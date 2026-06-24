@@ -118,6 +118,10 @@ func (t *IcmpTunnel) resolveDst() ([4]byte, bool) {
 
 // txPollLoop reads from all TUN queues in one goroutine (avoids duplicate sends).
 func (t *IcmpTunnel) txPollLoop(rawFd int) {
+	for _, f := range t.tun.fds {
+		_ = unix.SetNonblock(int(f.Fd()), true)
+	}
+
 	pfds := make([]unix.PollFd, len(t.tun.fds))
 	for i, f := range t.tun.fds {
 		pfds[i] = unix.PollFd{Fd: int32(f.Fd()), Events: unix.POLLIN}
@@ -139,8 +143,14 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 			}
 			qfd := t.tun.fds[qi]
 			for {
-				n, err := qfd.Read(payload)
+				n, err := tunReadNB(qfd, payload)
+				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+					break
+				}
 				if err != nil || n == 0 {
+					if err != nil && !t.stop.stopped() {
+						logWarn("tun read: " + err.Error())
+					}
 					break
 				}
 				dst, ok := t.resolveDst()

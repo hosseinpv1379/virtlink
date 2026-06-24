@@ -66,7 +66,6 @@ func openTunMulti(name string, n int) (*TunDev, error) {
 func openTunMultiTry(name string, n int) (*TunDev, error) {
 	td := &TunDev{fds: make([]*os.File, 0, n), queues: n}
 	for i := 0; i < n; i++ {
-		// Blocking TUN reads — non-blocking + spin caused 100% CPU and stalled I/O.
 		fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
 		if err != nil {
 			td.Close()
@@ -96,6 +95,18 @@ func openTunMultiTry(name string, n int) (*TunDev, error) {
 func tunWrite(fd *os.File, pkt []byte) error {
 	_, err := fd.Write(pkt)
 	return err
+}
+
+// tunReadNB reads one packet from a non-blocking TUN fd.
+// Returns (0, EAGAIN) when no data is available.
+func tunReadNB(fd *os.File, buf []byte) (int, error) {
+	n, err := fd.Read(buf)
+	if err != nil {
+		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			return 0, err
+		}
+	}
+	return n, err
 }
 
 // pollFD waits until fd is readable/writable or timeoutMs elapses.
