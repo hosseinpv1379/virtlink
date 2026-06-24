@@ -1,14 +1,15 @@
 // tun_icmp.go — ICMP Echo tunnel (IP protocol 1).
 //
-// Uses a SINGLE raw socket (SO_REUSEPORT on raw ICMP duplicates every packet).
-// Zero per-packet heap allocation via in-place frame build.
+// Single raw socket.  Strict peer-IP filter rejects own outbound loopback
+// (Linux delivers sent packets back to the same raw socket).  Sequence
+// dedup catches any remaining duplicate delivery.
 package main
 
 import (
 	"encoding/binary"
 	"fmt"
-	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 
 	"github.com/vishvananda/netlink"
@@ -21,14 +22,38 @@ const (
 	icmpEchoReq = 8
 )
 
+// icmpSeqDedup tracks recently seen outer ICMP sequence numbers from the peer.
+type icmpSeqDedup struct {
+	mu   sync.Mutex
+	ring [512]uint16
+	idx  int
+}
+
+func (d *icmpSeqDedup) isDup(seq uint16) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, s := range d.ring {
+		if s == seq {
+			return true
+		}
+	}
+	d.ring[d.idx%512] = seq
+	d.idx++
+	return false
+}
+
 type IcmpTunnel struct {
 	cfg     *Config
 	tunFd   *os.File
 	rawFd   int
+	lockFd  *os.File
 	done    chan struct{}
 	stop    stoppedFlag
 	seq     atomic.Uint32
-	lastSrc atomic.Value // [4]byte
+	dedup   icmpSeqDedup
+	lastSrc atomic.Value // [4]byte — server only
+	peerIP  [4]byte
+	localIP [4]byte
 }
 
 func (t *IcmpTunnel) DevName() string   { return "icmp-tun0" }
@@ -45,14 +70,25 @@ func (t *IcmpTunnel) Up() error {
 		mtu = 1472
 	}
 
+	t.peerIP = ipTo4(c.RemoteIP)
+	t.localIP = ipTo4(c.LocalIP)
+
 	header("icmp / " + c.Mode)
 	step("sysctl (via /proc/sys)...")
 	applySysctl()
 	step("cleanup...")
 	t.doClean()
 
-	step(fmt.Sprintf("TUN device %s...", dev))
+	// Prevent duplicate tunnel instances (each extra process = duplicate packets).
+	step("instance lock...")
 	var err error
+	t.lockFd, err = acquireTunnelLock(dev)
+	if err != nil {
+		return err
+	}
+	logOK("instance lock acquired")
+
+	step(fmt.Sprintf("TUN device %s...", dev))
 	t.tunFd, err = openTunDev(dev)
 	if err != nil {
 		return fmt.Errorf("tun: %w", err)
@@ -67,7 +103,7 @@ func (t *IcmpTunnel) Up() error {
 	netlink.LinkSetUp(l)
 	logOK(fmt.Sprintf("%s  %s  MTU=%d", dev, addr, mtu))
 
-	step("raw ICMP socket (single, no REUSEPORT)...")
+	step("raw ICMP socket...")
 	t.rawFd, err = openRawICMP()
 	if err != nil {
 		return fmt.Errorf("SOCK_RAW IPPROTO_ICMP: %w", err)
@@ -77,28 +113,25 @@ func (t *IcmpTunnel) Up() error {
 	addMSS(dev)
 	t.done = make(chan struct{})
 
-	var fixedDst [4]byte
-	if c.Mode == "client" {
-		ip := net.ParseIP(c.RemoteIP).To4()
-		copy(fixedDst[:], ip)
-	}
-
 	rawFd := t.rawFd
 	tun := t.tunFd
-	go t.rxLoop(rawFd, tun, fixedDst)
-	go t.txLoop(rawFd, tun, fixedDst)
+	go t.rxLoop(rawFd, tun)
+	go t.txLoop(rawFd, tun)
 
 	done(dev, addr, peer,
-		"proto    : ICMP Echo (single socket)",
+		"proto    : ICMP Echo (peer-filtered)",
 		"id       : 0xCAFE",
+		"filter   : peer="+c.RemoteIP+" only",
 		"test     : ping -c3 "+peer,
 	)
 	return nil
 }
 
-func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
+func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
+	peer := t.peerIP
+	local := t.localIP
 	for {
 		n, from, err := unix.Recvfrom(rawFd, buf, 0)
 		if err != nil {
@@ -109,6 +142,18 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 				continue
 			}
 			logWarn("icmp rx: " + err.Error())
+			continue
+		}
+		sa, ok := from.(*unix.SockaddrInet4)
+		if !ok {
+			continue
+		}
+		// Drop own outbound packets echoed back by the kernel.
+		if sa.Addr == local {
+			continue
+		}
+		// Only accept tunnel packets from the configured peer public IP.
+		if sa.Addr != peer {
 			continue
 		}
 		if n < 20 {
@@ -125,12 +170,12 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 		if binary.BigEndian.Uint16(icmp[4:6]) != icmpTunID {
 			continue
 		}
-		if t.cfg.Mode == "server" {
-			if sa, ok := from.(*unix.SockaddrInet4); ok {
-				t.lastSrc.Store(sa.Addr)
-			}
-		} else if sa, ok := from.(*unix.SockaddrInet4); ok && sa.Addr != fixedDst {
+		seq := binary.BigEndian.Uint16(icmp[6:8])
+		if t.dedup.isDup(seq) {
 			continue
+		}
+		if t.cfg.Mode == "server" {
+			t.lastSrc.Store(sa.Addr)
 		}
 		if _, err := tun.Write(icmp[8:]); err != nil {
 			if t.stop.stopped() {
@@ -141,7 +186,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 	}
 }
 
-func (t *IcmpTunnel) txLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
+func (t *IcmpTunnel) txLoop(rawFd int, tun *os.File) {
 	buf := getBuf()
 	frame := getICMPFrame()
 	defer putBuf(buf)
@@ -158,7 +203,7 @@ func (t *IcmpTunnel) txLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 		}
 		var dst [4]byte
 		if t.cfg.Mode == "client" {
-			dst = fixedDst
+			dst = t.peerIP
 		} else if v := t.lastSrc.Load(); v != nil {
 			dst = v.([4]byte)
 		} else {
@@ -197,6 +242,8 @@ func (t *IcmpTunnel) doClean() {
 		t.tunFd.Close()
 		t.tunFd = nil
 	}
+	releaseTunnelLock(t.lockFd)
+	t.lockFd = nil
 	delMSS(t.DevName())
 	nlDown(t.DevName())
 }

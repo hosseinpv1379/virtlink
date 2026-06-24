@@ -3,7 +3,9 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 
@@ -133,5 +135,40 @@ func (r *rrCounter) next() int { return int(r.n.Add(1)-1) % tunWorkers }
 // stoppedFlag is checked occasionally in hot loops (no select per packet).
 type stoppedFlag struct{ v atomic.Bool }
 
-func (s *stoppedFlag) stop()     { s.v.Store(true) }
+func (s *stoppedFlag) stop()         { s.v.Store(true) }
 func (s *stoppedFlag) stopped() bool { return s.v.Load() }
+
+// ipTo4 parses an IPv4 address into a fixed [4]byte (zero if invalid).
+func ipTo4(s string) [4]byte {
+	var out [4]byte
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return out
+	}
+	copy(out[:], ip.To4())
+	return out
+}
+
+// acquireTunnelLock prevents two virlink processes from running the same tunnel.
+func acquireTunnelLock(dev string) (*os.File, error) {
+	dir := "/var/run/virlink"
+	_ = os.MkdirAll(dir, 0o755)
+	path := dir + "/" + dev + ".lock"
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("lock %s: %w", path, err)
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("another virlink instance is already running (%s) — stop it first", dev)
+	}
+	return f, nil
+}
+
+func releaseTunnelLock(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	f.Close()
+}
