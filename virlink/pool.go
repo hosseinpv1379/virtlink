@@ -14,7 +14,7 @@ import (
 
 const (
 	maxPktBuf   = 65535 + 512
-	sockBufSize = 16 << 20 // 16 MB
+	sockBufSize = 32 << 20 // 32 MB
 	icmpHdrLen  = 8
 )
 

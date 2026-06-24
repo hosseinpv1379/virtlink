@@ -1,8 +1,9 @@
 // tun_icmp.go — ICMP Echo tunnel (IP protocol 1).
 //
-// Performance (v2.7):
-//   • IFF_MULTI_QUEUE TUN — tunQueues parallel tx readers
-//   • Zero-copy TX — read IP packet directly into frame payload area
+// Performance (v2.7.3):
+//   • IFF_MULTI_QUEUE TUN — one poller reads all queues (no duplicate TX)
+//   • sendmmsg / recvmmsg batch syscalls (32 packets)
+//   • writev batch inject to TUN on RX
 //   • Lock-free sequence dedup, strict peer-IP filter
 package main
 
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -78,7 +80,7 @@ func (t *IcmpTunnel) Up() error {
 	a, _ := netlink.ParseAddr(addr)
 	netlink.AddrAdd(l, a)
 	netlink.LinkSetUp(l)
-	logOK(fmt.Sprintf("%s  %s  MTU=%d  queues=%d", dev, addr, mtu, tunQueues))
+	logOK(fmt.Sprintf("%s  %s  MTU=%d  queues=%d", dev, addr, mtu, t.tun.QueueCount()))
 
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)
@@ -95,94 +97,183 @@ func (t *IcmpTunnel) Up() error {
 	t.done = make(chan struct{})
 
 	rawFd := t.rawFd
-	go t.rxLoop(rawFd, t.tun.Fd0())
-	for i, qfd := range t.tun.fds {
-		go t.txLoop(rawFd, qfd, i)
-	}
+	go t.rxBatchLoop(rawFd, t.tun.Fd0())
+	go t.txBatchLoop(rawFd)
 
 	done(dev, addr, peer,
-		fmt.Sprintf("transport : ICMP ×%d TUN queues", t.tun.QueueCount()),
+		fmt.Sprintf("transport : ICMP batch ×%d queues", t.tun.QueueCount()),
 		"filter   : peer="+c.RemoteIP,
 		"test     : ping -c3 "+peer,
 	)
 	return nil
 }
 
-func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
-	buf := getBuf()
-	defer putBuf(buf)
-	peer, local := t.peerIP, t.localIP
-	for {
-		n, from, err := unix.Recvfrom(rawFd, buf, 0)
-		if err != nil {
-			if t.stop.stopped() {
-				return
+func (t *IcmpTunnel) resolveDst() ([4]byte, bool) {
+	if t.cfg.Mode == "client" {
+		return t.peerIP, true
+	}
+	if v := t.lastSrc.Load(); v != nil {
+		return v.([4]byte), true
+	}
+	return [4]byte{}, false
+}
+
+func (t *IcmpTunnel) txBatchLoop(rawFd int) {
+	pfds := make([]unix.PollFd, len(t.tun.fds))
+	for i, f := range t.tun.fds {
+		pfds[i] = unix.PollFd{Fd: int32(f.Fd()), Events: unix.POLLIN}
+	}
+
+	var (
+		msgs   [icmpBatchMax]mmsghdr
+		iovs   [icmpBatchMax]unix.Iovec
+		addrs  [icmpBatchMax]unix.SockaddrInet4
+		frames [icmpBatchMax][]byte
+		lens   [icmpBatchMax]int
+	)
+
+	for !t.stop.stopped() {
+		_, err := unix.Poll(pfds, 10)
+		if err != nil && err != unix.EINTR {
+			continue
+		}
+
+		nmsg := 0
+		for qi, p := range pfds {
+			if p.Revents&unix.POLLIN == 0 {
+				continue
 			}
-		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-			_ = pollFD(rawFd, unix.POLLIN, 100)
+			qfd := t.tun.fds[qi]
+			for nmsg < icmpBatchMax {
+				frame := getICMPFrame()
+				payload := frame[icmpHdrLen:]
+				n, err := qfd.Read(payload)
+				if err != nil || n == 0 {
+					putICMPFrame(frame)
+					break
+				}
+				dst, ok := t.resolveDst()
+				if !ok {
+					putICMPFrame(frame)
+					continue
+				}
+				seq := uint16(t.seq.Add(1))
+				pkt := buildICMPFrame(frame, icmpTunID, seq, payload[:n])
+
+				addrs[nmsg] = unix.SockaddrInet4{Addr: dst}
+				iovs[nmsg].Base = &pkt[0]
+				iovs[nmsg].Len = uint64(len(pkt))
+				lens[nmsg] = len(pkt)
+				msgs[nmsg].Hdr.Name = (*byte)(unsafe.Pointer(&addrs[nmsg]))
+				msgs[nmsg].Hdr.Namelen = unix.SizeofSockaddrInet4
+				msgs[nmsg].Hdr.Iov = &iovs[nmsg]
+				msgs[nmsg].Hdr.Iovlen = 1
+				frames[nmsg] = frame
+				nmsg++
+			}
+		}
+
+		if nmsg == 0 {
 			continue
 		}
-		if err == unix.EINTR {
-			continue
+
+		sent, err := sendmmsg(rawFd, msgs[:nmsg])
+		if err != nil {
+			for i := 0; i < nmsg; i++ {
+				if frames[i] != nil {
+					_ = unix.Sendto(rawFd, frames[i][:lens[i]], 0, &addrs[i])
+				}
+			}
+		} else if sent < nmsg {
+			for i := sent; i < nmsg; i++ {
+				_ = unix.Sendto(rawFd, frames[i][:lens[i]], 0, &addrs[i])
+			}
 		}
-			logWarn("icmp rx: " + err.Error())
-			continue
-		}
-		sa, ok := from.(*unix.SockaddrInet4)
-		if !ok || sa.Addr == local || sa.Addr != peer {
-			continue
-		}
-		if n < 20 {
-			continue
-		}
-		ihl := int(buf[0]&0xf) * 4
-		if n < ihl+8 {
-			continue
-		}
-		icmp := buf[ihl:n]
-		if icmp[0] != icmpEchoReq || binary.BigEndian.Uint16(icmp[4:6]) != icmpTunID {
-			continue
-		}
-		seq := binary.BigEndian.Uint16(icmp[6:8])
-		if t.dedup.dup(seq) {
-			continue
-		}
-		if t.cfg.Mode == "server" {
-			t.lastSrc.Store(sa.Addr)
-		}
-		if err := tunWrite(tun, icmp[8:]); err != nil && !t.stop.stopped() {
-			logWarn("tun write: " + err.Error())
+		for i := 0; i < nmsg; i++ {
+			putICMPFrame(frames[i])
+			frames[i] = nil
 		}
 	}
 }
 
-func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File, _ int) {
-	frame := getICMPFrame()
-	defer putICMPFrame(frame)
-	payload := frame[icmpHdrLen:]
+func (t *IcmpTunnel) rxBatchLoop(rawFd int, tun *os.File) {
+	var (
+		msgs  [icmpBatchMax]mmsghdr
+		iovs  [icmpBatchMax]unix.Iovec
+		addrs [icmpBatchMax]unix.RawSockaddrInet4
+		bufs  [icmpBatchMax][]byte
+	)
+	for i := range bufs {
+		bufs[i] = getBuf()
+		iovs[i].Base = &bufs[i][0]
+		iovs[i].Len = uint64(len(bufs[i]))
+		msgs[i].Hdr.Name = (*byte)(unsafe.Pointer(&addrs[i]))
+		msgs[i].Hdr.Namelen = unix.SizeofSockaddrInet4
+		msgs[i].Hdr.Iov = &iovs[i]
+		msgs[i].Hdr.Iovlen = 1
+	}
+	defer func() {
+		for i := range bufs {
+			putBuf(bufs[i])
+		}
+	}()
 
-	for {
-		n, err := qfd.Read(payload)
+	peer, local := t.peerIP, t.localIP
+	tunPkts := make([][]byte, 0, icmpBatchMax)
+
+	for !t.stop.stopped() {
+		n, err := recvmmsg(rawFd, msgs[:], unix.MSG_WAITFORONE)
 		if err != nil {
 			if t.stop.stopped() {
 				return
 			}
-			logWarn("tun read: " + err.Error())
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				_ = pollFD(rawFd, unix.POLLIN, 100)
+				continue
+			}
+			if err == unix.EINTR {
+				continue
+			}
+			logWarn("icmp rx: " + err.Error())
 			continue
 		}
-		var dst [4]byte
-		if t.cfg.Mode == "client" {
-			dst = t.peerIP
-		} else if v := t.lastSrc.Load(); v != nil {
-			dst = v.([4]byte)
-		} else {
-			continue
+
+		tunPkts = tunPkts[:0]
+		for i := 0; i < n; i++ {
+			sa := (*unix.RawSockaddrInet4)(unsafe.Pointer(msgs[i].Hdr.Name))
+			from := sa.Addr
+			if from == local || from != peer {
+				continue
+			}
+			buf := bufs[i][:msgs[i].Len]
+			if len(buf) < 20 {
+				continue
+			}
+			ihl := int(buf[0]&0xf) * 4
+			if len(buf) < ihl+8 {
+				continue
+			}
+			icmp := buf[ihl:msgs[i].Len]
+			if icmp[0] != icmpEchoReq || binary.BigEndian.Uint16(icmp[4:6]) != icmpTunID {
+				continue
+			}
+			seq := binary.BigEndian.Uint16(icmp[6:8])
+			if t.dedup.dup(seq) {
+				continue
+			}
+			if t.cfg.Mode == "server" {
+				t.lastSrc.Store(from)
+			}
+			inner := icmp[8:]
+			if len(inner) > 0 {
+				tunPkts = append(tunPkts, inner)
+			}
 		}
-		seq := uint16(t.seq.Add(1))
-		pkt := buildICMPFrame(frame, icmpTunID, seq, payload[:n])
-		sa := &unix.SockaddrInet4{Addr: dst}
-		if err := unix.Sendto(rawFd, pkt, 0, sa); err != nil && err != unix.EAGAIN {
-			logDebug("icmp tx: " + err.Error())
+
+		if len(tunPkts) > 0 {
+			if err := tunWritev(tun, tunPkts); err != nil && !t.stop.stopped() {
+				logWarn("tun writev: " + err.Error())
+			}
 		}
 	}
 }
