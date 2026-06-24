@@ -235,8 +235,14 @@ func (h *HealthMgr) runHTTPServer(port int, tun Tunnel, bm *BenchMgr) {
 		_ = json.NewEncoder(w).Encode(res)
 	})
 
+	// GET /  — HTML dashboard (auto-refreshes every 5s)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/health", http.StatusFound)
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(dashboardHTML))
 	})
 
 	addr := fmt.Sprintf(":%d", port)
