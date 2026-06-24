@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-const version = "2.0.0"
+const version = "2.1.0"
 
 func main() {
 	cfgFile  := flag.String("c", "", "path to config.toml")
@@ -89,8 +89,13 @@ Tunnel types  ([tunnel] type = "..." in config.toml):
   bonded-gre-fou  dual GRE-FOU ECMP 2×BW    port 5557/5558
   l2tpv3          L2TPv3 over UDP            port 5059
   gre-wg          GRE inside WireGuard       wg 51820
-  vxlan-wg        VXLAN inside WireGuard     wg 51821
   gre-fou-ipsec   GRE-FOU + IPsec ESP        port 5556
+  udp-obfs        AES-256-GCM obfuscated UDP port 443
+  gre             Kernel GRE (proto 47)      raw
+  tcp             User-space TCP tunnel      port 8443
+  udp             User-space UDP tunnel      port 5060
+  icmp            ICMP Echo tunnel (proto 1) raw
+  bip             BIP tunnel (proto 58)      raw
 
 Lifecycle:
   • tunnel is created when the process starts
