@@ -1,8 +1,9 @@
 // tun_icmp.go — ICMP Echo tunnel (IP protocol 1).
 //
-// Performance:
-//   • IFF_MULTI_QUEUE TUN — one poller reads all queues (no duplicate TX)
-//   • Zero-copy TX — read IP packet directly into ICMP frame payload
+// Performance (v2.7.6):
+//   • IFF_MULTI_QUEUE TUN — one goroutine per queue (parallel TX)
+//   • sendmmsg batching (32 packets) per queue
+//   • Non-blocking TUN reads + poll (no stall, no duplicate sends)
 //   • Lock-free sequence dedup, strict peer-IP filter
 package main
 
@@ -96,10 +97,12 @@ func (t *IcmpTunnel) Up() error {
 
 	rawFd := t.rawFd
 	go t.rxLoop(rawFd, t.tun.Fd0())
-	go t.txPollLoop(rawFd)
+	for _, qfd := range t.tun.fds {
+		go t.txLoop(rawFd, qfd)
+	}
 
 	done(dev, addr, peer,
-		fmt.Sprintf("transport : ICMP ×%d TUN queues", t.tun.QueueCount()),
+		fmt.Sprintf("transport : ICMP ×%d queues (batch TX)", t.tun.QueueCount()),
 		"filter   : peer="+c.RemoteIP,
 		"test     : ping -c3 "+peer,
 	)
@@ -116,54 +119,50 @@ func (t *IcmpTunnel) resolveDst() ([4]byte, bool) {
 	return [4]byte{}, false
 }
 
-// txPollLoop reads from all TUN queues in one goroutine (avoids duplicate sends).
-func (t *IcmpTunnel) txPollLoop(rawFd int) {
-	for _, f := range t.tun.fds {
-		_ = unix.SetNonblock(int(f.Fd()), true)
-	}
+// txLoop serves one TUN queue: non-blocking drain + sendmmsg batches.
+func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File) {
+	_ = unix.SetNonblock(int(qfd.Fd()), true)
+	tunFD := int(qfd.Fd())
 
-	pfds := make([]unix.PollFd, len(t.tun.fds))
-	for i, f := range t.tun.fds {
-		pfds[i] = unix.PollFd{Fd: int32(f.Fd()), Events: unix.POLLIN}
-	}
+	scratch := getICMPFrame()
+	defer putICMPFrame(scratch)
+	scratchPayload := scratch[icmpHdrLen:]
 
-	frame := getICMPFrame()
-	defer putICMPFrame(frame)
-	payload := frame[icmpHdrLen:]
+	var batch icmpTxBatch
 
 	for !t.stop.stopped() {
-		_, err := unix.Poll(pfds, 10)
-		if err != nil && err != unix.EINTR {
+		batch.reset()
+
+		for batch.n < icmpBatchMax {
+			n, err := tunReadNB(qfd, scratchPayload)
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				break
+			}
+			if err != nil || n == 0 {
+				if err != nil && !t.stop.stopped() {
+					logWarn("tun read: " + err.Error())
+				}
+				break
+			}
+			dst, ok := t.resolveDst()
+			if !ok {
+				continue
+			}
+			frame := getICMPFrame()
+			seq := uint16(t.seq.Add(1))
+			pkt := buildICMPFrame(frame, icmpTunID, seq, scratchPayload[:n])
+			batch.add(frame, len(pkt), dst)
+		}
+
+		if batch.n == 0 {
+			_ = pollFD(tunFD, unix.POLLIN, 10)
 			continue
 		}
 
-		for qi, p := range pfds {
-			if p.Revents&unix.POLLIN == 0 {
-				continue
-			}
-			qfd := t.tun.fds[qi]
-			for {
-				n, err := tunReadNB(qfd, payload)
-				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-					break
-				}
-				if err != nil || n == 0 {
-					if err != nil && !t.stop.stopped() {
-						logWarn("tun read: " + err.Error())
-					}
-					break
-				}
-				dst, ok := t.resolveDst()
-				if !ok {
-					continue
-				}
-				seq := uint16(t.seq.Add(1))
-				pkt := buildICMPFrame(frame, icmpTunID, seq, payload[:n])
-				sa := &unix.SockaddrInet4{Addr: dst}
-				if err := unix.Sendto(rawFd, pkt, 0, sa); err != nil && err != unix.EAGAIN {
-					logDebug("icmp tx: " + err.Error())
-				}
-			}
+		icmpSendBatch(rawFd, &batch)
+		for i := 0; i < batch.n; i++ {
+			putICMPFrame(batch.frames[i])
+			batch.frames[i] = nil
 		}
 	}
 }
@@ -180,7 +179,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 				return
 			}
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-				_ = pollFD(rawFd, unix.POLLIN, 100)
+				_ = pollFD(rawFd, unix.POLLIN, 10)
 				continue
 			}
 			if err == unix.EINTR {
