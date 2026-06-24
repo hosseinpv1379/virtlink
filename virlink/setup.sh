@@ -477,6 +477,10 @@ channel_size = 10_000
 
 [logging]
 level = "info"
+
+[health]
+disabled = false
+port     = 6543
 EOF
 }
 

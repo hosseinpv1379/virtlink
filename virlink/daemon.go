@@ -49,45 +49,54 @@ func runDaemon(cfg *Config, tun Tunnel) int {
 		ApplyForward(tun.PeerIP(), fwdRules)
 	}
 
-	// ── 3. register signal handler ────────────────────────────────────────────
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// ── 4. heartbeat goroutine ────────────────────────────────────────────────
+	// ── 3. health probe + HTTP endpoint ───────────────────────────────────────
 	interval := cfg.Transport.HeartbeatInterval
 	if interval <= 0 {
 		interval = 10
 	}
+	ivDur := time.Duration(interval) * time.Second
 	startedAt := time.Now()
 
+	var hm *HealthMgr
+	if !cfg.Health.Disabled {
+		hm = NewHealthMgr(startedAt, ivDur)
+		hm.Start(plainIP(tun.OverlayIP()), tun.PeerIP(), cfg.Health.Port, tun)
+		logInfo(fmt.Sprintf("health probe active  port=%d  probe_interval=%ds",
+			cfg.Health.Port, interval))
+	}
+
+	// ── 4. register signal handler ────────────────────────────────────────────
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// ── 5. heartbeat goroutine ────────────────────────────────────────────────
 	stopHB := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(time.Duration(interval) * time.Second)
+		ticker := time.NewTicker(ivDur)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				printHeartbeat(tun, fwdRules, startedAt)
+				printHeartbeat(tun, fwdRules, startedAt, hm)
 			case <-stopHB:
 				return
 			}
 		}
 	}()
 
-	// ── 5. wait for signal ────────────────────────────────────────────────────
+	// ── 6. wait for signal ────────────────────────────────────────────────────
 	sig := <-sigCh
 	fmt.Println()
 	logInfo(fmt.Sprintf("received %s — shutting down...", sig))
-
 	close(stopHB)
 
-	// ── 6. remove forward rules ───────────────────────────────────────────────
+	// ── 7. remove forward rules ───────────────────────────────────────────────
 	if len(fwdRules) > 0 {
 		logInfo("removing port forward rules...")
 		RemoveForward(tun.PeerIP(), fwdRules)
 	}
 
-	// ── 7. tear down tunnel ───────────────────────────────────────────────────
+	// ── 8. tear down tunnel ───────────────────────────────────────────────────
 	logInfo("tearing down tunnel...")
 	if err := tun.Down(); err != nil {
 		logError("teardown: " + err.Error())
@@ -100,50 +109,60 @@ func runDaemon(cfg *Config, tun Tunnel) int {
 
 // ── heartbeat ─────────────────────────────────────────────────────────────────
 
-func printHeartbeat(tun Tunnel, fwdRules []ForwardRule, since time.Time) {
+func printHeartbeat(tun Tunnel, fwdRules []ForwardRule, since time.Time, hm *HealthMgr) {
 	dev := tun.DevName()
 	uptime := time.Since(since).Round(time.Second)
 
 	l, err := netlink.LinkByName(dev)
 	if err != nil {
-		logWarn(fmt.Sprintf("❌  %-12s  NOT FOUND  uptime=%s", dev, uptime))
+		logWarn(fmt.Sprintf("dev=%-12s  NOT FOUND  uptime=%s", dev, uptime))
 		return
 	}
 
 	// link state
-	state := "UP  "
-	stateColor := cGreen
+	linkState := "UP"
+	linkColor := cGreen
 	if l.Attrs().Flags&net.FlagUp == 0 {
-		state = "DOWN"
-		stateColor = cRed
+		linkState = "DOWN"
+		linkColor = cRed
 	}
 
-	// rx/tx stats from kernel (read natively via netlink)
+	// rx/tx stats from kernel (netlink)
 	var rxB, txB, rxPkt, txPkt uint64
 	if s := l.Attrs().Statistics; s != nil {
 		rxB, txB = s.RxBytes, s.TxBytes
 		rxPkt, txPkt = s.RxPackets, s.TxPackets
 	}
 
-	// build forward summary
-	fwdSummary := ""
+	// handshake state
+	hsStr := "disabled"
+	hsColor := cGray
+	lastSeenStr := ""
+	if hm != nil {
+		hsStr = hm.Handshake()
+		hsColor = hm.HandshakeColor()
+		lastSeenStr = "  last_probe=" + hm.LastSeenStr()
+	}
+
+	// forward rules summary
+	fwdStr := ""
 	if len(fwdRules) > 0 {
 		parts := make([]string, 0, len(fwdRules))
 		for _, r := range fwdRules {
 			parts = append(parts, fmt.Sprintf("%d→%d", r.ListenPort, r.TargetPort))
 		}
-		fwdSummary = "  fwd=[" + strings.Join(parts, " ") + "]"
+		fwdStr = "  fwd=[" + strings.Join(parts, " ") + "]"
 	}
 
-	stateStr := color(stateColor, state)
-	logInfo(fmt.Sprintf("♥  %-12s  state=%-6s  rx=%-10s (%spkt)  tx=%-10s (%spkt)  peer=%-15s  uptime=%s%s",
+	logInfo(fmt.Sprintf("♥  dev=%-10s  link=%-4s  handshake=%-9s  rx=%-10s(%spkt)  tx=%-10s(%spkt)  uptime=%s%s%s",
 		dev,
-		stateStr,
+		color(linkColor, linkState),
+		color(hsColor, hsStr),
 		fmtBytes(rxB), fmtNum(rxPkt),
 		fmtBytes(txB), fmtNum(txPkt),
-		tun.PeerIP(),
 		uptime,
-		fwdSummary,
+		lastSeenStr,
+		fwdStr,
 	))
 }
 

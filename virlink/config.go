@@ -87,6 +87,13 @@ type ForwardCfg struct {
 	Rules   []string `toml:"rules"`
 }
 
+// HealthCfg maps to [health].
+// UDP probe + HTTP endpoint to verify real end-to-end connectivity.
+type HealthCfg struct {
+	Disabled bool `toml:"disabled"` // set to true to disable (default: enabled)
+	Port     int  `toml:"port"`     // default 6543
+}
+
 // ─── root config ─────────────────────────────────────────────────────────────
 
 type Config struct {
@@ -100,6 +107,7 @@ type Config struct {
 	Logging   LoggingCfg   `toml:"logging"`
 	Forward   ForwardCfg   `toml:"forward"`
 	Obfs      ObfsCfg      `toml:"obfs"`
+	Health    HealthCfg    `toml:"health"`
 
 	// Convenience aliases (set after parse, not from TOML)
 	Mode     string `toml:"-"`
@@ -271,6 +279,7 @@ func setDefaults(c *Config) {
 	if !c.Tuning.BBR { c.Tuning.BBR = true }
 	if c.Tuning.ChannelSize == 0 { c.Tuning.ChannelSize = 10_000 }
 	if c.Logging.Level == ""     { c.Logging.Level = "info" }
+	if c.Health.Port == 0        { c.Health.Port = defaultHealthPort }
 }
 
 // ─── validation ───────────────────────────────────────────────────────────────
