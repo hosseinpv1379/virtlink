@@ -9,7 +9,7 @@ INSTALL_DIR="/opt/virlink"
 VIRLINK_BIN="${INSTALL_DIR}/virlink"
 CONFIGS_DIR="${INSTALL_DIR}/configs"
 LOGS_DIR="/var/log/virlink"
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.5.0"
 
 UPDATE_AVAILABLE=0
 LATEST_TAG=""
@@ -313,51 +313,75 @@ tunnel_stop() {
   ok "Tunnel '${name}' stopped and disabled."
 }
 
-# tunnel_status: shows systemctl status + binary log tail
+# tunnel_status: shows systemctl status + colorized binary log tail
 tunnel_status() {
   local name="$1"
   local cfg="${CONFIGS_DIR}/${name}.toml"
   local svc; svc="$(svc_name "$name")"
   local log; log="$(svc_log "$name")"
+
+  # colorize INF/WRN/ERR/heartbeat lines
+  _clog() {
+    sed -E \
+      -e "s/  INF  /  $(printf '\033[90m')·$(printf '\033[0m')  /g" \
+      -e "s/  WRN  /  $(printf '\033[33m')⚠$(printf '\033[0m')  /g" \
+      -e "s/  ERR  /  $(printf '\033[1;31m')✗$(printf '\033[0m')  /g" \
+      -e "s/  DBG  /  $(printf '\033[36m')·$(printf '\033[0m')  /g" \
+      -e "s/(♥)/$(printf '\033[32m')\1$(printf '\033[0m')/g" \
+      -e "s/\bconnected\b/$(printf '\033[32m')connected$(printf '\033[0m')/g" \
+      -e "s/\bdegraded\b/$(printf '\033[33m')degraded$(printf '\033[0m')/g" \
+      -e "s/\bdead\b/$(printf '\033[31m')dead$(printf '\033[0m')/g" \
+      -e "s/\blink=UP\b/link=$(printf '\033[32m')UP$(printf '\033[0m')/g" \
+      -e "s/\blink=DOWN\b/link=$(printf '\033[31m')DOWN$(printf '\033[0m')/g"
+  }
+
   blank
-  echo -e "  ${BOLD}Tunnel: ${C}${name}${NC}"
+  echo -e "  ${BOLD}${C}⬡  ${name}${NC}"
   sep
 
-  # ── service state ──
+  # ── service state ──────────────────────────────────────────────
+  local running=0
   if tunnel_is_running "$name"; then
-    echo -e "  Status   : ${G}${BOLD}● RUNNING${NC}  (${svc})"
+    running=1
+    echo -e "  ${G}${BOLD}● RUNNING${NC}  ${DIM}(${svc})${NC}"
   else
-    echo -e "  Status   : ${R}● STOPPED${NC}  (${svc})"
+    echo -e "  ${R}● STOPPED${NC}  ${DIM}(${svc})${NC}"
   fi
 
-  # ── config summary ──
+  # ── config summary ─────────────────────────────────────────────
   if [[ -f "$cfg" ]]; then
     local type mode local_ip remote_ip cidr
-    type=$(grep -E '^\s*type\s*=' "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
-    mode=$(grep -E '^\s*mode\s*=' "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
+    type=$(grep -E '^\s*type\s*='      "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
+    mode=$(grep -E '^\s*mode\s*='      "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
     local_ip=$(grep -E '^\s*local_ip'  "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
     remote_ip=$(grep -E '^\s*remote_ip' "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
-    cidr=$(grep -E '^\s*cidr' "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
-    echo -e "  Type     : ${Y}${type}${NC}  mode=${mode}"
-    echo -e "  Local    : ${local_ip}  →  peer: ${remote_ip}"
-    echo -e "  Overlay  : ${cidr}"
-    echo -e "  Config   : ${DIM}${cfg}${NC}"
-    echo -e "  Log file : ${DIM}${log}${NC}"
+    cidr=$(grep -E '^\s*cidr'          "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
+    blank
+    echo -e "  ${DIM}type${NC}     ${Y}${type}${NC}   ${DIM}mode${NC}  ${mode}"
+    echo -e "  ${DIM}local${NC}    ${local_ip}  ${DIM}→${NC}  ${remote_ip}"
+    echo -e "  ${DIM}overlay${NC}  ${C}${cidr}${NC}"
+    echo -e "  ${DIM}config${NC}   ${DIM}${cfg}${NC}"
   fi
 
-  # ── systemctl one-liner ──
+  # ── systemd stats ──────────────────────────────────────────────
   blank
-  echo -e "  ${DIM}── systemd unit ────────────────────────────────${NC}"
+  echo -e "  ${DIM}── systemd ──────────────────────────────────────${NC}"
   systemctl status "$svc" --no-pager -l --lines=0 2>/dev/null | \
     grep -E '(Loaded|Active|Main PID|Tasks|Memory|CPU)' | sed 's/^/  /' || true
 
-  # ── binary log tail ──
+  # ── binary log tail (colorized) ────────────────────────────────
   blank
   echo -e "  ${DIM}── binary log (last 30 lines) ───────────────────${NC}"
   if [[ -f "$log" ]] && [[ -s "$log" ]]; then
-    tail -30 "$log" | sed 's/^/  /'
+    tail -30 "$log" | _clog | sed 's/^/  /'
+    echo -e "  ${DIM}↳ ${log}${NC}"
   else
-    echo -e "  ${DIM}(no log yet)${NC}"
+    if (( running )); then
+      echo -e "  ${DIM}(reading from journal)${NC}"
+      journalctl -u "$svc" -n 20 --no-pager 2>/dev/null | tail -20 | _clog | sed 's/^/  /'
+    else
+      echo -e "  ${DIM}(no log yet — start the tunnel first)${NC}"
+    fi
   fi
   blank
 }
@@ -1017,6 +1041,91 @@ EOF
   press_enter
 }
 
+screen_logs() {
+  header
+  echo -e "  ${BOLD}Tunnel Logs${NC}"
+  sep
+  ensure_dirs
+  if ! pick_tunnel; then
+    press_enter
+    return
+  fi
+  local name="$PICKED_TUNNEL"
+  local log; log="$(svc_log "$name")"
+  local svc; svc="$(svc_name "$name")"
+
+  blank
+  echo -e "  ${BOLD}${name}${NC}  ${DIM}(${svc})${NC}"
+  echo -e "  ${DIM}log: ${log}${NC}"
+  blank
+
+  local mode
+  pick mode "View mode" \
+    "tail-50   — last 50 lines" \
+    "follow    — live tail (Ctrl+C to stop)" \
+    "search    — grep keyword"
+  read -r mode _ <<< "$mode"   # extract first word only
+
+  blank
+
+  # colorizer: INF=dim, WRN=yellow, ERR=red bold, ♥=green, states
+  _colorize() {
+    sed -E \
+      -e "s/ INF / $(printf '\033[90m')INF$(printf '\033[0m') /g" \
+      -e "s/ WRN / $(printf '\033[33m')WRN$(printf '\033[0m') /g" \
+      -e "s/ ERR / $(printf '\033[1;31m')ERR$(printf '\033[0m') /g" \
+      -e "s/ DBG / $(printf '\033[36m')DBG$(printf '\033[0m') /g" \
+      -e "s/(♥)/$(printf '\033[32m')\1$(printf '\033[0m')/g" \
+      -e "s/(connected)/$(printf '\033[32m')\1$(printf '\033[0m')/g" \
+      -e "s/(degraded)/$(printf '\033[33m')\1$(printf '\033[0m')/g" \
+      -e "s/(dead)/$(printf '\033[1;31m')\1$(printf '\033[0m')/g" \
+      -e "s/(UP)/$(printf '\033[32m')\1$(printf '\033[0m')/g" \
+      -e "s/(DOWN)/$(printf '\033[31m')\1$(printf '\033[0m')/g"
+  }
+
+  case "$mode" in
+    tail-50)
+      if [[ -f "$log" && -s "$log" ]]; then
+        echo -e "${DIM}──── last 50 lines ─────────────────────────────${NC}"
+        tail -50 "$log" | _colorize
+        sep
+      else
+        warn "Log file empty or not found: $log"
+        if systemctl is-active "$svc" &>/dev/null; then
+          blank
+          echo -e "  ${DIM}journalctl output:${NC}"
+          journalctl -u "$svc" -n 50 --no-pager 2>/dev/null | _colorize | tail -50
+        fi
+      fi
+      ;;
+    follow)
+      echo -e "  ${Y}⚠${NC}  Press ${BOLD}Ctrl+C${NC} to stop following"
+      sep
+      if [[ -f "$log" ]]; then
+        tail -f "$log" | _colorize
+      else
+        journalctl -f -u "$svc" 2>/dev/null | _colorize
+      fi
+      ;;
+    search)
+      local kw
+      prompt kw "Search keyword" ""
+      [[ -z "$kw" ]] && return
+      blank
+      echo -e "  ${DIM}── results for \"${kw}\" ──────────────────────────${NC}"
+      if [[ -f "$log" ]]; then
+        grep -i "$kw" "$log" | _colorize | tail -100
+      else
+        journalctl -u "$svc" --no-pager 2>/dev/null | grep -i "$kw" | _colorize | tail -100
+      fi
+      sep
+      ;;
+  esac
+
+  blank
+  press_enter
+}
+
 screen_keygen() {
   header
   echo -e "  ${BOLD}Generate WireGuard Keypair${NC}"
@@ -1071,30 +1180,32 @@ main() {
     sep
     echo -e "    ${C}1${NC}  Create new tunnel"
     echo -e "    ${C}2${NC}  Manage tunnels  (start / stop / status / restart)"
-    echo -e "    ${C}3${NC}  Add port forward rule"
-    echo -e "    ${C}4${NC}  Generate WireGuard keypair"
+    echo -e "    ${C}3${NC}  View tunnel logs  (tail / follow / search)"
+    echo -e "    ${C}4${NC}  Add port forward rule"
     echo -e "    ${C}5${NC}  List all tunnels"
+    echo -e "    ${C}6${NC}  Generate WireGuard keypair"
     if (( UPDATE_AVAILABLE )); then
-      echo -e "    ${Y}6${NC}  ${Y}Update available${NC} → ${LATEST_TAG}"
+      echo -e "    ${Y}7${NC}  ${Y}Update available${NC} → ${LATEST_TAG}"
     else
-      echo -e "    ${C}6${NC}  Check for updates"
+      echo -e "    ${C}7${NC}  Check for updates"
     fi
-    echo -e "    ${C}7${NC}  Exit"
+    echo -e "    ${C}8${NC}  Exit"
     blank
-    tty_out "  ${W}?${NC} Choose [1-7]: "
+    tty_out "  ${W}?${NC} Choose [1-8]: "
     read -r choice < /dev/tty
     case "$choice" in
       1) screen_create ;;
       2) screen_manage ;;
-      3) screen_setup_forward ;;
-      4) screen_keygen ;;
+      3) screen_logs ;;
+      4) screen_setup_forward ;;
       5)
         header
         list_tunnels || true
         press_enter
         ;;
-      6) screen_update ;;
-      7) blank; ok "Goodbye."; blank; exit 0 ;;
+      6) screen_keygen ;;
+      7) screen_update ;;
+      8) blank; ok "Goodbye."; blank; exit 0 ;;
       *) warn "Invalid choice." ;;
     esac
   done
