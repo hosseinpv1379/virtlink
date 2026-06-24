@@ -101,8 +101,10 @@ func (t *IcmpTunnel) Up() error {
 		copy(fixedDst[:], ip)
 	}
 
-	go t.rxLoop(fixedDst)
-	go t.txLoop(fixedDst)
+	rawFd := t.rawFd
+	tunFd := t.tunFd
+	go t.rxLoop(rawFd, tunFd, fixedDst)
+	go t.txLoop(rawFd, tunFd, fixedDst)
 
 	done(dev, addr, peer,
 		"proto    : ICMP Echo (IP protocol 1, type=8 both directions)",
@@ -114,11 +116,15 @@ func (t *IcmpTunnel) Up() error {
 }
 
 // rxLoop: raw ICMP socket → TUN
-func (t *IcmpTunnel) rxLoop(fixedDst [4]byte) {
-	// IP header (20B) + ICMP header (8B) + payload
+func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 	buf := make([]byte, 1500+28)
 	for {
-		n, from, err := unix.Recvfrom(t.rawFd, buf, 0)
+		select {
+		case <-t.done:
+			return
+		default:
+		}
+		n, from, err := unix.Recvfrom(rawFd, buf, 0)
 		if err != nil {
 			select {
 			case <-t.done:
@@ -164,8 +170,8 @@ func (t *IcmpTunnel) rxLoop(fixedDst [4]byte) {
 			}
 		}
 
-		payload := icmp[8:] // skip ICMP header
-		if _, err := t.tunFd.Write(payload); err != nil {
+		payload := icmp[8:]
+		if _, err := tun.Write(payload); err != nil {
 			select {
 			case <-t.done:
 				return
@@ -177,10 +183,15 @@ func (t *IcmpTunnel) rxLoop(fixedDst [4]byte) {
 }
 
 // txLoop: TUN → raw ICMP socket
-func (t *IcmpTunnel) txLoop(fixedDst [4]byte) {
+func (t *IcmpTunnel) txLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 	buf := make([]byte, 65536)
 	for {
-		n, err := t.tunFd.Read(buf)
+		select {
+		case <-t.done:
+			return
+		default:
+		}
+		n, err := tun.Read(buf)
 		if err != nil {
 			select {
 			case <-t.done:
@@ -206,7 +217,7 @@ func (t *IcmpTunnel) txLoop(fixedDst [4]byte) {
 		seq := uint16(t.seq.Add(1))
 		frame := buildICMPEcho(icmpTunID, seq, buf[:n])
 		sa := &unix.SockaddrInet4{Addr: dst}
-		if err := unix.Sendto(t.rawFd, frame, 0, sa); err != nil {
+		if err := unix.Sendto(rawFd, frame, 0, sa); err != nil {
 			logDebug("icmp tx: " + err.Error())
 		}
 	}

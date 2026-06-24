@@ -93,8 +93,9 @@ func (t *UdpTunnel) Up() error {
 		t.lastPeer.Store(fixedPeer)
 	}
 
-	go t.rxLoop(mtu)
-	go t.txLoop(fixedPeer)
+	// Capture local refs — doClean() nils these fields, goroutines must not race on them
+	go t.rxLoop(t.udpConn, t.tunFd, mtu)
+	go t.txLoop(t.udpConn, t.tunFd, fixedPeer)
 
 	done(dev, addr, peer,
 		fmt.Sprintf("transport : UDP :%d  (no encryption)", port),
@@ -104,10 +105,15 @@ func (t *UdpTunnel) Up() error {
 }
 
 // rxLoop: UDP socket → TUN
-func (t *UdpTunnel) rxLoop(mtu int) {
+func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File, mtu int) {
 	buf := make([]byte, mtu+128)
 	for {
-		n, src, err := t.udpConn.ReadFromUDP(buf)
+		select {
+		case <-t.done:
+			return
+		default:
+		}
+		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			select {
 			case <-t.done:
@@ -117,9 +123,8 @@ func (t *UdpTunnel) rxLoop(mtu int) {
 				continue
 			}
 		}
-		// server: track client address
 		t.lastPeer.Store(src)
-		if _, err := t.tunFd.Write(buf[:n]); err != nil {
+		if _, err := tun.Write(buf[:n]); err != nil {
 			select {
 			case <-t.done:
 				return
@@ -131,10 +136,15 @@ func (t *UdpTunnel) rxLoop(mtu int) {
 }
 
 // txLoop: TUN → UDP socket
-func (t *UdpTunnel) txLoop(fixed *net.UDPAddr) {
+func (t *UdpTunnel) txLoop(conn *net.UDPConn, tun *os.File, fixed *net.UDPAddr) {
 	buf := make([]byte, 65536)
 	for {
-		n, err := t.tunFd.Read(buf)
+		select {
+		case <-t.done:
+			return
+		default:
+		}
+		n, err := tun.Read(buf)
 		if err != nil {
 			select {
 			case <-t.done:
@@ -149,10 +159,10 @@ func (t *UdpTunnel) txLoop(fixed *net.UDPAddr) {
 			if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
 				dst = p
 			} else {
-				continue // server waiting for first packet
+				continue
 			}
 		}
-		if _, err := t.udpConn.WriteToUDP(buf[:n], dst); err != nil {
+		if _, err := conn.WriteToUDP(buf[:n], dst); err != nil {
 			logDebug("udp tx: " + err.Error())
 		}
 	}

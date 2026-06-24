@@ -149,8 +149,11 @@ func (t *UdpObfsTunnel) Up() error {
 	}
 
 	// ── goroutines ────────────────────────────────────────────────────────────
-	go t.rxLoop(key, mask, mtu)
-	go t.txLoop(key, mask, mtu, fixedPeer)
+	// Capture local references NOW. doClean() will nil out t.udpConn / t.tunFd
+	// to signal cleanup, but goroutines hold their own ref so they never
+	// dereference a nil pointer — they simply get an error and check t.done.
+	go t.rxLoop(t.udpConn, t.tunFd, key, mask, mtu)
+	go t.txLoop(t.udpConn, t.tunFd, key, mask, mtu, fixedPeer)
 
 	logOK(fmt.Sprintf("encrypt=AES-256-GCM  mask=%s  padding=%v", mask, c.Obfs.Padding))
 
@@ -164,10 +167,18 @@ func (t *UdpObfsTunnel) Up() error {
 }
 
 // rxLoop: UDP → decrypt → TUN
-func (t *UdpObfsTunnel) rxLoop(key [32]byte, mask string, mtu int) {
+// conn and tun are passed by value so they're never nil even after doClean().
+func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, key [32]byte, mask string, mtu int) {
 	buf := make([]byte, mtu+256)
 	for {
-		n, src, err := t.udpConn.ReadFromUDP(buf)
+		// check shutdown before blocking
+		select {
+		case <-t.done:
+			return
+		default:
+		}
+
+		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			select {
 			case <-t.done:
@@ -187,7 +198,7 @@ func (t *UdpObfsTunnel) rxLoop(key [32]byte, mask string, mtu int) {
 		// server: dynamically track client's current IP:port
 		t.lastPeer.Store(src)
 
-		if _, err := t.tunFd.Write(pkt); err != nil {
+		if _, err := tun.Write(pkt); err != nil {
 			select {
 			case <-t.done:
 				return
@@ -199,10 +210,18 @@ func (t *UdpObfsTunnel) rxLoop(key [32]byte, mask string, mtu int) {
 }
 
 // txLoop: TUN → encrypt → UDP
-func (t *UdpObfsTunnel) txLoop(key [32]byte, mask string, mtu int, fixed *net.UDPAddr) {
+// conn and tun are passed by value so they're never nil even after doClean().
+func (t *UdpObfsTunnel) txLoop(conn *net.UDPConn, tun *os.File, key [32]byte, mask string, mtu int, fixed *net.UDPAddr) {
 	buf := make([]byte, mtu+4)
 	for {
-		n, err := t.tunFd.Read(buf)
+		// check shutdown before blocking
+		select {
+		case <-t.done:
+			return
+		default:
+		}
+
+		n, err := tun.Read(buf)
 		if err != nil {
 			select {
 			case <-t.done:
@@ -228,7 +247,7 @@ func (t *UdpObfsTunnel) txLoop(key [32]byte, mask string, mtu int, fixed *net.UD
 			}
 		}
 
-		if _, err := t.udpConn.WriteToUDP(frame, dst); err != nil {
+		if _, err := conn.WriteToUDP(frame, dst); err != nil {
 			logDebug("udp send: " + err.Error())
 		}
 	}

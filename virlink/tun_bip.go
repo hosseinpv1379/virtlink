@@ -97,8 +97,10 @@ func (t *BipTunnel) Up() error {
 		copy(fixedDst[:], ip)
 	}
 
-	go t.rxLoop(fixedDst)
-	go t.txLoop(fixedDst)
+	rawFd := t.rawFd
+	tunFd := t.tunFd
+	go t.rxLoop(rawFd, tunFd, fixedDst)
+	go t.txLoop(rawFd, tunFd, fixedDst)
 
 	done(dev, addr, peer,
 		fmt.Sprintf("proto    : IPv4 protocol %d (ICMPv6 number, DPI confusion)", bipProto),
@@ -110,11 +112,15 @@ func (t *BipTunnel) Up() error {
 }
 
 // rxLoop: raw socket → TUN.
-// Strips the outer IPv4 header and writes the inner IP packet to TUN.
-func (t *BipTunnel) rxLoop(fixedDst [4]byte) {
-	buf := make([]byte, 1500+20) // outer IP header + payload
+func (t *BipTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
+	buf := make([]byte, 1500+20)
 	for {
-		n, from, err := unix.Recvfrom(t.rawFd, buf, 0)
+		select {
+		case <-t.done:
+			return
+		default:
+		}
+		n, from, err := unix.Recvfrom(rawFd, buf, 0)
 		if err != nil {
 			select {
 			case <-t.done:
@@ -147,7 +153,7 @@ func (t *BipTunnel) rxLoop(fixedDst [4]byte) {
 		}
 
 		inner := buf[ihl:n]
-		if _, err := t.tunFd.Write(inner); err != nil {
+		if _, err := tun.Write(inner); err != nil {
 			select {
 			case <-t.done:
 				return
@@ -159,11 +165,15 @@ func (t *BipTunnel) rxLoop(fixedDst [4]byte) {
 }
 
 // txLoop: TUN → raw socket.
-// The inner IP packet becomes the payload of an outer IPv4 packet with proto=58.
-func (t *BipTunnel) txLoop(fixedDst [4]byte) {
+func (t *BipTunnel) txLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 	buf := make([]byte, 65536)
 	for {
-		n, err := t.tunFd.Read(buf)
+		select {
+		case <-t.done:
+			return
+		default:
+		}
+		n, err := tun.Read(buf)
 		if err != nil {
 			select {
 			case <-t.done:
@@ -186,8 +196,7 @@ func (t *BipTunnel) txLoop(fixedDst [4]byte) {
 		}
 
 		sa := &unix.SockaddrInet4{Addr: dst}
-		// Write inner IP packet — kernel adds outer IP header with proto=58
-		if err := unix.Sendto(t.rawFd, buf[:n], 0, sa); err != nil {
+		if err := unix.Sendto(rawFd, buf[:n], 0, sa); err != nil {
 			logDebug("bip tx: " + err.Error())
 		}
 	}
