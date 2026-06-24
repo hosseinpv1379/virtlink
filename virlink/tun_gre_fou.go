@@ -32,9 +32,6 @@ func (t *GreFouTunnel) Up() error {
 	step("kernel modules...")
 	loadModules("ip_gre", "fou")
 
-	step("sysctl (via /proc/sys)...")
-	applySysctl()
-
 	step("cleanup...")
 	t.doClean()
 
@@ -64,6 +61,9 @@ func (t *GreFouTunnel) Up() error {
 	}
 	logOK(fmt.Sprintf("%s  %s  MTU=%d", dev, addr, c.GreFou.MTU))
 
+	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
+	applyTunnelTuning(c, dev)
+
 	step("iptables MSS clamping...")
 	addMSS(dev)
 
@@ -82,6 +82,7 @@ func (t *GreFouTunnel) Down() error {
 }
 
 func (t *GreFouTunnel) doClean() {
+	restoreTunnelTuning()
 	nlDown(t.dev())
 	try("ip", "fou", "del", "port", fmt.Sprint(t.cfg.GreFou.Port))
 }

@@ -39,13 +39,6 @@ func (t *BondedTunnel) Up() error {
 	step("kernel modules...")
 	loadModules("ip_gre", "fou")
 
-	step("sysctl (via /proc/sys)...")
-	applySysctl()
-	// per-flow ECMP hashing: hash on src+dst+port so flows spread across paths
-	if err := nlSysctl("net.ipv4.fib_multipath_hash_policy", "1"); err != nil {
-		warn("fib_multipath_hash_policy: " + err.Error())
-	}
-
 	step("cleanup...")
 	t.doClean()
 
@@ -102,6 +95,9 @@ func (t *BondedTunnel) Up() error {
 	}
 	logOK(fmt.Sprintf("route %s/32 nexthop %s nexthop %s", peer, dev0, dev1))
 
+	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
+	applyTunnelTuning(c, dev0, dev1)
+
 	step("iptables MSS clamping...")
 	addMSS(dev0)
 	addMSS(dev1)
@@ -127,6 +123,7 @@ func (t *BondedTunnel) Down() error {
 }
 
 func (t *BondedTunnel) doClean() {
+	restoreTunnelTuning()
 	nlDown(t.dev0(), t.dev1())
 	try("ip", "fou", "del", "port", fmt.Sprint(t.cfg.Bonded.Port1))
 	try("ip", "fou", "del", "port", fmt.Sprint(t.cfg.Bonded.Port2))

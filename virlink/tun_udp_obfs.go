@@ -29,20 +29,11 @@ import (
 	"net"
 	"os"
 	"sync/atomic"
-	"unsafe"
 
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
 
-const (
-	obfsSubnet = "10.20.20.0/24"
-
-	// Linux TUN constants
-	iffTun   = 0x0001
-	iffNoPi  = 0x1000
-	tunSetIff = uintptr(0x400454ca) // TUNSETIFF ioctl
-)
+const obfsSubnet = "10.20.20.0/24"
 
 // fake QUIC v1 Initial Long Header (15 bytes, DCID randomised per packet)
 var quicPrefix = [15]byte{
@@ -71,11 +62,12 @@ var dtlsPrefix = [13]byte{
 // so both goroutines share the same object.
 type UdpObfsTunnel struct {
 	cfg      *Config
-	tunFd    *os.File
+	tun      *TunDev
 	udpConn  *net.UDPConn
-	gcm      cipher.AEAD  // cached — avoids aes.NewCipher+NewGCM per packet
+	gcm      cipher.AEAD
 	done     chan struct{}
-	lastPeer atomic.Value // *net.UDPAddr — server dynamically tracks client
+	stop     stoppedFlag
+	lastPeer atomic.Value
 }
 
 func (t *UdpObfsTunnel) DevName() string   { return "udpobfs0" }
@@ -120,15 +112,12 @@ func (t *UdpObfsTunnel) Up() error {
 
 	header(fmt.Sprintf("udp-obfs / %s  mask=%s", c.Mode, mask))
 
-	step("sysctl (via /proc/sys)...")
-	applySysctl()
-
 	step("cleanup...")
 	t.doClean()
 
 	// ── TUN device (/dev/net/tun) ─────────────────────────────────────────────
-	step(fmt.Sprintf("TUN device %s...", dev))
-	t.tunFd, err = openTunDev(dev)
+	step(fmt.Sprintf("TUN device %s ×%d queues...", dev, tunQueues))
+	t.tun, err = openTunMulti(dev, tunQueues)
 	if err != nil {
 		return fmt.Errorf("tun: %w", err)
 	}
@@ -148,7 +137,10 @@ func (t *UdpObfsTunnel) Up() error {
 	if err := netlink.LinkSetUp(l); err != nil {
 		return fmt.Errorf("link up: %w", err)
 	}
-	logOK(fmt.Sprintf("%s  %s  MTU=%d", dev, addr, mtu))
+	logOK(fmt.Sprintf("%s  %s  MTU=%d  queues=%d", dev, addr, mtu, tunQueues))
+
+	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
+	applyTunnelTuning(c, dev)
 
 	// ── UDP socket ────────────────────────────────────────────────────────────
 	step(fmt.Sprintf("UDP socket :%d...", port))
@@ -172,9 +164,11 @@ func (t *UdpObfsTunnel) Up() error {
 	// Capture local references NOW. doClean() will nil out t.udpConn / t.tunFd
 	// to signal cleanup, but goroutines hold their own ref so they never
 	// dereference a nil pointer — they simply get an error and check t.done.
-	gcm := t.gcm // local ref (cipher.AEAD is safe for concurrent use)
-	go t.rxLoop(t.udpConn, t.tunFd, gcm, mask, mtu)
-	go t.txLoop(t.udpConn, t.tunFd, gcm, mask, mtu, fixedPeer)
+	gcm := t.gcm
+	go t.rxLoop(t.udpConn, t.tun.Fd0(), gcm, mask)
+	for _, q := range t.tun.fds {
+		go t.txLoop(t.udpConn, q, gcm, mask, fixedPeer)
+	}
 
 	logOK(fmt.Sprintf("encrypt=AES-256-GCM  mask=%s  padding=%v", mask, c.Obfs.Padding))
 
@@ -190,78 +184,44 @@ func (t *UdpObfsTunnel) Up() error {
 // rxLoop: UDP → decrypt → TUN
 // conn and tun are passed as values so they're never nil after doClean().
 // Uses a pre-allocated buffer from the pool — zero per-packet allocation.
-func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD, mask string, mtu int) {
+func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD, mask string) {
 	buf := getBuf()
 	defer putBuf(buf)
-	_ = mtu
 	for {
-		select {
-		case <-t.done:
-			return
-		default:
-		}
-
 		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			select {
-			case <-t.done:
+			if t.stop.stopped() {
 				return
-			default:
-				logWarn("rx: " + err.Error())
-				continue
 			}
+			continue
 		}
-
 		pkt, err := obfsDecrypt(buf[:n], gcm, mask, t.cfg.Obfs.Padding)
 		if err != nil {
 			logDebug(fmt.Sprintf("rx from %s: %v", src, err))
 			continue
 		}
-
 		t.lastPeer.Store(src)
-
-		if _, err := tun.Write(pkt); err != nil {
-			select {
-			case <-t.done:
-				return
-			default:
-				logWarn("tun write: " + err.Error())
-			}
+		if err := tunWrite(tun, pkt); err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
 		}
 	}
 }
 
-// txLoop: TUN → encrypt → UDP
-// conn and tun are passed as values so they're never nil after doClean().
-// Uses a pre-allocated buffer from the pool — zero per-packet allocation.
-func (t *UdpObfsTunnel) txLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD, mask string, mtu int, fixed *net.UDPAddr) {
+func (t *UdpObfsTunnel) txLoop(conn *net.UDPConn, qfd *os.File, gcm cipher.AEAD, mask string, fixed *net.UDPAddr) {
 	buf := getBuf()
 	defer putBuf(buf)
-	_ = mtu
 	for {
-		select {
-		case <-t.done:
-			return
-		default:
-		}
-
-		n, err := tun.Read(buf)
+		n, err := tunRead(qfd, buf)
 		if err != nil {
-			select {
-			case <-t.done:
+			if t.stop.stopped() {
 				return
-			default:
-				logWarn("tun read: " + err.Error())
-				continue
 			}
-		}
-
-		frame, err := obfsEncrypt(buf[:n], gcm, mask, t.cfg.Obfs.Padding)
-		if err != nil {
-			logDebug("encrypt: " + err.Error())
 			continue
 		}
-
+		frame, err := obfsEncrypt(buf[:n], gcm, mask, t.cfg.Obfs.Padding)
+		if err != nil {
+			continue
+		}
 		dst := fixed
 		if dst == nil {
 			if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
@@ -270,7 +230,6 @@ func (t *UdpObfsTunnel) txLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD,
 				continue
 			}
 		}
-
 		if _, err := conn.WriteToUDP(frame, dst); err != nil {
 			logDebug("udp send: " + err.Error())
 		}
@@ -284,21 +243,19 @@ func (t *UdpObfsTunnel) Down() error {
 }
 
 func (t *UdpObfsTunnel) doClean() {
+	restoreTunnelTuning()
+	t.stop.stop()
 	if t.done != nil {
-		select {
-		case <-t.done:
-		default:
-			close(t.done)
-		}
+		close(t.done)
 		t.done = nil
 	}
 	if t.udpConn != nil {
 		t.udpConn.Close()
 		t.udpConn = nil
 	}
-	if t.tunFd != nil {
-		t.tunFd.Close()
-		t.tunFd = nil
+	if t.tun != nil {
+		t.tun.Close()
+		t.tun = nil
 	}
 	nlDown(t.DevName())
 }
@@ -307,36 +264,6 @@ func (t *UdpObfsTunnel) Status() {
 	if l, err := netlink.LinkByName(t.DevName()); err == nil {
 		fmt.Printf("  %s: flags=%v\n", l.Attrs().Name, l.Attrs().Flags)
 	}
-}
-
-// ── TUN device ────────────────────────────────────────────────────────────────
-
-// openTunDev creates a TUN interface by name and returns its file descriptor.
-// All subsequent reads/writes on the fd are raw IP packets.
-// txqueuelen is set to 1000 (vs default 100) to absorb packet bursts.
-func openTunDev(name string) (*os.File, error) {
-	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open /dev/net/tun: %w", err)
-	}
-
-	// Build ifreq: name (16B) + flags (2B) + padding
-	var ifr [40]byte
-	copy(ifr[:16], name)
-	binary.LittleEndian.PutUint16(ifr[16:], iffTun|iffNoPi)
-
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd),
-		tunSetIff, uintptr(unsafe.Pointer(&ifr[0]))); errno != 0 {
-		unix.Close(fd)
-		return nil, fmt.Errorf("TUNSETIFF %s: %w", name, errno)
-	}
-	f := os.NewFile(uintptr(fd), name)
-
-	// Increase tx queue so userspace bursts don't cause ENOBUFS drops.
-	if l, lerr := netlink.LinkByName(name); lerr == nil {
-		_ = netlink.LinkSetTxQLen(l, 10000)
-	}
-	return f, nil
 }
 
 // ── crypto ────────────────────────────────────────────────────────────────────

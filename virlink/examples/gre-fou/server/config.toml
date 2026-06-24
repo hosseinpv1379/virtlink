@@ -20,7 +20,8 @@ heartbeat_interval = 10
 encryption = false
 
 [tuning]
-bbr          = true
+enabled      = true
+mode         = "balanced"
 multipath    = false
 channel_size = 10_000
 

@@ -158,6 +158,16 @@ func nlSysctl(key, value string) error {
 	return os.WriteFile(path, []byte(value), 0644)
 }
 
+// readSysctl reads the current value of a kernel parameter (trailing newline stripped).
+func readSysctl(key string) (string, error) {
+	path := "/proc/sys/" + strings.ReplaceAll(key, ".", "/")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // mustIP4 parses and returns an IPv4 address; panics on invalid input

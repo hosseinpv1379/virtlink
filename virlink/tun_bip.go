@@ -1,23 +1,10 @@
-// tun_bip.go — BIP tunnel (IP protocol 58 / ICMPv6 number over IPv4).
+// tun_bip.go — BIP tunnel (IPv4 protocol 58).
 //
-// "BIP" uses IPv4 raw sockets with protocol number 58 (the ICMPv6 protocol
-// number) as the outer transport. This creates IPv4 packets with proto=58
-// in the IP header, which confuses DPI systems that only expect proto 58
-// to appear in IPv6 traffic.
-//
-// Architecture:
-//   [TUN device] ←→ [Go userspace] ←→ [raw IPv4 socket, proto=58]
-//
-// Wire format:
-//   outer: [IPv4 header, proto=58] [inner IP packet]
-//
-// No framing or encryption. The inner IP packet is the direct payload of the
-// outer IPv4 packet. Receive side strips the outer IP header.
+// Performance (v2.7): multi-queue TUN, peer filter, non-blocking raw socket.
 package main
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"sync/atomic"
 
@@ -26,18 +13,20 @@ import (
 )
 
 const (
-	bipSubnet  = "10.20.44.0/24"
-	bipProto   = 58 // ICMPv6 protocol number, used as transport over IPv4
+	bipSubnet = "10.20.44.0/24"
+	bipProto  = 58
 )
 
-// BipTunnel encapsulates IP traffic using IPv4 packets with protocol 58.
-// Requires CAP_NET_RAW (root).
 type BipTunnel struct {
 	cfg     *Config
-	tunFd   *os.File
-	rawFd   int // raw IPv4 socket with proto=58
+	tun     *TunDev
+	rawFd   int
+	lockFd  *os.File
 	done    chan struct{}
-	lastSrc atomic.Value // [4]byte — server tracks client IP
+	stop    stoppedFlag
+	lastSrc atomic.Value
+	peerIP  [4]byte
+	localIP [4]byte
 }
 
 func (t *BipTunnel) DevName() string   { return "bip-tun0" }
@@ -51,93 +40,78 @@ func (t *BipTunnel) Up() error {
 	peer := t.PeerIP()
 	mtu := c.Tunnel.MTU
 	if mtu == 0 {
-		mtu = 1480 // 1500 − 20 (outer IP header)
+		mtu = 1480
 	}
+	t.peerIP = ipTo4(c.RemoteIP)
+	t.localIP = ipTo4(c.LocalIP)
 
 	header("bip / " + c.Mode)
-	step("sysctl (via /proc/sys)...")
-	applySysctl()
-	step("cleanup...")
 	t.doClean()
 
-	// ── TUN device ────────────────────────────────────────────────────────────
-	step(fmt.Sprintf("TUN device %s...", dev))
 	var err error
-	t.tunFd, err = openTunDev(dev)
+	t.lockFd, err = acquireTunnelLock(dev)
+	if err != nil {
+		return err
+	}
+
+	t.tun, err = openTunMulti(dev, tunQueues)
 	if err != nil {
 		return fmt.Errorf("tun: %w", err)
 	}
-	l, err := netlink.LinkByName(dev)
-	if err != nil {
-		return fmt.Errorf("link %s: %w", dev, err)
-	}
+	l, _ := netlink.LinkByName(dev)
 	netlink.LinkSetMTU(l, mtu)
 	a, _ := netlink.ParseAddr(addr)
 	netlink.AddrAdd(l, a)
 	netlink.LinkSetUp(l)
-	logOK(fmt.Sprintf("%s  %s  MTU=%d", dev, addr, mtu))
+	logOK(fmt.Sprintf("%s  %s  queues=%d", dev, addr, tunQueues))
 
-	// ── raw socket, protocol 58 ───────────────────────────────────────────────
-	step(fmt.Sprintf("raw socket proto=%d...", bipProto))
+	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
+	applyTunnelTuning(c, dev)
+
 	t.rawFd, err = unix.Socket(unix.AF_INET, unix.SOCK_RAW, bipProto)
 	if err != nil {
 		return fmt.Errorf("SOCK_RAW proto=%d: %w", bipProto, err)
 	}
-	// 1-second receive timeout for graceful shutdown
-	tv := unix.Timeval{Sec: 1, Usec: 0}
-	_ = unix.SetsockoptTimeval(t.rawFd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
-	tuneRawSock(t.rawFd) // 4 MB socket buffers — prevents drops under burst
-	logOK(fmt.Sprintf("raw proto=%d socket ready", bipProto))
+	_ = unix.SetNonblock(t.rawFd, true)
+	tuneRawSock(t.rawFd)
+	logOK(fmt.Sprintf("raw proto=%d ready", bipProto))
 
 	addMSS(dev)
 	t.done = make(chan struct{})
 
-	var fixedDst [4]byte
-	if c.Mode == "client" {
-		ip := net.ParseIP(c.RemoteIP).To4()
-		copy(fixedDst[:], ip)
+	rawFd := t.rawFd
+	go t.rxLoop(rawFd, t.tun.Fd0())
+	for _, q := range t.tun.fds {
+		go t.txLoop(rawFd, q)
 	}
 
-	rawFd := t.rawFd
-	tunFd := t.tunFd
-	go t.rxLoop(rawFd, tunFd, fixedDst)
-	go t.txLoop(rawFd, tunFd, fixedDst)
-
 	done(dev, addr, peer,
-		fmt.Sprintf("proto    : IPv4 protocol %d (ICMPv6 number, DPI confusion)", bipProto),
-		fmt.Sprintf("local    : %s   remote : %s", c.LocalIP, c.RemoteIP),
-		"firewall : allow IP protocol 58 between servers",
-		"test     : ping -c3 "+peer,
+		fmt.Sprintf("proto : IPv4 proto %d  queues=%d", bipProto, tunQueues),
+		"test  : ping -c3 "+peer,
 	)
 	return nil
 }
 
-// rxLoop: raw socket → TUN.
-// Uses pre-allocated buffer from pool — zero per-packet allocation.
-func (t *BipTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
+func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
+	peer, local := t.peerIP, t.localIP
 	for {
-		select {
-		case <-t.done:
-			return
-		default:
-		}
 		n, from, err := unix.Recvfrom(rawFd, buf, 0)
 		if err != nil {
-			select {
-			case <-t.done:
+			if t.stop.stopped() {
 				return
-			default:
-				if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == unix.EBADF {
-					continue
-				}
-				logWarn("bip rx: " + err.Error())
+			}
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == unix.EINTR {
 				continue
 			}
+			logWarn("bip rx: " + err.Error())
+			continue
 		}
-
-		// strip outer IPv4 header
+		sa, ok := from.(*unix.SockaddrInet4)
+		if !ok || sa.Addr == local || sa.Addr != peer {
+			continue
+		}
 		if n < 20 {
 			continue
 		}
@@ -145,63 +119,36 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 		if n <= ihl {
 			continue
 		}
-
-		// filter by source IP
-		if sa, ok := from.(*unix.SockaddrInet4); ok {
-			if t.cfg.Mode == "server" {
-				t.lastSrc.Store(sa.Addr)
-			} else if sa.Addr != fixedDst {
-				continue
-			}
+		if t.cfg.Mode == "server" {
+			t.lastSrc.Store(sa.Addr)
 		}
-
-		inner := buf[ihl:n]
-		if _, err := tun.Write(inner); err != nil {
-			select {
-			case <-t.done:
-				return
-			default:
-				logWarn("tun write: " + err.Error())
-			}
+		if err := tunWrite(tun, buf[ihl:n]); err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
 		}
 	}
 }
 
-// txLoop: TUN → raw socket.
-// Uses pre-allocated buffer from pool — zero per-packet allocation.
-func (t *BipTunnel) txLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
+func (t *BipTunnel) txLoop(rawFd int, qfd *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
 	for {
-		select {
-		case <-t.done:
-			return
-		default:
-		}
-		n, err := tun.Read(buf)
+		n, err := tunRead(qfd, buf)
 		if err != nil {
-			select {
-			case <-t.done:
+			if t.stop.stopped() {
 				return
-			default:
-				logWarn("tun read: " + err.Error())
-				continue
 			}
+			continue
 		}
-
 		var dst [4]byte
 		if t.cfg.Mode == "client" {
-			dst = fixedDst
+			dst = t.peerIP
+		} else if v := t.lastSrc.Load(); v != nil {
+			dst = v.([4]byte)
 		} else {
-			if v := t.lastSrc.Load(); v != nil {
-				dst = v.([4]byte)
-			} else {
-				continue
-			}
+			continue
 		}
-
 		sa := &unix.SockaddrInet4{Addr: dst}
-		if err := unix.Sendto(rawFd, buf[:n], 0, sa); err != nil {
+		if err := unix.Sendto(rawFd, buf[:n], 0, sa); err != nil && err != unix.EAGAIN {
 			logDebug("bip tx: " + err.Error())
 		}
 	}
@@ -214,22 +161,22 @@ func (t *BipTunnel) Down() error {
 }
 
 func (t *BipTunnel) doClean() {
+	restoreTunnelTuning()
+	t.stop.stop()
 	if t.done != nil {
-		select {
-		case <-t.done:
-		default:
-			close(t.done)
-		}
+		close(t.done)
 		t.done = nil
 	}
-	if t.rawFd != 0 {
+	if t.rawFd > 0 {
 		unix.Close(t.rawFd)
 		t.rawFd = 0
 	}
-	if t.tunFd != nil {
-		t.tunFd.Close()
-		t.tunFd = nil
+	if t.tun != nil {
+		t.tun.Close()
+		t.tun = nil
 	}
+	releaseTunnelLock(t.lockFd)
+	t.lockFd = nil
 	delMSS(t.DevName())
 	nlDown(t.DevName())
 }

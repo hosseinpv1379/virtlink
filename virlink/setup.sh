@@ -9,7 +9,7 @@ INSTALL_DIR="/opt/virlink"
 VIRLINK_BIN="${INSTALL_DIR}/virlink"
 CONFIGS_DIR="${INSTALL_DIR}/configs"
 LOGS_DIR="/var/log/virlink"
-SCRIPT_VERSION="2.6.2"
+SCRIPT_VERSION="2.7.1"
 
 UPDATE_AVAILABLE=0
 LATEST_TAG=""
@@ -503,7 +503,8 @@ write_tuning() {
   cat >> "$file" << EOF
 
 [tuning]
-bbr          = true
+enabled      = true
+mode         = "balanced"
 multipath    = ${multipath}
 channel_size = 10_000
 

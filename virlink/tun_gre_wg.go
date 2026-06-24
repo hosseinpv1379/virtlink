@@ -50,9 +50,6 @@ func (t *GreWgTunnel) Up() error {
 	step("kernel modules...")
 	loadModules("wireguard", "ip_gre")
 
-	step("sysctl (via /proc/sys)...")
-	applySysctl()
-
 	step("cleanup...")
 	t.doClean()
 
@@ -96,6 +93,9 @@ func (t *GreWgTunnel) Up() error {
 	}
 	logOK(fmt.Sprintf("GRE %s  %s  (endpoints: WG overlay)", greDev, greAddr))
 
+	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
+	applyTunnelTuning(c, wgDev, greDev)
+
 	step("iptables MSS clamping...")
 	addMSS(greDev)
 
@@ -115,6 +115,7 @@ func (t *GreWgTunnel) Down() error {
 }
 
 func (t *GreWgTunnel) doClean() {
+	restoreTunnelTuning()
 	nlDown(t.greDev(), t.wgDev())
 }
 

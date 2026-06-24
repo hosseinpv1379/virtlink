@@ -40,9 +40,6 @@ func (t *GreTunnel) Up() error {
 	step("kernel modules...")
 	loadModules("ip_gre")
 
-	step("sysctl (via /proc/sys)...")
-	applySysctl()
-
 	step("cleanup...")
 	nlDown(dev)
 
@@ -59,6 +56,9 @@ func (t *GreTunnel) Up() error {
 	}
 	logOK(fmt.Sprintf("%s  %s  MTU=%d", dev, addr, mtu))
 
+	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
+	applyTunnelTuning(c, dev)
+
 	step("iptables MSS clamping...")
 	addMSS(dev)
 
@@ -72,6 +72,7 @@ func (t *GreTunnel) Up() error {
 
 func (t *GreTunnel) Down() error {
 	delMSS(t.DevName())
+	restoreTunnelTuning()
 	nlDown(t.DevName())
 	logOK("gre torn down")
 	return nil

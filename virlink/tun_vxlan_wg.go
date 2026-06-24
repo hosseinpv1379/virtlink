@@ -48,9 +48,6 @@ func (t *VxlanWgTunnel) Up() error {
 	step("kernel modules...")
 	loadModules("wireguard", "vxlan")
 
-	step("sysctl (via /proc/sys)...")
-	applySysctl()
-
 	step("cleanup...")
 	t.doClean()
 
@@ -94,6 +91,9 @@ func (t *VxlanWgTunnel) Up() error {
 	}
 	logOK(fmt.Sprintf("VXLAN %s  %s  VNI=%d", vxDev, ovAddr, wg.VNI))
 
+	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
+	applyTunnelTuning(c, wgDev, vxDev)
+
 	step("iptables MSS clamping...")
 	addMSS(vxDev)
 
@@ -113,6 +113,7 @@ func (t *VxlanWgTunnel) Down() error {
 }
 
 func (t *VxlanWgTunnel) doClean() {
+	restoreTunnelTuning()
 	nlDown(t.vxlanDev(), t.wgDev())
 }
 

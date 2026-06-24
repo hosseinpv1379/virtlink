@@ -1,5 +1,6 @@
 # ── compiled binary (distributed via GitHub Releases only) ────────────────────
-virlink
+virlink/virlink
+virlink/virlink-test
 virlink_new
 
 # ── user-generated runtime files ─────────────────────────────────────────────

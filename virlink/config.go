@@ -60,10 +60,12 @@ type SecurityCfg struct {
 
 // TuningCfg maps to [tuning]
 type TuningCfg struct {
-	BBR         bool `toml:"bbr"`          // enable BBR + fq qdisc
-	Multipath   bool `toml:"multipath"`    // ECMP per-flow hashing (bonded)
-	Workers     int  `toml:"workers"`      // 0 = auto (future use)
-	ChannelSize int  `toml:"channel_size"` // future use
+	Enabled     *bool  `toml:"enabled"`      // default true — temporary scoped tuning at tunnel up
+	Mode        string `toml:"mode"`         // balanced | fast | resource | latency (default balanced)
+	BBR         bool   `toml:"bbr"`          // legacy; mode takes precedence
+	Multipath   bool   `toml:"multipath"`    // ECMP per-flow hashing (bonded)
+	Workers     int    `toml:"workers"`      // 0 = auto (future use)
+	ChannelSize int    `toml:"channel_size"` // future use
 }
 
 // LoggingCfg maps to [logging]
@@ -276,7 +278,9 @@ func setDefaults(c *Config) {
 	if s.AuthKeyOut == "" { s.AuthKeyOut = "0xa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2" }
 	if s.AuthKeyIn == ""  { s.AuthKeyIn = "0xb2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1" }
 
-	if !c.Tuning.BBR { c.Tuning.BBR = true }
+	if c.Tuning.Mode == "" {
+		c.Tuning.Mode = tuningBalanced
+	}
 	if c.Tuning.ChannelSize == 0 { c.Tuning.ChannelSize = 10_000 }
 	if c.Logging.Level == ""     { c.Logging.Level = "info" }
 	if c.Health.Port == 0        { c.Health.Port = defaultHealthPort }
@@ -311,6 +315,9 @@ func validate(c *Config) error {
 	}
 	if t.LocalIP == t.RemoteIP {
 		return fmt.Errorf("[tunnel] local_ip and remote_ip must be different")
+	}
+	if err := validateTuningMode(tuningMode(c)); err != nil {
+		return err
 	}
 	return nil
 }

@@ -29,9 +29,6 @@ func (t *IpipFouTunnel) Up() error {
 	step("kernel modules...")
 	loadModules("ipip", "fou")
 
-	step("sysctl (via /proc/sys)...")
-	applySysctl()
-
 	step("cleanup...")
 	t.doClean()
 
@@ -60,6 +57,9 @@ func (t *IpipFouTunnel) Up() error {
 	}
 	logOK(fmt.Sprintf("%s  %s  MTU=%d", dev, addr, c.IpipFou.MTU))
 
+	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
+	applyTunnelTuning(c, dev)
+
 	step("iptables MSS clamping...")
 	addMSS(dev)
 
@@ -78,6 +78,7 @@ func (t *IpipFouTunnel) Down() error {
 }
 
 func (t *IpipFouTunnel) doClean() {
+	restoreTunnelTuning()
 	nlDown(t.dev(), "tunl0") // tunl0 is the kernel default IPIP device
 	try("ip", "fou", "del", "port", fmt.Sprint(t.cfg.IpipFou.Port))
 }

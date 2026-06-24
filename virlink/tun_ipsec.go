@@ -43,9 +43,6 @@ func (t *IpsecTunnel) Up() error {
 	step("kernel modules...")
 	loadModules("ip_gre", "fou", "esp4", "xfrm4_tunnel")
 
-	step("sysctl (via /proc/sys)...")
-	applySysctl()
-
 	step("cleanup...")
 	t.doClean(port, spiOut, spiIn)
 
@@ -70,6 +67,9 @@ func (t *IpsecTunnel) Up() error {
 		return err
 	}
 	logOK(fmt.Sprintf("%s  %s", dev, addr))
+
+	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
+	applyTunnelTuning(c, dev)
 
 	// ── IPsec xfrm (XFRM netlink — using ip xfrm for simplicity) ─────────────
 	step("IPsec xfrm states (SA)...")
@@ -136,6 +136,7 @@ func (t *IpsecTunnel) Down() error {
 }
 
 func (t *IpsecTunnel) doClean(port, spiOut, spiIn string) {
+	restoreTunnelTuning()
 	nlDown(t.dev())
 	try("ip", "fou", "del", "port", port)
 	c := t.cfg

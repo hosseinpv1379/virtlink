@@ -14,8 +14,7 @@ import (
 
 const (
 	maxPktBuf   = 65535 + 512
-	sockBufSize = 16 << 20 // 16 MB — absorbs multi-Gbps bursts
-	tunWorkers  = 4        // parallel sockets / TCP streams
+	sockBufSize = 16 << 20 // 16 MB
 	icmpHdrLen  = 8
 )
 
@@ -130,7 +129,26 @@ func closeFDs(fds []int) {
 // rrCounter round-robin index for multi-stream TX.
 type rrCounter struct{ n atomic.Uint32 }
 
-func (r *rrCounter) next() int { return int(r.n.Add(1)-1) % tunWorkers }
+func (r *rrCounter) next() int { return int(r.n.Add(1)-1) % tunQueues }
+
+// atomicSeqDedup — lock-free outer ICMP sequence dedup (no mutex in hot path).
+type atomicSeqDedup struct {
+	slots [4096]atomic.Uint32
+}
+
+func (d *atomicSeqDedup) dup(seq uint16) bool {
+	idx := uint32(seq) & 4095
+	tag := uint32(seq) << 16
+	for {
+		old := d.slots[idx].Load()
+		if old>>16 == uint32(seq) {
+			return true
+		}
+		if d.slots[idx].CompareAndSwap(old, tag) {
+			return false
+		}
+	}
+}
 
 // stoppedFlag is checked occasionally in hot loops (no select per packet).
 type stoppedFlag struct{ v atomic.Bool }

@@ -47,9 +47,6 @@ func (t *L2tpv3Tunnel) Up() error {
 	}
 	logOK("l2tp modules verified")
 
-	step("sysctl (via /proc/sys)...")
-	applySysctl()
-
 	step("cleanup...")
 	t.doClean(localTID, localSID)
 
@@ -94,6 +91,9 @@ func (t *L2tpv3Tunnel) Up() error {
 	}
 	logOK(fmt.Sprintf("%s  %s  MTU=%d", dev, addr, l.MTU))
 
+	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
+	applyTunnelTuning(c, dev)
+
 	step("iptables MSS clamping...")
 	addMSS(dev)
 
@@ -121,6 +121,7 @@ func (t *L2tpv3Tunnel) Down() error {
 }
 
 func (t *L2tpv3Tunnel) doClean(tid, sid int) {
+	restoreTunnelTuning()
 	// l2tp session/tunnel deletion must go through GENL
 	try("ip", "l2tp", "del", "session",
 		"tunnel_id", fmt.Sprint(tid), "session_id", fmt.Sprint(sid))
