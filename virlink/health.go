@@ -152,24 +152,27 @@ func (h *HealthMgr) runProbeSender(peerOverlay string, port int) {
 	}
 }
 
-// ── HTTP health endpoint ───────────────────────────────────────────────────────
+// ── HTTP health + bench endpoints ─────────────────────────────────────────────
 
 type healthJSON struct {
-	Status    string `json:"status"`
-	Handshake string `json:"handshake"`
-	LastSeen  string `json:"last_seen"`
-	Uptime    string `json:"uptime"`
-	Interface string `json:"interface"`
-	OverlayIP string `json:"overlay_ip"`
-	PeerIP    string `json:"peer_ip"`
-	TxProbes  uint64 `json:"tx_probes"`
-	RxProbes  uint64 `json:"rx_probes"`
+	Status       string       `json:"status"`
+	Handshake    string       `json:"handshake"`
+	LastSeen     string       `json:"last_seen"`
+	Uptime       string       `json:"uptime"`
+	Interface    string       `json:"interface"`
+	OverlayIP    string       `json:"overlay_ip"`
+	PeerIP       string       `json:"peer_ip"`
+	TxProbes     uint64       `json:"tx_probes"`
+	RxProbes     uint64       `json:"rx_probes"`
+	LastBench    *BenchResult `json:"last_bench,omitempty"`
+	BenchHint    string       `json:"bench_hint,omitempty"`
 }
 
-func (h *HealthMgr) runHTTPServer(port int, tun Tunnel) {
+func (h *HealthMgr) runHTTPServer(port int, tun Tunnel, bm *BenchMgr) {
 	mux := http.NewServeMux()
 
-	handler := func(w http.ResponseWriter, r *http.Request) {
+	// GET /health  — probe state + last bench result if available
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		hs := h.Handshake()
 		code := http.StatusOK
 		httpStatus := "ok"
@@ -188,13 +191,50 @@ func (h *HealthMgr) runHTTPServer(port int, tun Tunnel) {
 			TxProbes:  h.txCount.Load(),
 			RxProbes:  h.rxCount.Load(),
 		}
+		if bm != nil {
+			bm.mu.Lock()
+			resp.LastBench = bm.lastResult
+			bm.mu.Unlock()
+			if resp.LastBench == nil {
+				resp.BenchHint = fmt.Sprintf("GET :%d/bench to run bandwidth test", port)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
 		_ = json.NewEncoder(w).Encode(resp)
-	}
+	})
 
-	mux.HandleFunc("/health", handler)
-	mux.HandleFunc("/status", handler)
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/health", http.StatusFound)
+	})
+
+	// GET /bench  — run upload+download test through the tunnel overlay
+	// Blocks until complete (up to ~60s), then returns and caches for 2min.
+	mux.HandleFunc("/bench", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if bm == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprintln(w, `{"error":"bench disabled"}`)
+			return
+		}
+		// For non-GET requests return method not allowed
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// Use a longer write timeout for bench (may take up to 60s)
+		if rw, ok := w.(http.ResponseWriter); ok {
+			_ = rw
+		}
+		res := bm.RunBench()
+		code := http.StatusOK
+		if res != nil && res.Error != "" {
+			code = http.StatusInternalServerError
+		}
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(res)
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/health", http.StatusFound)
 	})
@@ -204,21 +244,23 @@ func (h *HealthMgr) runHTTPServer(port int, tun Tunnel) {
 		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 5 * time.Second,
+		WriteTimeout: 120 * time.Second, // bench can take up to 60s
 	}
-	logInfo(fmt.Sprintf("health HTTP server   listen=0.0.0.0:%d  GET /health", port))
+	logInfo(fmt.Sprintf("health HTTP  listen=0.0.0.0:%d  /health  /bench(port %d)", port, port+1))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logWarn(fmt.Sprintf("health HTTP: %v", err))
 	}
 }
 
-// ── Start — launches all three goroutines ─────────────────────────────────────
+// ── Start — launches all goroutines ───────────────────────────────────────────
 
-// Start begins the probe server, probe sender, and HTTP health server.
+// Start begins the probe server, probe sender, bench server, and HTTP server.
 // overlayIP must be the plain IP (no /prefix).
 // peerIP must be the plain peer overlay IP.
 func (h *HealthMgr) Start(overlayIP, peerIP string, port int, tun Tunnel) {
+	bm := NewBenchMgr(port, peerIP)
 	go h.runProbeServer(overlayIP, port)
 	go h.runProbeSender(peerIP, port)
-	go h.runHTTPServer(port, tun)
+	go bm.runServer()
+	go h.runHTTPServer(port, tun, bm)
 }
