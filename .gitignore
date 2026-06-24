@@ -1,0 +1,24 @@
+# ── compiled binary (distributed via GitHub Releases only) ────────────────────
+virlink
+virlink_new
+
+# ── user-generated runtime files ─────────────────────────────────────────────
+configs/
+/var/run/virlink/
+/var/log/virlink/
+
+# ── build artefacts ───────────────────────────────────────────────────────────
+*.o
+*.a
+*.tar.gz
+
+# ── unrelated directories ─────────────────────────────────────────────────────
+virtual-links/
+virtual-links.tar.gz
+kernel-tunnels/
+docs/
+
+# ── OS / IDE ──────────────────────────────────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
