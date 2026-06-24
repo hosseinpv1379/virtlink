@@ -2,13 +2,10 @@
 package main
 
 import (
-	"context"
 	"encoding/binary"
-	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -98,77 +95,26 @@ func tuneTCPConn(conn net.Conn) {
 	}
 }
 
-func setSockReusePort(fd int) {
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, sockBufSize)
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, sockBufSize)
-}
-
-// listenUDPWorkers creates tunWorkers UDP sockets on the same port (SO_REUSEPORT).
-func listenUDPWorkers(port int) ([]*net.UDPConn, error) {
-	conns := make([]*net.UDPConn, 0, tunWorkers)
-	for i := 0; i < tunWorkers; i++ {
-		lc := net.ListenConfig{
-			Control: func(_ string, _ string, c syscall.RawConn) error {
-				return c.Control(func(fd uintptr) { setSockReusePort(int(fd)) })
-			},
-		}
-		pc, err := lc.ListenPacket(context.Background(), "udp4", portAddr(port))
-		if err != nil {
-			for _, c := range conns {
-				c.Close()
-			}
-			return nil, err
-		}
-		conns = append(conns, pc.(*net.UDPConn))
+// openRawICMP creates one raw ICMP socket (no SO_REUSEPORT — duplicates packets).
+func openRawICMP() (int, error) {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
+	if err != nil {
+		return 0, err
 	}
-	return conns, nil
+	tuneRawSock(fd)
+	return fd, nil
 }
 
-// dialUDPWorkers opens tunWorkers UDP sockets to the same remote endpoint.
-func dialUDPWorkers(remoteIP string, port int) ([]*net.UDPConn, error) {
-	conns := make([]*net.UDPConn, 0, tunWorkers)
-	for i := 0; i < tunWorkers; i++ {
-		lc := net.ListenConfig{
-			Control: func(_ string, _ string, c syscall.RawConn) error {
-				return c.Control(func(fd uintptr) { setSockReusePort(int(fd)) })
-			},
-		}
-		pc, err := lc.ListenPacket(context.Background(), "udp4", ":0")
-		if err != nil {
-			for _, c := range conns {
-				c.Close()
-			}
-			return nil, err
-		}
-		uc := pc.(*net.UDPConn)
-		tuneUDPConn(uc)
-		conns = append(conns, uc)
+// connectUDP binds the socket to a fixed peer (fewer lookups per send).
+func connectUDP(conn *net.UDPConn, dst *net.UDPAddr) error {
+	f, err := conn.File()
+	if err != nil {
+		return err
 	}
-	return conns, nil
-}
-
-func portAddr(port int) string {
-	return fmt.Sprintf(":%d", port)
-}
-
-// openRawICMPWorkers creates tunWorkers raw ICMP sockets with SO_REUSEPORT.
-func openRawICMPWorkers() ([]int, error) {
-	fds := make([]int, 0, tunWorkers)
-	for i := 0; i < tunWorkers; i++ {
-		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
-		if err != nil {
-			for _, f := range fds {
-				unix.Close(f)
-			}
-			return nil, err
-		}
-		setSockReusePort(fd)
-		tuneRawSock(fd)
-		fds = append(fds, fd)
-	}
-	return fds, nil
+	defer f.Close()
+	sa := &unix.SockaddrInet4{Port: dst.Port}
+	copy(sa.Addr[:], dst.IP.To4())
+	return unix.Connect(int(f.Fd()), sa)
 }
 
 func closeFDs(fds []int) {
@@ -179,15 +125,7 @@ func closeFDs(fds []int) {
 	}
 }
 
-func closeUDPs(conns []*net.UDPConn) {
-	for _, c := range conns {
-		if c != nil {
-			c.Close()
-		}
-	}
-}
-
-// rrCounter round-robin index for multi-socket TX.
+// rrCounter round-robin index for multi-stream TX.
 type rrCounter struct{ n atomic.Uint32 }
 
 func (r *rrCounter) next() int { return int(r.n.Add(1)-1) % tunWorkers }

@@ -1,10 +1,7 @@
 // tun_udp.go — plain UDP tunnel (no encryption).
 //
-// Performance (v2.6):
-//   • tunWorkers (4) UDP sockets with SO_REUSEPORT — kernel load-balances RX
-//   • Round-robin TX across sockets — multi-core scaling
-//   • Zero per-packet allocation (buffer pool)
-//   • 16 MB socket buffers
+// Single UDP socket for RX (SO_REUSEPORT multi-socket caused duplicate delivery
+// on some kernels).  TX uses a worker pool fed by one TUN reader for parallelism.
 package main
 
 import (
@@ -18,14 +15,19 @@ import (
 
 const udpRawSubnet = "10.20.42.0/24"
 
+type udpTxJob struct {
+	buf []byte
+	n   int
+}
+
 type UdpTunnel struct {
 	cfg      *Config
 	tunFd    *os.File
-	udpConns []*net.UDPConn
+	udpConn  *net.UDPConn
+	txCh     chan udpTxJob
 	done     chan struct{}
 	stop     stoppedFlag
 	lastPeer atomic.Value // *net.UDPAddr
-	rr       rrCounter
 }
 
 func (t *UdpTunnel) DevName() string   { return "udp-tun0" }
@@ -71,37 +73,38 @@ func (t *UdpTunnel) Up() error {
 	}
 	logOK(fmt.Sprintf("%s  %s  MTU=%d", dev, addr, mtu))
 
-	step(fmt.Sprintf("UDP sockets ×%d :%d (SO_REUSEPORT)...", tunWorkers, port))
-	if c.Mode == "server" {
-		t.udpConns, err = listenUDPWorkers(port)
-	} else {
-		t.udpConns, err = dialUDPWorkers(c.RemoteIP, port)
-	}
+	step(fmt.Sprintf("UDP socket :%d...", port))
+	t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{Port: port})
 	if err != nil {
 		return fmt.Errorf("udp :%d: %w", port, err)
 	}
-	for _, conn := range t.udpConns {
-		tuneUDPConn(conn)
+	tuneUDPConn(t.udpConn)
+	if c.Mode == "client" {
+		dst := &net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port}
+		t.lastPeer.Store(dst)
+		_ = connectUDP(t.udpConn, dst)
 	}
-	logOK(fmt.Sprintf("UDP ×%d :%d", len(t.udpConns), port))
+	logOK(fmt.Sprintf("UDP :%d  tx_workers=%d", port, tunWorkers))
 
 	addMSS(dev)
 	t.done = make(chan struct{})
+	t.txCh = make(chan udpTxJob, 512)
 
 	var fixedPeer *net.UDPAddr
 	if c.Mode == "client" {
 		fixedPeer = &net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port}
-		t.lastPeer.Store(fixedPeer)
 	}
 
+	conn := t.udpConn
 	tun := t.tunFd
-	for _, conn := range t.udpConns {
-		go t.rxLoop(conn, tun)
+	go t.rxLoop(conn, tun)
+	go t.txReader(tun)
+	for i := 0; i < tunWorkers; i++ {
+		go t.txWorker(conn, fixedPeer)
 	}
-	go t.txLoop(tun, fixedPeer)
 
 	done(dev, addr, peer,
-		fmt.Sprintf("transport : UDP ×%d :%d", tunWorkers, port),
+		fmt.Sprintf("transport : UDP :%d  tx_workers=%d", port, tunWorkers),
 		"test      : ping -c3 "+peer,
 	)
 	return nil
@@ -129,10 +132,10 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 	}
 }
 
-func (t *UdpTunnel) txLoop(tun *os.File, fixed *net.UDPAddr) {
+// txReader reads from TUN and hands copies to worker pool.
+func (t *UdpTunnel) txReader(tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
-	conns := t.udpConns
 	for {
 		n, err := tun.Read(buf)
 		if err != nil {
@@ -142,18 +145,35 @@ func (t *UdpTunnel) txLoop(tun *os.File, fixed *net.UDPAddr) {
 			logWarn("tun read: " + err.Error())
 			continue
 		}
+		pkt := getBuf()
+		copy(pkt, buf[:n])
+		select {
+		case t.txCh <- udpTxJob{pkt, n}:
+		default:
+			// queue full — drop back-pressure frame, keep tunnel alive
+			putBuf(pkt)
+		}
+		if t.stop.stopped() {
+			return
+		}
+	}
+}
+
+func (t *UdpTunnel) txWorker(conn *net.UDPConn, fixed *net.UDPAddr) {
+	for job := range t.txCh {
 		dst := fixed
 		if dst == nil {
 			if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
 				dst = p
 			} else {
+				putBuf(job.buf)
 				continue
 			}
 		}
-		idx := t.rr.next() % len(conns)
-		if _, err := conns[idx].WriteToUDP(buf[:n], dst); err != nil {
+		if _, err := conn.WriteToUDP(job.buf[:job.n], dst); err != nil {
 			logDebug("udp tx: " + err.Error())
 		}
+		putBuf(job.buf)
 	}
 }
 
@@ -165,6 +185,10 @@ func (t *UdpTunnel) Down() error {
 
 func (t *UdpTunnel) doClean() {
 	t.stop.stop()
+	if t.txCh != nil {
+		close(t.txCh)
+		t.txCh = nil
+	}
 	if t.done != nil {
 		select {
 		case <-t.done:
@@ -173,8 +197,10 @@ func (t *UdpTunnel) doClean() {
 		}
 		t.done = nil
 	}
-	closeUDPs(t.udpConns)
-	t.udpConns = nil
+	if t.udpConn != nil {
+		t.udpConn.Close()
+		t.udpConn = nil
+	}
 	if t.tunFd != nil {
 		t.tunFd.Close()
 		t.tunFd = nil

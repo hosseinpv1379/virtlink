@@ -1,10 +1,7 @@
 // tun_icmp.go — ICMP Echo tunnel (IP protocol 1).
 //
-// Performance (v2.6):
-//   • Zero per-packet heap allocation (in-place ICMP build + frame pool)
-//   • tunWorkers raw sockets with SO_REUSEPORT
-//   • Blocking recv (no 1 s poll timeout)
-//   • 16 MB socket buffers
+// Uses a SINGLE raw socket (SO_REUSEPORT on raw ICMP duplicates every packet).
+// Zero per-packet heap allocation via in-place frame build.
 package main
 
 import (
@@ -27,12 +24,11 @@ const (
 type IcmpTunnel struct {
 	cfg     *Config
 	tunFd   *os.File
-	rawFds  []int
+	rawFd   int
 	done    chan struct{}
 	stop    stoppedFlag
 	seq     atomic.Uint32
 	lastSrc atomic.Value // [4]byte
-	rr      rrCounter
 }
 
 func (t *IcmpTunnel) DevName() string   { return "icmp-tun0" }
@@ -71,12 +67,12 @@ func (t *IcmpTunnel) Up() error {
 	netlink.LinkSetUp(l)
 	logOK(fmt.Sprintf("%s  %s  MTU=%d", dev, addr, mtu))
 
-	step(fmt.Sprintf("raw ICMP sockets ×%d (SO_REUSEPORT)...", tunWorkers))
-	t.rawFds, err = openRawICMPWorkers()
+	step("raw ICMP socket (single, no REUSEPORT)...")
+	t.rawFd, err = openRawICMP()
 	if err != nil {
 		return fmt.Errorf("SOCK_RAW IPPROTO_ICMP: %w", err)
 	}
-	logOK(fmt.Sprintf("raw ICMP ×%d ready", len(t.rawFds)))
+	logOK("raw ICMP socket ready")
 
 	addMSS(dev)
 	t.done = make(chan struct{})
@@ -87,14 +83,13 @@ func (t *IcmpTunnel) Up() error {
 		copy(fixedDst[:], ip)
 	}
 
+	rawFd := t.rawFd
 	tun := t.tunFd
-	for _, fd := range t.rawFds {
-		go t.rxLoop(fd, tun, fixedDst)
-	}
-	go t.txLoop(tun, fixedDst)
+	go t.rxLoop(rawFd, tun, fixedDst)
+	go t.txLoop(rawFd, tun, fixedDst)
 
 	done(dev, addr, peer,
-		"proto    : ICMP Echo ×"+fmt.Sprint(tunWorkers),
+		"proto    : ICMP Echo (single socket)",
 		"id       : 0xCAFE",
 		"test     : ping -c3 "+peer,
 	)
@@ -137,8 +132,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 		} else if sa, ok := from.(*unix.SockaddrInet4); ok && sa.Addr != fixedDst {
 			continue
 		}
-		payload := icmp[8:]
-		if _, err := tun.Write(payload); err != nil {
+		if _, err := tun.Write(icmp[8:]); err != nil {
 			if t.stop.stopped() {
 				return
 			}
@@ -147,13 +141,12 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 	}
 }
 
-func (t *IcmpTunnel) txLoop(tun *os.File, fixedDst [4]byte) {
+func (t *IcmpTunnel) txLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 	buf := getBuf()
 	frame := getICMPFrame()
 	defer putBuf(buf)
 	defer putICMPFrame(frame)
 
-	fds := t.rawFds
 	for {
 		n, err := tun.Read(buf)
 		if err != nil {
@@ -173,9 +166,8 @@ func (t *IcmpTunnel) txLoop(tun *os.File, fixedDst [4]byte) {
 		}
 		seq := uint16(t.seq.Add(1))
 		pkt := buildICMPFrame(frame, icmpTunID, seq, buf[:n])
-		idx := t.rr.next() % len(fds)
 		sa := &unix.SockaddrInet4{Addr: dst}
-		if err := unix.Sendto(fds[idx], pkt, 0, sa); err != nil {
+		if err := unix.Sendto(rawFd, pkt, 0, sa); err != nil {
 			logDebug("icmp tx: " + err.Error())
 		}
 	}
@@ -197,8 +189,10 @@ func (t *IcmpTunnel) doClean() {
 		}
 		t.done = nil
 	}
-	closeFDs(t.rawFds)
-	t.rawFds = nil
+	if t.rawFd > 0 {
+		unix.Close(t.rawFd)
+		t.rawFd = 0
+	}
 	if t.tunFd != nil {
 		t.tunFd.Close()
 		t.tunFd = nil
