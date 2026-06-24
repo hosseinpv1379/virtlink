@@ -1,4 +1,5 @@
 // logger.go — structured timestamped logging.
+// All output goes through printLog so log files have a consistent format.
 package main
 
 import (
@@ -7,7 +8,6 @@ import (
 	"time"
 )
 
-// global log level (set from [logging] level in config)
 var globalLogLevel = "info"
 
 func initLogger(level string) {
@@ -20,24 +20,27 @@ func initLogger(level string) {
 
 func logDebug(msg string) {
 	if globalLogLevel == "debug" {
-		printLog("DEBUG", msg, cCyan)
+		printLog("DBG", msg, cCyan)
 	}
 }
 
 func logInfo(msg string) {
 	if globalLogLevel == "debug" || globalLogLevel == "info" {
-		printLog("INFO ", msg, "")
+		printLog("INF", msg, "")
 	}
 }
 
 func logWarn(msg string) {
-	printLog("WARN ", msg, cYellow)
+	printLog("WRN", msg, cYellow)
 }
 
 func logError(msg string) {
-	printLog("ERROR", msg, cRed)
+	printLog("ERR", msg, cRed)
 }
 
+// printLog writes a timestamped line to stdout (captured by systemd / log file).
+// Format (plain, no terminal):  2006-01-02 15:04:05  INF  message
+// Format (terminal):            2006-01-02 15:04:05  \033[36mDBG\033[0m  message
 func printLog(level, msg, clr string) {
 	ts := time.Now().Format("2006-01-02 15:04:05")
 	if clr != "" && isatty() {
@@ -47,36 +50,33 @@ func printLog(level, msg, clr string) {
 	}
 }
 
-// ── setup-phase pretty helpers (used inside tun_*.go during Up()) ─────────────
+// ── setup-phase helpers (tun_*.go Up()) ──────────────────────────────────────
+// All route through printLog so log files are uniform.
 
 func step(msg string) {
-	fmt.Printf("  %s %s\n", color(cCyan, "▸"), msg)
+	printLog("INF", "  setup  "+msg, cCyan)
 }
 
 func logOK(msg string) {
-	fmt.Printf("  %s %s\n", color(cGreen, "✓"), msg)
+	printLog("INF", "  ok     "+msg, cGreen)
 }
 
 func warn(msg string) {
-	fmt.Fprintf(os.Stderr, "  %s %s\n", color(cYellow, "⚠"), msg)
+	printLog("WRN", msg, cYellow)
 }
 
 func header(title string) {
-	fmt.Printf("\n%s\n\n", color(cBold, "══ virlink: "+title+" ══"))
+	printLog("INF", "════ virlink: "+title+" ════", cBold)
 }
 
 func done(iface, overlay, peer string, extras ...string) {
-	fmt.Printf("\n  %s\n", color(cGreen, "✅  tunnel is up"))
-	fmt.Printf("     interface  : %s\n", iface)
-	fmt.Printf("     overlay IP : %s\n", overlay)
-	fmt.Printf("     peer IP    : %s\n", peer)
+	printLog("INF", fmt.Sprintf("tunnel UP   dev=%-12s overlay=%-18s peer=%s", iface, overlay, peer), cGreen)
 	for _, e := range extras {
-		fmt.Printf("     %s\n", e)
+		printLog("INF", "            "+e, "")
 	}
-	fmt.Println()
 }
 
-// ── color helpers (also used by runner.go) ────────────────────────────────────
+// ── color helpers ─────────────────────────────────────────────────────────────
 
 const (
 	cReset  = "\033[0m"

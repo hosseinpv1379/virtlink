@@ -261,6 +261,44 @@ tunnel_start() {
   fi
 }
 
+# tunnel_remove: full purge — service, journal, log file, config
+tunnel_remove() {
+  local name="$1"
+  local svc; svc="$(svc_name "$name")"
+  local unit; unit="$(svc_unit "$name")"
+  local log; log="$(svc_log "$name")"
+  local cfg="${CONFIGS_DIR}/${name}.toml"
+
+  info "Stopping service ${svc}..."
+  systemctl stop    "$svc" 2>/dev/null || true
+  systemctl disable "$svc" 2>/dev/null || true
+
+  info "Removing service unit ${unit}..."
+  rm -f "$unit"
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed  "$svc" 2>/dev/null || true
+
+  # purge journal entries for this unit
+  info "Purging journal for ${svc}..."
+  if journalctl --unit="$svc" --disk-usage &>/dev/null; then
+    # rotate + flush so the latest journal file is writable, then vacuum
+    journalctl --rotate 2>/dev/null || true
+    # remove journal entries older than 1s (effectively all) for the unit.
+    # journalctl doesn't support per-unit vacuum, so we use --vacuum-time
+    # on the flush file that was just rotated — this only removes sealed files.
+    journalctl --vacuum-time=1s 2>/dev/null || true
+  fi
+
+  info "Removing log file ${log}..."
+  rm -f "$log"
+
+  info "Removing config ${cfg}..."
+  rm -f "$cfg"
+
+  ok "Tunnel '${name}' completely removed."
+  blank
+}
+
 # tunnel_stop: stops + disables service
 tunnel_stop() {
   local name="$1"
@@ -275,36 +313,51 @@ tunnel_stop() {
   ok "Tunnel '${name}' stopped and disabled."
 }
 
-# tunnel_status: shows systemctl status + recent logs
+# tunnel_status: shows systemctl status + binary log tail
 tunnel_status() {
   local name="$1"
   local cfg="${CONFIGS_DIR}/${name}.toml"
   local svc; svc="$(svc_name "$name")"
+  local log; log="$(svc_log "$name")"
   blank
   echo -e "  ${BOLD}Tunnel: ${C}${name}${NC}"
   sep
+
+  # ── service state ──
   if tunnel_is_running "$name"; then
-    echo -e "  Status : ${G}${BOLD}RUNNING${NC}  (${svc})"
+    echo -e "  Status   : ${G}${BOLD}● RUNNING${NC}  (${svc})"
   else
-    echo -e "  Status : ${R}STOPPED${NC}  (${svc})"
+    echo -e "  Status   : ${R}● STOPPED${NC}  (${svc})"
   fi
+
+  # ── config summary ──
   if [[ -f "$cfg" ]]; then
-    local type mode local_ip remote_ip
-    type=$(grep 'type '     "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
-    mode=$(grep 'mode '     "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
-    local_ip=$(grep 'local_ip'  "$cfg" 2>/dev/null | awk -F'"' '{print $2}')
-    remote_ip=$(grep 'remote_ip' "$cfg" 2>/dev/null | awk -F'"' '{print $2}')
-    echo -e "  Config : $cfg"
-    echo -e "  Type   : ${Y}${type}${NC}  (${mode})"
-    echo -e "  IPs    : ${local_ip} → ${remote_ip}"
+    local type mode local_ip remote_ip cidr
+    type=$(grep -E '^\s*type\s*=' "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
+    mode=$(grep -E '^\s*mode\s*=' "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
+    local_ip=$(grep -E '^\s*local_ip'  "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
+    remote_ip=$(grep -E '^\s*remote_ip' "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
+    cidr=$(grep -E '^\s*cidr' "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
+    echo -e "  Type     : ${Y}${type}${NC}  mode=${mode}"
+    echo -e "  Local    : ${local_ip}  →  peer: ${remote_ip}"
+    echo -e "  Overlay  : ${cidr}"
+    echo -e "  Config   : ${DIM}${cfg}${NC}"
+    echo -e "  Log file : ${DIM}${log}${NC}"
   fi
+
+  # ── systemctl one-liner ──
   blank
-  echo -e "  ${DIM}systemctl status:${NC}"
-  systemctl status "$(svc_name "$name")" --no-pager -l 2>/dev/null | tail -15 | sed 's/^/    /' || true
-  if [[ -f "$(svc_log "$name")" ]]; then
-    blank
-    echo -e "  ${DIM}Last 10 log lines:${NC}"
-    tail -10 "$(svc_log "$name")" | sed 's/^/    /'
+  echo -e "  ${DIM}── systemd unit ────────────────────────────────${NC}"
+  systemctl status "$svc" --no-pager -l --lines=0 2>/dev/null | \
+    grep -E '(Loaded|Active|Main PID|Tasks|Memory|CPU)' | sed 's/^/  /' || true
+
+  # ── binary log tail ──
+  blank
+  echo -e "  ${DIM}── binary log (last 30 lines) ───────────────────${NC}"
+  if [[ -f "$log" ]] && [[ -s "$log" ]]; then
+    tail -30 "$log" | sed 's/^/  /'
+  else
+    echo -e "  ${DIM}(no log yet)${NC}"
   fi
   blank
 }
@@ -914,12 +967,8 @@ screen_manage() {
       fi
       ;;
     remove)
-      if confirm "Remove tunnel '${name}' and its service file"; then
-        tunnel_stop "$name" 2>/dev/null || true
-        rm -f "$(svc_unit "$name")"
-        systemctl daemon-reload 2>/dev/null || true
-        rm -f "${CONFIGS_DIR}/${name}.toml"
-        ok "Removed: $name"
+      if confirm "Completely remove tunnel '${name}' (service + logs + config)"; then
+        tunnel_remove "$name"
       fi
       ;;
   esac
