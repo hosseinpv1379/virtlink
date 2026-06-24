@@ -137,14 +137,22 @@ do_install() {
 
 # ── version / update ──────────────────────────────────────────────────────────
 check_update() {
-  local current latest
+  local current latest raw
   set +e
-  current=$("$VIRLINK_BIN" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "")
-  latest=$(curl -fsSL --connect-timeout 2 --max-time 4 \
-    "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null | \
-    python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || echo "")
+  current=$("$VIRLINK_BIN" --version 2>/dev/null \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+  [[ -n "$current" && "$current" != v* ]] && current="v${current}"
+
+  # Use grep+sed only — no python3 dependency
+  raw=$(curl -fsSL --connect-timeout 5 --max-time 8 \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null)
+  latest=$(echo "$raw" \
+    | grep '"tag_name"' | head -1 \
+    | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
   set -e
-  LATEST_TAG="$latest"
+
+  LATEST_TAG="${latest:-}"
   if [[ -n "$latest" && -n "$current" && "${latest#v}" != "${current#v}" ]]; then
     UPDATE_AVAILABLE=1
   else
@@ -1144,10 +1152,19 @@ screen_update() {
   info "Checking GitHub for latest release..."
   check_update
   local cur_ver
-  cur_ver=$("$VIRLINK_BIN" --version 2>/dev/null | grep -oE 'v[0-9.]+' || echo "?")
+  cur_ver=$("$VIRLINK_BIN" --version 2>/dev/null \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "?")
+  [[ "$cur_ver" != "?" && "$cur_ver" != v* ]] && cur_ver="v${cur_ver}"
   blank
   echo -e "  Installed : ${W}${cur_ver}${NC}"
-  echo -e "  Latest    : ${W}${LATEST_TAG:-unknown}${NC}"
+  if [[ -z "$LATEST_TAG" ]]; then
+    echo -e "  Latest    : ${R}could not reach GitHub${NC}"
+    echo -e "  ${DIM}Check: curl -s https://api.github.com/repos/${GITHUB_REPO}/releases/latest | grep tag_name${NC}"
+    blank
+    press_enter
+    return
+  fi
+  echo -e "  Latest    : ${W}${LATEST_TAG}${NC}"
   blank
   if (( UPDATE_AVAILABLE )); then
     if confirm "Update to ${LATEST_TAG}"; then
