@@ -1,0 +1,36 @@
+# ── virlink · L2TPv3 · SERVER (5.75.206.15) ───────────────────────────────────
+# Kernel Layer-2 tunnel over UDP
+#
+# Requires:  apt install linux-modules-extra-$(uname -r)
+# Usage:     sudo ./virlink -c config.toml
+# Overlay:   this host → 10.20.10.2/24
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tunnel]
+type      = "l2tpv3"
+mode      = "server"
+local_ip  = "5.75.206.15"
+remote_ip = "81.12.35.242"
+cidr      = "10.20.10.0/24"
+mtu       = 1464
+
+[transport]
+port  = 5059
+proto = "l2tp"
+
+[l2tp]
+client_tunnel_id  = 1000
+server_tunnel_id  = 2000
+client_session_id = 1000
+server_session_id = 2000
+
+[security]
+encryption = false
+
+[tuning]
+bbr          = true
+multipath    = false
+channel_size = 10_000
+
+[logging]
+level = "info"
