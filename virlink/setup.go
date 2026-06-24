@@ -13,11 +13,23 @@ func applySysctl() {
 	params := []struct{ k, v string }{
 		{"net.ipv4.ip_forward", "1"},
 		{"net.ipv6.conf.all.forwarding", "1"},
+		// congestion + qdisc
 		{"net.core.default_qdisc", "fq"},
 		{"net.ipv4.tcp_congestion_control", "bbr"},
+		// TCP buffer tuning
 		{"net.ipv4.tcp_rmem", "4096 1048576 134217728"},
 		{"net.ipv4.tcp_wmem", "4096 1048576 134217728"},
 		{"net.ipv4.tcp_mtu_probing", "1"},
+		// Allow socket buffers up to 128 MB — required for tuneUDPConn / tuneRawSock
+		// to actually get the 4 MB buffers they request.
+		{"net.core.rmem_max", "134217728"},
+		{"net.core.wmem_max", "134217728"},
+		{"net.core.rmem_default", "1048576"},
+		{"net.core.wmem_default", "1048576"},
+		// Larger kernel backlog so bursts don't cause ENOBUF in UDP / raw sockets
+		{"net.core.netdev_max_backlog", "65536"},
+		{"net.ipv4.udp_rmem_min", "65536"},
+		{"net.ipv4.udp_wmem_min", "65536"},
 	}
 	for _, p := range params {
 		if err := nlSysctl(p.k, p.v); err != nil {

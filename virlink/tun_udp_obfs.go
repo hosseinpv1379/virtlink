@@ -65,10 +65,15 @@ var dtlsPrefix = [13]byte{
 // UdpObfsTunnel is an obfuscated userspace tunnel.
 // It is the only tunnel type that does NOT use kernel GRE/IPIP/etc.
 // All crypto and forwarding happens inside this Go process.
+//
+// Performance: the cipher.AEAD is created ONCE in Up() and reused for every
+// packet.  cipher.AEAD.Seal/Open are documented as safe for concurrent use,
+// so both goroutines share the same object.
 type UdpObfsTunnel struct {
 	cfg      *Config
 	tunFd    *os.File
 	udpConn  *net.UDPConn
+	gcm      cipher.AEAD  // cached — avoids aes.NewCipher+NewGCM per packet
 	done     chan struct{}
 	lastPeer atomic.Value // *net.UDPAddr — server dynamically tracks client
 }
@@ -98,6 +103,21 @@ func (t *UdpObfsTunnel) Up() error {
 	}
 	key := deriveObfsKey(c.Obfs.Key)
 
+	// ── cache cipher once — reused for every packet ───────────────────────────
+	// aes.NewCipher + cipher.NewGCM are expensive; doing this per-packet would
+	// be the dominant CPU cost at high packet rates.
+	var err error
+	{
+		block, berr := aes.NewCipher(key[:])
+		if berr != nil {
+			return fmt.Errorf("aes init: %w", berr)
+		}
+		t.gcm, err = cipher.NewGCM(block)
+		if err != nil {
+			return fmt.Errorf("gcm init: %w", err)
+		}
+	}
+
 	header(fmt.Sprintf("udp-obfs / %s  mask=%s", c.Mode, mask))
 
 	step("sysctl (via /proc/sys)...")
@@ -108,7 +128,6 @@ func (t *UdpObfsTunnel) Up() error {
 
 	// ── TUN device (/dev/net/tun) ─────────────────────────────────────────────
 	step(fmt.Sprintf("TUN device %s...", dev))
-	var err error
 	t.tunFd, err = openTunDev(dev)
 	if err != nil {
 		return fmt.Errorf("tun: %w", err)
@@ -137,6 +156,7 @@ func (t *UdpObfsTunnel) Up() error {
 	if err != nil {
 		return fmt.Errorf("udp listen :%d: %w", port, err)
 	}
+	tuneUDPConn(t.udpConn) // 4 MB socket buffers — prevents drops under burst
 	logOK(fmt.Sprintf("UDP :%d", port))
 
 	t.done = make(chan struct{})
@@ -152,8 +172,9 @@ func (t *UdpObfsTunnel) Up() error {
 	// Capture local references NOW. doClean() will nil out t.udpConn / t.tunFd
 	// to signal cleanup, but goroutines hold their own ref so they never
 	// dereference a nil pointer — they simply get an error and check t.done.
-	go t.rxLoop(t.udpConn, t.tunFd, key, mask, mtu)
-	go t.txLoop(t.udpConn, t.tunFd, key, mask, mtu, fixedPeer)
+	gcm := t.gcm // local ref (cipher.AEAD is safe for concurrent use)
+	go t.rxLoop(t.udpConn, t.tunFd, gcm, mask, mtu)
+	go t.txLoop(t.udpConn, t.tunFd, gcm, mask, mtu, fixedPeer)
 
 	logOK(fmt.Sprintf("encrypt=AES-256-GCM  mask=%s  padding=%v", mask, c.Obfs.Padding))
 
@@ -167,11 +188,13 @@ func (t *UdpObfsTunnel) Up() error {
 }
 
 // rxLoop: UDP → decrypt → TUN
-// conn and tun are passed by value so they're never nil even after doClean().
-func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, key [32]byte, mask string, mtu int) {
-	buf := make([]byte, mtu+256)
+// conn and tun are passed as values so they're never nil after doClean().
+// Uses a pre-allocated buffer from the pool — zero per-packet allocation.
+func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD, mask string, mtu int) {
+	buf := getBuf()
+	defer putBuf(buf)
+	_ = mtu
 	for {
-		// check shutdown before blocking
 		select {
 		case <-t.done:
 			return
@@ -189,13 +212,12 @@ func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, key [32]byte, ma
 			}
 		}
 
-		pkt, err := obfsDecrypt(buf[:n], key, mask, t.cfg.Obfs.Padding)
+		pkt, err := obfsDecrypt(buf[:n], gcm, mask, t.cfg.Obfs.Padding)
 		if err != nil {
 			logDebug(fmt.Sprintf("rx from %s: %v", src, err))
 			continue
 		}
 
-		// server: dynamically track client's current IP:port
 		t.lastPeer.Store(src)
 
 		if _, err := tun.Write(pkt); err != nil {
@@ -210,11 +232,13 @@ func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, key [32]byte, ma
 }
 
 // txLoop: TUN → encrypt → UDP
-// conn and tun are passed by value so they're never nil even after doClean().
-func (t *UdpObfsTunnel) txLoop(conn *net.UDPConn, tun *os.File, key [32]byte, mask string, mtu int, fixed *net.UDPAddr) {
-	buf := make([]byte, mtu+4)
+// conn and tun are passed as values so they're never nil after doClean().
+// Uses a pre-allocated buffer from the pool — zero per-packet allocation.
+func (t *UdpObfsTunnel) txLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD, mask string, mtu int, fixed *net.UDPAddr) {
+	buf := getBuf()
+	defer putBuf(buf)
+	_ = mtu
 	for {
-		// check shutdown before blocking
 		select {
 		case <-t.done:
 			return
@@ -232,7 +256,7 @@ func (t *UdpObfsTunnel) txLoop(conn *net.UDPConn, tun *os.File, key [32]byte, ma
 			}
 		}
 
-		frame, err := obfsEncrypt(buf[:n], key, mask, t.cfg.Obfs.Padding)
+		frame, err := obfsEncrypt(buf[:n], gcm, mask, t.cfg.Obfs.Padding)
 		if err != nil {
 			logDebug("encrypt: " + err.Error())
 			continue
@@ -243,7 +267,7 @@ func (t *UdpObfsTunnel) txLoop(conn *net.UDPConn, tun *os.File, key [32]byte, ma
 			if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
 				dst = p
 			} else {
-				continue // server waiting for first client packet
+				continue
 			}
 		}
 
@@ -289,6 +313,7 @@ func (t *UdpObfsTunnel) Status() {
 
 // openTunDev creates a TUN interface by name and returns its file descriptor.
 // All subsequent reads/writes on the fd are raw IP packets.
+// txqueuelen is set to 1000 (vs default 100) to absorb packet bursts.
 func openTunDev(name string) (*os.File, error) {
 	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -305,7 +330,13 @@ func openTunDev(name string) (*os.File, error) {
 		unix.Close(fd)
 		return nil, fmt.Errorf("TUNSETIFF %s: %w", name, errno)
 	}
-	return os.NewFile(uintptr(fd), name), nil
+	f := os.NewFile(uintptr(fd), name)
+
+	// Increase tx queue so userspace bursts don't cause ENOBUFS drops.
+	if l, lerr := netlink.LinkByName(name); lerr == nil {
+		_ = netlink.LinkSetTxQLen(l, 1000)
+	}
+	return f, nil
 }
 
 // ── crypto ────────────────────────────────────────────────────────────────────
@@ -316,11 +347,13 @@ func deriveObfsKey(passphrase string) [32]byte {
 }
 
 // obfsEncrypt encrypts plaintext IP packet and prepends the chosen mask header.
+// gcm is the cached cipher — created once in Up(), safe for concurrent use.
 //
 // Plaintext inside GCM:
-//   [flags(1B)] [original packet] [random pad (optional)] [padLen(1B)]
-//   flags: 0x01 = padding present
-func obfsEncrypt(pkt []byte, key [32]byte, mask string, padding bool) ([]byte, error) {
+//
+//	[flags(1B)] [original packet] [random pad (optional)] [padLen(1B)]
+//	flags: 0x01 = padding present
+func obfsEncrypt(pkt []byte, gcm cipher.AEAD, mask string, padding bool) ([]byte, error) {
 	// build inner plaintext
 	inner := make([]byte, 1+len(pkt))
 	if padding {
@@ -329,9 +362,9 @@ func obfsEncrypt(pkt []byte, key [32]byte, mask string, padding bool) ([]byte, e
 		if _, err := rand.Read(pad); err != nil {
 			return nil, err
 		}
-		pad[padLen-1] = byte(padLen) // last byte = total pad length
+		pad[padLen-1] = byte(padLen)
 		inner = make([]byte, 1+len(pkt)+padLen)
-		inner[0] = 0x01 // flags: padding present
+		inner[0] = 0x01
 		copy(inner[1:], pkt)
 		copy(inner[1+len(pkt):], pad)
 	} else {
@@ -339,19 +372,14 @@ func obfsEncrypt(pkt []byte, key [32]byte, mask string, padding bool) ([]byte, e
 		copy(inner[1:], pkt)
 	}
 
-	// AES-256-GCM
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
+	// nonce: 12-byte random (GCM standard)
+	var nonceBuf [12]byte
+	if _, err := rand.Read(nonceBuf[:]); err != nil {
 		return nil, err
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
-	}
+	nonce := nonceBuf[:]
+
+	// encrypt — gcm.Seal appends to nil → allocates result once
 	ciphertext := gcm.Seal(nil, nonce, inner, nil)
 
 	// build wire frame: [mask header] [nonce] [ciphertext]
@@ -359,14 +387,13 @@ func obfsEncrypt(pkt []byte, key [32]byte, mask string, padding bool) ([]byte, e
 	switch mask {
 	case "quic":
 		h := quicPrefix
-		rand.Read(h[6:14]) // randomise DCID per packet
+		_, _ = rand.Read(h[6:14]) // randomise DCID per packet
 		hdr = h[:]
 	case "dtls":
 		h := dtlsPrefix
 		payLen := len(nonce) + len(ciphertext)
 		binary.BigEndian.PutUint16(h[11:], uint16(payLen))
 		hdr = h[:]
-	default: // noise: no header
 	}
 
 	frame := make([]byte, 0, len(hdr)+len(nonce)+len(ciphertext))
@@ -377,8 +404,8 @@ func obfsEncrypt(pkt []byte, key [32]byte, mask string, padding bool) ([]byte, e
 }
 
 // obfsDecrypt reverses obfsEncrypt.
-func obfsDecrypt(frame []byte, key [32]byte, mask string, _ bool) ([]byte, error) {
-	// strip mask header
+// gcm is the cached cipher — same object reused across all packets.
+func obfsDecrypt(frame []byte, gcm cipher.AEAD, mask string, _ bool) ([]byte, error) {
 	switch mask {
 	case "quic":
 		if len(frame) < len(quicPrefix) {
@@ -392,14 +419,6 @@ func obfsDecrypt(frame []byte, key [32]byte, mask string, _ bool) ([]byte, error
 		frame = frame[len(dtlsPrefix):]
 	}
 
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
 	ns := gcm.NonceSize()
 	if len(frame) < ns+gcm.Overhead()+1 {
 		return nil, fmt.Errorf("frame too short (%d bytes)", len(frame))

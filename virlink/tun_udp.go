@@ -81,6 +81,7 @@ func (t *UdpTunnel) Up() error {
 	if err != nil {
 		return fmt.Errorf("udp :%d: %w", port, err)
 	}
+	tuneUDPConn(t.udpConn) // 4 MB socket buffers — prevents kernel drops under burst
 	logOK(fmt.Sprintf("UDP :%d", port))
 
 	addMSS(dev)
@@ -105,8 +106,11 @@ func (t *UdpTunnel) Up() error {
 }
 
 // rxLoop: UDP socket → TUN
+// Uses pre-allocated buffer from pool — zero per-packet allocation.
 func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File, mtu int) {
-	buf := make([]byte, mtu+128)
+	buf := getBuf()
+	defer putBuf(buf)
+	_ = mtu // buf is already sized for any UDP datagram
 	for {
 		select {
 		case <-t.done:
@@ -136,8 +140,10 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File, mtu int) {
 }
 
 // txLoop: TUN → UDP socket
+// Uses pre-allocated buffer from pool — zero per-packet allocation.
 func (t *UdpTunnel) txLoop(conn *net.UDPConn, tun *os.File, fixed *net.UDPAddr) {
-	buf := make([]byte, 65536)
+	buf := getBuf()
+	defer putBuf(buf)
 	for {
 		select {
 		case <-t.done:

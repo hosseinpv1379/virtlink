@@ -88,7 +88,8 @@ func (t *IcmpTunnel) Up() error {
 	}
 	// 1-second receive timeout so the goroutine can check done periodically
 	tv := unix.Timeval{Sec: 1, Usec: 0}
-	unix.SetsockoptTimeval(t.rawFd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
+	_ = unix.SetsockoptTimeval(t.rawFd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
+	tuneRawSock(t.rawFd) // 4 MB socket buffers — prevents drops under burst
 	logOK("raw ICMP socket ready")
 
 	addMSS(dev)
@@ -116,8 +117,10 @@ func (t *IcmpTunnel) Up() error {
 }
 
 // rxLoop: raw ICMP socket → TUN
+// Uses pre-allocated buffer from pool — zero per-packet allocation.
 func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
-	buf := make([]byte, 1500+28)
+	buf := getBuf()
+	defer putBuf(buf)
 	for {
 		select {
 		case <-t.done:
@@ -183,8 +186,10 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 }
 
 // txLoop: TUN → raw ICMP socket
+// Uses pre-allocated buffer from pool — zero per-packet allocation.
 func (t *IcmpTunnel) txLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
-	buf := make([]byte, 65536)
+	buf := getBuf()
+	defer putBuf(buf)
 	for {
 		select {
 		case <-t.done:

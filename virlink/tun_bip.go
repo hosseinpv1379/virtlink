@@ -85,7 +85,8 @@ func (t *BipTunnel) Up() error {
 	}
 	// 1-second receive timeout for graceful shutdown
 	tv := unix.Timeval{Sec: 1, Usec: 0}
-	unix.SetsockoptTimeval(t.rawFd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
+	_ = unix.SetsockoptTimeval(t.rawFd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
+	tuneRawSock(t.rawFd) // 4 MB socket buffers — prevents drops under burst
 	logOK(fmt.Sprintf("raw proto=%d socket ready", bipProto))
 
 	addMSS(dev)
@@ -112,8 +113,10 @@ func (t *BipTunnel) Up() error {
 }
 
 // rxLoop: raw socket → TUN.
+// Uses pre-allocated buffer from pool — zero per-packet allocation.
 func (t *BipTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
-	buf := make([]byte, 1500+20)
+	buf := getBuf()
+	defer putBuf(buf)
 	for {
 		select {
 		case <-t.done:
@@ -165,8 +168,10 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
 }
 
 // txLoop: TUN → raw socket.
+// Uses pre-allocated buffer from pool — zero per-packet allocation.
 func (t *BipTunnel) txLoop(rawFd int, tun *os.File, fixedDst [4]byte) {
-	buf := make([]byte, 65536)
+	buf := getBuf()
+	defer putBuf(buf)
 	for {
 		select {
 		case <-t.done:
