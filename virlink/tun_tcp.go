@@ -1,22 +1,10 @@
 // tun_tcp.go — TCP tunnel.
 //
-// Architecture:
-//   [TUN device] ←→ [Go userspace] ←→ [TCP socket]
-//
-// Framing: [uint16 big-endian length (2 B)] [IP packet]
-//
-// Performance notes:
-//   • tcpWriteFrame uses net.Buffers (writev) — single syscall for hdr+payload.
-//   • rxLoop reuses a single pre-allocated buffer — zero per-packet allocation.
-//   • TCP_NODELAY on every connection — Nagle causes 40 ms latency spikes when
-//     the window is small (common for small-MTU tunnel traffic).
-//   • 4 MB read/write socket buffers absorb bursts without head-of-line blocking.
-//
-// WARNING — TCP-over-TCP:
-//   Carrying TCP inside TCP is inherently problematic.  When the inner TCP
-//   detects loss and retransmits, the outer TCP buffers and retransmits too,
-//   creating a cascade that collapses throughput.  For encrypted traffic prefer
-//   udp-obfs.  Use this mode only when TCP is the only allowed protocol.
+// Performance (v2.6):
+//   • tunWorkers parallel TCP streams (round-robin TX, per-stream RX)
+//   • atomic.Pointer conn slots — no mutex in hot path
+//   • writev framing, TCP_NODELAY, 16 MB buffers
+//   • Zero per-packet allocation in rx/tx loops
 package main
 
 import (
@@ -25,7 +13,7 @@ import (
 	"io"
 	"net"
 	"os"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -33,14 +21,14 @@ import (
 
 const tcpSubnet = "10.20.41.0/24"
 
-// TcpTunnel carries IP traffic over a TCP connection.
 type TcpTunnel struct {
 	cfg    *Config
 	tunFd  *os.File
 	ln     net.Listener
-	connMu sync.Mutex
-	conn   net.Conn
+	conns  [tunWorkers]atomic.Pointer[net.Conn]
 	done   chan struct{}
+	stop   stoppedFlag
+	rr     rrCounter
 }
 
 func (t *TcpTunnel) DevName() string   { return "tcp-tun0" }
@@ -55,7 +43,7 @@ func (t *TcpTunnel) Up() error {
 	port := c.Transport.Port
 	mtu := c.Tunnel.MTU
 	if mtu == 0 {
-		mtu = 1460 // 1500 − 20 (IP) − 20 (TCP)
+		mtu = 1460
 	}
 
 	header("tcp / " + c.Mode)
@@ -64,7 +52,6 @@ func (t *TcpTunnel) Up() error {
 	step("cleanup...")
 	t.doClean()
 
-	// ── TUN device ────────────────────────────────────────────────────────────
 	step(fmt.Sprintf("TUN device %s...", dev))
 	var err error
 	t.tunFd, err = openTunDev(dev)
@@ -90,7 +77,7 @@ func (t *TcpTunnel) Up() error {
 	addMSS(dev)
 	t.done = make(chan struct{})
 
-	tun := t.tunFd // local ref for goroutines (safe vs doClean nil-out)
+	tun := t.tunFd
 	go t.txLoop(tun)
 
 	if c.Mode == "server" {
@@ -98,98 +85,108 @@ func (t *TcpTunnel) Up() error {
 		if err != nil {
 			return fmt.Errorf("tcp listen :%d: %w", port, err)
 		}
-		logOK(fmt.Sprintf("TCP listening :%d", port))
+		logOK(fmt.Sprintf("TCP listening :%d  streams=%d", port, tunWorkers))
 		go t.acceptLoop(tun)
 	} else {
 		go t.connectLoop(tun)
 	}
 
 	done(dev, addr, peer,
-		fmt.Sprintf("transport : TCP :%d", port),
+		fmt.Sprintf("transport : TCP ×%d :%d", tunWorkers, port),
 		"reconnect : automatic (client retries every 3 s)",
-		"note      : prefer udp-obfs for better throughput",
 		"test      : ping -c3 "+peer,
 	)
 	return nil
 }
 
-// txLoop reads IP packets from TUN and writes framed to current TCP connection.
-// One goroutine, pre-allocated buffer — zero per-packet heap allocation.
+func (t *TcpTunnel) pickConn() net.Conn {
+	for i := 0; i < tunWorkers; i++ {
+		idx := t.rr.next() % tunWorkers
+		if c := t.conns[idx].Load(); c != nil {
+			return *c
+		}
+	}
+	return nil
+}
+
 func (t *TcpTunnel) txLoop(tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
 	for {
-		select {
-		case <-t.done:
-			return
-		default:
-		}
 		n, err := tun.Read(buf)
 		if err != nil {
-			select {
-			case <-t.done:
+			if t.stop.stopped() {
 				return
-			default:
-				logWarn("tun read: " + err.Error())
-				continue
 			}
+			logWarn("tun read: " + err.Error())
+			continue
 		}
-		t.connMu.Lock()
-		c := t.conn
-		t.connMu.Unlock()
+		c := t.pickConn()
 		if c == nil {
-			continue // no connection yet
+			continue
 		}
 		if err := tcpWriteFrame(c, buf[:n]); err != nil {
 			logDebug("tcp tx: " + err.Error())
-			t.connMu.Lock()
-			if t.conn == c {
-				_ = t.conn.Close()
-				t.conn = nil
-			}
-			t.connMu.Unlock()
+			t.clearConn(c)
 		}
 	}
 }
 
-// acceptLoop (server): accepts connections, tunes them, starts rx goroutine.
+func (t *TcpTunnel) clearConn(c net.Conn) {
+	for i := range t.conns {
+		if p := t.conns[i].Load(); p != nil && *p == c {
+			_ = c.Close()
+			t.conns[i].Store(nil)
+			return
+		}
+	}
+}
+
+func (t *TcpTunnel) setConn(slot int, c net.Conn) {
+	if old := t.conns[slot].Swap(&c); old != nil && *old != c {
+		_ = (*old).Close()
+	}
+}
+
 func (t *TcpTunnel) acceptLoop(tun *os.File) {
+	slot := 0
 	for {
 		conn, err := t.ln.Accept()
 		if err != nil {
-			select {
-			case <-t.done:
+			if t.stop.stopped() {
 				return
-			default:
-				logWarn("tcp accept: " + err.Error())
-				time.Sleep(100 * time.Millisecond)
-				continue
 			}
+			logWarn("tcp accept: " + err.Error())
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-		tuneTCPConn(conn) // TCP_NODELAY + 4 MB buffers
-		logInfo(fmt.Sprintf("tcp: client connected from %s", conn.RemoteAddr()))
-		t.connMu.Lock()
-		if t.conn != nil {
-			_ = t.conn.Close()
-		}
-		t.conn = conn
-		t.connMu.Unlock()
-		go t.rxLoop(conn, tun)
+		tuneTCPConn(conn)
+		logInfo(fmt.Sprintf("tcp: client connected from %s (stream %d)", conn.RemoteAddr(), slot%tunWorkers))
+		idx := slot % tunWorkers
+		slot++
+		t.setConn(idx, conn)
+		go t.rxLoop(conn, tun, idx)
 	}
 }
 
-// connectLoop (client): connects with retry, tunes connection.
 func (t *TcpTunnel) connectLoop(tun *os.File) {
 	addr := fmt.Sprintf("%s:%d", t.cfg.RemoteIP, t.cfg.Transport.Port)
+	for s := 0; s < tunWorkers; s++ {
+		go t.connectOne(tun, addr, s)
+	}
+	select {
+	case <-t.done:
+	}
+}
+
+func (t *TcpTunnel) connectOne(tun *os.File, addr string, slot int) {
 	for {
-		select {
-		case <-t.done:
+		if t.stop.stopped() {
 			return
-		default:
 		}
 		conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 		if err != nil {
-			logWarn(fmt.Sprintf("tcp connect %s: %v — retry in 3s", addr, err))
+			logWarn(fmt.Sprintf("tcp connect %s stream %d: %v — retry in 3s", addr, slot, err))
 			select {
 			case <-t.done:
 				return
@@ -197,45 +194,30 @@ func (t *TcpTunnel) connectLoop(tun *os.File) {
 				continue
 			}
 		}
-		tuneTCPConn(conn) // TCP_NODELAY + 4 MB buffers
-		logOK(fmt.Sprintf("tcp: connected to %s", addr))
-		t.connMu.Lock()
-		t.conn = conn
-		t.connMu.Unlock()
-		t.rxLoop(conn, tun) // blocks until connection drops
-		t.connMu.Lock()
-		if t.conn == conn {
-			t.conn = nil
-		}
-		t.connMu.Unlock()
+		tuneTCPConn(conn)
+		logOK(fmt.Sprintf("tcp: stream %d connected to %s", slot, addr))
+		t.setConn(slot, conn)
+		t.rxLoop(conn, tun, slot)
+		t.conns[slot].Store(nil)
 		select {
 		case <-t.done:
 			return
-		default:
-			time.Sleep(time.Second)
+		case <-time.After(time.Second):
 		}
 	}
 }
 
-// rxLoop reads framed IP packets from TCP and writes to TUN.
-// Uses a single pre-allocated buffer — zero per-packet heap allocation.
-func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File) {
+func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 	defer conn.Close()
 	buf := getBuf()
 	defer putBuf(buf)
 	var hdr [2]byte
 	for {
-		select {
-		case <-t.done:
-			return
-		default:
-		}
 		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-			select {
-			case <-t.done:
-			default:
-				logDebug("tcp rx: " + err.Error())
+			if !t.stop.stopped() {
+				logDebug(fmt.Sprintf("tcp rx stream %d: %v", slot, err))
 			}
+			t.conns[slot].CompareAndSwap(&conn, nil)
 			return
 		}
 		n := int(binary.BigEndian.Uint16(hdr[:]))
@@ -244,26 +226,20 @@ func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File) {
 			return
 		}
 		if _, err := io.ReadFull(conn, buf[:n]); err != nil {
-			select {
-			case <-t.done:
-			default:
-				logDebug("tcp rx read: " + err.Error())
+			if !t.stop.stopped() {
+				logDebug(fmt.Sprintf("tcp rx read stream %d: %v", slot, err))
 			}
 			return
 		}
 		if _, err := tun.Write(buf[:n]); err != nil {
-			select {
-			case <-t.done:
+			if t.stop.stopped() {
 				return
-			default:
-				logWarn("tun write: " + err.Error())
 			}
+			logWarn("tun write: " + err.Error())
 		}
 	}
 }
 
-// tcpWriteFrame writes a length-prefixed frame using writev (net.Buffers) —
-// a single syscall for header + payload, no intermediate copy.
 func tcpWriteFrame(conn net.Conn, data []byte) error {
 	var hdr [2]byte
 	binary.BigEndian.PutUint16(hdr[:], uint16(len(data)))
@@ -278,6 +254,7 @@ func (t *TcpTunnel) Down() error {
 }
 
 func (t *TcpTunnel) doClean() {
+	t.stop.stop()
 	if t.done != nil {
 		select {
 		case <-t.done:
@@ -290,12 +267,12 @@ func (t *TcpTunnel) doClean() {
 		_ = t.ln.Close()
 		t.ln = nil
 	}
-	t.connMu.Lock()
-	if t.conn != nil {
-		_ = t.conn.Close()
-		t.conn = nil
+	for i := range t.conns {
+		if p := t.conns[i].Load(); p != nil {
+			_ = (*p).Close()
+			t.conns[i].Store(nil)
+		}
 	}
-	t.connMu.Unlock()
 	if t.tunFd != nil {
 		_ = t.tunFd.Close()
 		t.tunFd = nil

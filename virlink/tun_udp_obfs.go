@@ -334,7 +334,7 @@ func openTunDev(name string) (*os.File, error) {
 
 	// Increase tx queue so userspace bursts don't cause ENOBUFS drops.
 	if l, lerr := netlink.LinkByName(name); lerr == nil {
-		_ = netlink.LinkSetTxQLen(l, 1000)
+		_ = netlink.LinkSetTxQLen(l, 10000)
 	}
 	return f, nil
 }

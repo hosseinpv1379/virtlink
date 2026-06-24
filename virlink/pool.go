@@ -1,75 +1,199 @@
 // pool.go — performance helpers shared by all user-space tunnel types.
-//
-// Performance problems solved here:
-//
-//  1. Per-packet heap allocation: every loop allocating make([]byte,N) triggers
-//     GC on every packet → latency spikes under load. sync.Pool recycles buffers.
-//
-//  2. Small socket buffers: Linux default SO_RCVBUF is ~208 KB.  At 1 Gbps and
-//     1500-byte packets that covers < 1 ms of burst — any hiccup drops packets.
-//     We bump all sockets to 4 MB receive + 4 MB send.
-//
-//  3. TCP Nagle: writing header then payload as two separate syscalls lets Nagle
-//     coalesce them into one segment, adding ~40 ms of delay when the window is
-//     small.  TCP_NODELAY disables this for tunnel connections.
-//
-//  4. Vectored I/O: net.Buffers.WriteTo uses writev(2) — header + payload in a
-//     single syscall without copying into a new buffer.
 package main
 
 import (
+	"context"
+	"encoding/binary"
+	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-// ── buffer pool ───────────────────────────────────────────────────────────────
-// Packets are at most 65535 bytes (uint16 max).  We add 512 bytes of headroom
-// so crypto/framing layers can work in-place without extra allocations.
+const (
+	maxPktBuf   = 65535 + 512
+	sockBufSize = 16 << 20 // 16 MB — absorbs multi-Gbps bursts
+	tunWorkers  = 4        // parallel sockets / TCP streams
+	icmpHdrLen  = 8
+)
 
-const maxPktBuf = 65535 + 512
-
-var pktPool = &sync.Pool{
-	New: func() interface{} {
+var pktPool = sync.Pool{
+	New: func() any {
 		b := make([]byte, maxPktBuf)
 		return &b
 	},
 }
 
-// getBuf returns a buffer from the pool (len == maxPktBuf).
-// Always call putBuf when done so the buffer is reused.
 func getBuf() []byte { return *pktPool.Get().(*[]byte) }
-
-// putBuf returns b to the pool.  b must have been obtained from getBuf.
 func putBuf(b []byte) {
 	b = b[:maxPktBuf]
 	pktPool.Put(&b)
 }
 
+// icmpFramePool holds reusable [8+maxIP] buffers for ICMP encapsulation.
+var icmpFramePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, icmpHdrLen+maxPktBuf)
+		return &b
+	},
+}
+
+func getICMPFrame() []byte { return *icmpFramePool.Get().(*[]byte) }
+func putICMPFrame(b []byte) {
+	b = b[:icmpHdrLen+maxPktBuf]
+	icmpFramePool.Put(&b)
+}
+
+// buildICMPFrame writes an ICMP Echo Request in-place into frame (len ≥ 8+len(payload)).
+// Returns the slice to send: frame[:8+payloadLen]. Zero heap allocation.
+func buildICMPFrame(frame []byte, id, seq uint16, payload []byte) []byte {
+	n := icmpHdrLen + len(payload)
+	pkt := frame[:n]
+	pkt[0] = 8 // Echo Request
+	pkt[1] = 0
+	pkt[2] = 0
+	pkt[3] = 0
+	binary.BigEndian.PutUint16(pkt[4:], id)
+	binary.BigEndian.PutUint16(pkt[6:], seq)
+	copy(pkt[8:], payload)
+	cs := icmpChecksum(pkt)
+	binary.BigEndian.PutUint16(pkt[2:], cs)
+	return pkt
+}
+
+func icmpChecksum(b []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(b[i])<<8 | uint32(b[i+1])
+	}
+	if len(b)&1 != 0 {
+		sum += uint32(b[len(b)-1]) << 8
+	}
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return ^uint16(sum)
+}
+
 // ── socket tuning ─────────────────────────────────────────────────────────────
 
-// tuneUDPConn sets 4 MB read/write kernel socket buffers on a UDP connection.
-// This must be called after Listen/Dial and before any Reads.
-// net.core.rmem_max must be ≥ 4 MB (applySysctl sets it to 128 MB).
 func tuneUDPConn(conn *net.UDPConn) {
-	_ = conn.SetReadBuffer(4 << 20)
-	_ = conn.SetWriteBuffer(4 << 20)
+	_ = conn.SetReadBuffer(sockBufSize)
+	_ = conn.SetWriteBuffer(sockBufSize)
 }
 
-// tuneRawSock sets 4 MB read/write kernel socket buffers on a raw fd.
 func tuneRawSock(fd int) {
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, 4<<20)
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4<<20)
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, sockBufSize)
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, sockBufSize)
 }
 
-// tuneTCPConn tunes a TCP connection for tunnel use:
-//   - TCP_NODELAY:  disable Nagle — critical when framing small packets back-to-back
-//   - 4 MB buffers: absorb bursts without head-of-line blocking
 func tuneTCPConn(conn net.Conn) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
-		_ = tc.SetReadBuffer(4 << 20)
-		_ = tc.SetWriteBuffer(4 << 20)
+		_ = tc.SetReadBuffer(sockBufSize)
+		_ = tc.SetWriteBuffer(sockBufSize)
 	}
 }
+
+func setSockReusePort(fd int) {
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, sockBufSize)
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, sockBufSize)
+}
+
+// listenUDPWorkers creates tunWorkers UDP sockets on the same port (SO_REUSEPORT).
+func listenUDPWorkers(port int) ([]*net.UDPConn, error) {
+	conns := make([]*net.UDPConn, 0, tunWorkers)
+	for i := 0; i < tunWorkers; i++ {
+		lc := net.ListenConfig{
+			Control: func(_ string, _ string, c syscall.RawConn) error {
+				return c.Control(func(fd uintptr) { setSockReusePort(int(fd)) })
+			},
+		}
+		pc, err := lc.ListenPacket(context.Background(), "udp4", portAddr(port))
+		if err != nil {
+			for _, c := range conns {
+				c.Close()
+			}
+			return nil, err
+		}
+		conns = append(conns, pc.(*net.UDPConn))
+	}
+	return conns, nil
+}
+
+// dialUDPWorkers opens tunWorkers UDP sockets to the same remote endpoint.
+func dialUDPWorkers(remoteIP string, port int) ([]*net.UDPConn, error) {
+	conns := make([]*net.UDPConn, 0, tunWorkers)
+	for i := 0; i < tunWorkers; i++ {
+		lc := net.ListenConfig{
+			Control: func(_ string, _ string, c syscall.RawConn) error {
+				return c.Control(func(fd uintptr) { setSockReusePort(int(fd)) })
+			},
+		}
+		pc, err := lc.ListenPacket(context.Background(), "udp4", ":0")
+		if err != nil {
+			for _, c := range conns {
+				c.Close()
+			}
+			return nil, err
+		}
+		uc := pc.(*net.UDPConn)
+		tuneUDPConn(uc)
+		conns = append(conns, uc)
+	}
+	return conns, nil
+}
+
+func portAddr(port int) string {
+	return fmt.Sprintf(":%d", port)
+}
+
+// openRawICMPWorkers creates tunWorkers raw ICMP sockets with SO_REUSEPORT.
+func openRawICMPWorkers() ([]int, error) {
+	fds := make([]int, 0, tunWorkers)
+	for i := 0; i < tunWorkers; i++ {
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
+		if err != nil {
+			for _, f := range fds {
+				unix.Close(f)
+			}
+			return nil, err
+		}
+		setSockReusePort(fd)
+		tuneRawSock(fd)
+		fds = append(fds, fd)
+	}
+	return fds, nil
+}
+
+func closeFDs(fds []int) {
+	for _, fd := range fds {
+		if fd > 0 {
+			unix.Close(fd)
+		}
+	}
+}
+
+func closeUDPs(conns []*net.UDPConn) {
+	for _, c := range conns {
+		if c != nil {
+			c.Close()
+		}
+	}
+}
+
+// rrCounter round-robin index for multi-socket TX.
+type rrCounter struct{ n atomic.Uint32 }
+
+func (r *rrCounter) next() int { return int(r.n.Add(1)-1) % tunWorkers }
+
+// stoppedFlag is checked occasionally in hot loops (no select per packet).
+type stoppedFlag struct{ v atomic.Bool }
+
+func (s *stoppedFlag) stop()     { s.v.Store(true) }
+func (s *stoppedFlag) stopped() bool { return s.v.Load() }

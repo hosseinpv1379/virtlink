@@ -1,13 +1,10 @@
-// tun_udp.go — plain UDP tunnel (no encryption, no obfuscation).
+// tun_udp.go — plain UDP tunnel (no encryption).
 //
-// Architecture:
-//   [TUN device] ←→ [Go userspace] ←→ [UDP socket]
-//
-// IP packets read from TUN are sent as raw UDP datagrams.
-// Received UDP datagrams are written directly to TUN.
-//
-// Server dynamically tracks client address from incoming packets.
-// No framing overhead — one UDP datagram = one IP packet.
+// Performance (v2.6):
+//   • tunWorkers (4) UDP sockets with SO_REUSEPORT — kernel load-balances RX
+//   • Round-robin TX across sockets — multi-core scaling
+//   • Zero per-packet allocation (buffer pool)
+//   • 16 MB socket buffers
 package main
 
 import (
@@ -21,14 +18,14 @@ import (
 
 const udpRawSubnet = "10.20.42.0/24"
 
-// UdpTunnel is a plain UDP tunnel with a TUN device.
-// Unlike udp-obfs, there is no AES encryption or protocol masking.
 type UdpTunnel struct {
 	cfg      *Config
 	tunFd    *os.File
-	udpConn  *net.UDPConn
+	udpConns []*net.UDPConn
 	done     chan struct{}
-	lastPeer atomic.Value // *net.UDPAddr — server tracks client dynamically
+	stop     stoppedFlag
+	lastPeer atomic.Value // *net.UDPAddr
+	rr       rrCounter
 }
 
 func (t *UdpTunnel) DevName() string   { return "udp-tun0" }
@@ -43,7 +40,7 @@ func (t *UdpTunnel) Up() error {
 	port := c.Transport.Port
 	mtu := c.Tunnel.MTU
 	if mtu == 0 {
-		mtu = 1472 // 1500 − 20 (IP) − 8 (UDP)
+		mtu = 1472
 	}
 
 	header("udp / " + c.Mode)
@@ -52,7 +49,6 @@ func (t *UdpTunnel) Up() error {
 	step("cleanup...")
 	t.doClean()
 
-	// ── TUN device ────────────────────────────────────────────────────────────
 	step(fmt.Sprintf("TUN device %s...", dev))
 	var err error
 	t.tunFd, err = openTunDev(dev)
@@ -75,90 +71,76 @@ func (t *UdpTunnel) Up() error {
 	}
 	logOK(fmt.Sprintf("%s  %s  MTU=%d", dev, addr, mtu))
 
-	// ── UDP socket ────────────────────────────────────────────────────────────
-	step(fmt.Sprintf("UDP socket :%d...", port))
-	t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{Port: port})
+	step(fmt.Sprintf("UDP sockets ×%d :%d (SO_REUSEPORT)...", tunWorkers, port))
+	if c.Mode == "server" {
+		t.udpConns, err = listenUDPWorkers(port)
+	} else {
+		t.udpConns, err = dialUDPWorkers(c.RemoteIP, port)
+	}
 	if err != nil {
 		return fmt.Errorf("udp :%d: %w", port, err)
 	}
-	tuneUDPConn(t.udpConn) // 4 MB socket buffers — prevents kernel drops under burst
-	logOK(fmt.Sprintf("UDP :%d", port))
+	for _, conn := range t.udpConns {
+		tuneUDPConn(conn)
+	}
+	logOK(fmt.Sprintf("UDP ×%d :%d", len(t.udpConns), port))
 
 	addMSS(dev)
 	t.done = make(chan struct{})
 
-	// client knows where to send; server learns from first packet
 	var fixedPeer *net.UDPAddr
 	if c.Mode == "client" {
 		fixedPeer = &net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port}
 		t.lastPeer.Store(fixedPeer)
 	}
 
-	// Capture local refs — doClean() nils these fields, goroutines must not race on them
-	go t.rxLoop(t.udpConn, t.tunFd, mtu)
-	go t.txLoop(t.udpConn, t.tunFd, fixedPeer)
+	tun := t.tunFd
+	for _, conn := range t.udpConns {
+		go t.rxLoop(conn, tun)
+	}
+	go t.txLoop(tun, fixedPeer)
 
 	done(dev, addr, peer,
-		fmt.Sprintf("transport : UDP :%d  (no encryption)", port),
+		fmt.Sprintf("transport : UDP ×%d :%d", tunWorkers, port),
 		"test      : ping -c3 "+peer,
 	)
 	return nil
 }
 
-// rxLoop: UDP socket → TUN
-// Uses pre-allocated buffer from pool — zero per-packet allocation.
-func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File, mtu int) {
+func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
-	_ = mtu // buf is already sized for any UDP datagram
 	for {
-		select {
-		case <-t.done:
-			return
-		default:
-		}
 		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			select {
-			case <-t.done:
+			if t.stop.stopped() {
 				return
-			default:
-				logWarn("udp rx: " + err.Error())
-				continue
 			}
+			logWarn("udp rx: " + err.Error())
+			continue
 		}
 		t.lastPeer.Store(src)
 		if _, err := tun.Write(buf[:n]); err != nil {
-			select {
-			case <-t.done:
+			if t.stop.stopped() {
 				return
-			default:
-				logWarn("tun write: " + err.Error())
 			}
+			logWarn("tun write: " + err.Error())
 		}
 	}
 }
 
-// txLoop: TUN → UDP socket
-// Uses pre-allocated buffer from pool — zero per-packet allocation.
-func (t *UdpTunnel) txLoop(conn *net.UDPConn, tun *os.File, fixed *net.UDPAddr) {
+func (t *UdpTunnel) txLoop(tun *os.File, fixed *net.UDPAddr) {
 	buf := getBuf()
 	defer putBuf(buf)
+	conns := t.udpConns
 	for {
-		select {
-		case <-t.done:
-			return
-		default:
-		}
 		n, err := tun.Read(buf)
 		if err != nil {
-			select {
-			case <-t.done:
+			if t.stop.stopped() {
 				return
-			default:
-				logWarn("tun read: " + err.Error())
-				continue
 			}
+			logWarn("tun read: " + err.Error())
+			continue
 		}
 		dst := fixed
 		if dst == nil {
@@ -168,7 +150,8 @@ func (t *UdpTunnel) txLoop(conn *net.UDPConn, tun *os.File, fixed *net.UDPAddr) 
 				continue
 			}
 		}
-		if _, err := conn.WriteToUDP(buf[:n], dst); err != nil {
+		idx := t.rr.next() % len(conns)
+		if _, err := conns[idx].WriteToUDP(buf[:n], dst); err != nil {
 			logDebug("udp tx: " + err.Error())
 		}
 	}
@@ -181,6 +164,7 @@ func (t *UdpTunnel) Down() error {
 }
 
 func (t *UdpTunnel) doClean() {
+	t.stop.stop()
 	if t.done != nil {
 		select {
 		case <-t.done:
@@ -189,10 +173,8 @@ func (t *UdpTunnel) doClean() {
 		}
 		t.done = nil
 	}
-	if t.udpConn != nil {
-		t.udpConn.Close()
-		t.udpConn = nil
-	}
+	closeUDPs(t.udpConns)
+	t.udpConns = nil
 	if t.tunFd != nil {
 		t.tunFd.Close()
 		t.tunFd = nil
