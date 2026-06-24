@@ -1,189 +1,190 @@
 # virlink
 
-**Kernel-native virtual tunnel manager for Linux.**  
-Build encrypted, obfuscated, or high-performance tunnels between two servers — managed by a single binary and an interactive setup script.
+**Kernel-native virtual tunnel manager** — GRE, IPIP, L2TP, WireGuard, obfuscated UDP, raw ICMP/TCP/UDP/BIP tunnels, all managed through a single binary and interactive setup script.
 
-[![Release](https://img.shields.io/github/v/release/hosseinpv1379/virtlink?label=release)](https://github.com/hosseinpv1379/virtlink/releases/latest)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-lightgrey)
-![Kernel](https://img.shields.io/badge/kernel-%E2%89%A55.4-important)
+[![Release](https://img.shields.io/github/v/release/hosseinpv1379/virtlink)](https://github.com/hosseinpv1379/virtlink/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-linux%20amd64-blue)](https://github.com/hosseinpv1379/virtlink/releases/latest)
 
 ---
 
-## Quick Install
-
-Run this on **both** servers (as root):
+## Quick Start
 
 ```bash
-bash <(curl -fsSL https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh)
+# Install (as root)
+sudo bash <(curl -fsSL https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh)
 ```
 
-Or download manually:
+This downloads the binary and setup script to `/opt/virlink`, creates symlinks in `/usr/local/bin`, and launches the interactive menu.
+
+After install, run from anywhere:
 
 ```bash
-wget https://github.com/hosseinpv1379/virtlink/releases/latest/download/virlink
-wget https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh
-chmod +x virlink
-sudo bash setup.sh
+sudo virlink-setup
 ```
 
 ---
 
 ## Tunnel Types
 
-| Type | Description | Encrypted | Best For |
-|------|-------------|:---------:|----------|
-| `gre-fou` | GRE encapsulated in UDP (FOU) | ✗ | Fast site-to-site link |
-| `ipip-fou` | IPIP encapsulated in UDP | ✗ | Lowest overhead |
-| `bonded-gre-fou` | Dual GRE with ECMP | ✗ | 2× bandwidth |
-| `l2tpv3` | L2TPv3 over UDP | ✗ | Layer-2 Ethernet bridge |
-| `gre-wg` | GRE tunnelled inside WireGuard | ✓ | Encrypted routing |
-| `vxlan-wg` | VXLAN over WireGuard | ✓ | Encrypted L2 overlay |
-| `gre-fou-ipsec` | GRE-FOU + IPsec ESP | ✓ | Kernel-level encryption |
-| `udp-obfs` | AES-256-GCM + fake protocol headers | ✓ | **DPI bypass / censorship** |
+| Type | Protocol | Description | Encryption | Best For |
+|------|----------|-------------|-----------|---------|
+| `gre-fou` | UDP | GRE wrapped in UDP (FOU) | ✗ | Fast site-to-site |
+| `ipip-fou` | UDP | IPIP wrapped in UDP | ✗ | Minimal overhead |
+| `bonded-gre-fou` | UDP | Dual GRE-FOU ECMP | ✗ | 2× bandwidth |
+| `l2tpv3` | UDP | L2TPv3 over UDP | ✗ | Layer-2 bridge |
+| `gre-wg` | UDP | GRE inside WireGuard | ✓ | Encrypted routing |
+| `udp-obfs` | UDP | AES-256-GCM + fake headers | ✓ | **DPI bypass / Iran** |
+| `gre-fou-ipsec` | UDP | GRE-FOU + IPsec ESP | ✓ | Encrypted FOU |
+| `gre` | IP/47 | Plain kernel GRE | ✗ | No UDP wrapper |
+| `tcp` | TCP | User-space TCP tunnel | ✗ | Firewall-friendly |
+| `udp` | UDP | User-space plain UDP | ✗ | Simple UDP transport |
+| `icmp` | IP/1 | ICMP Echo carrier | ✗ | DPI evasion |
+| `bip` | IP/58 | Proto-58 carrier (ICMPv6 number) | ✗ | DPI evasion |
 
 ---
 
-## Interactive Setup
-
-```bash
-sudo bash setup.sh
-```
+## Interactive Menu
 
 ```
-  ██╗   ██╗██╗██████╗ ██╗     ██╗███╗   ██╗██╗  ██╗
-  ██║   ██║██║██╔══██╗██║     ██║████╗  ██║██║ ██╔╝
-  ██║   ██║██║██████╔╝██║     ██║██╔██╗ ██║█████╔╝
-  ╚██╗ ██╔╝██║██╔══██╗██║     ██║██║╚██╗██║██╔═██╗
-   ╚████╔╝ ██║██║  ██║███████╗██║██║ ╚████║██║  ██╗
-    ╚═══╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝
-
-  Kernel Tunnel Manager  v2.0.0
+sudo virlink-setup
 
   1  Create new tunnel
-  2  Manage tunnels  (start / stop / restart / status / install as service)
+  2  Manage tunnels  (start / stop / status / install as service)
   3  Add port forward rule
   4  Generate WireGuard keypair
   5  List all tunnels
-  6  Exit
+  6  Update virlink  ← shows update badge when a new release is available
+  7  Exit
 ```
 
-### Direct commands
+**Version check** — on every menu open the binary version is compared against the latest GitHub release. If an update is available, option 6 is highlighted in yellow. The update downloads both the binary and setup script atomically, then restarts.
+
+### Direct sub-commands
 
 ```bash
-sudo bash setup.sh start    <tunnel-name>
-sudo bash setup.sh stop     <tunnel-name>
-sudo bash setup.sh restart  <tunnel-name>
-sudo bash setup.sh status   <tunnel-name>
-sudo bash setup.sh list
+sudo virlink-setup start   my-tunnel
+sudo virlink-setup stop    my-tunnel
+sudo virlink-setup restart my-tunnel
+sudo virlink-setup status  my-tunnel
+sudo virlink-setup list
+sudo virlink-setup update      # one-shot update check + apply
 ```
 
 ---
 
-## Config File
+## Manual usage
 
-Configs are stored in `configs/<name>.toml` and generated automatically by `setup.sh`.  
-You can also write them by hand:
+```bash
+# bring up (blocks — tunnel lives while process runs)
+sudo virlink -c /opt/virlink/configs/my-tunnel.toml
+
+# tear down
+sudo virlink -c /opt/virlink/configs/my-tunnel.toml --down
+
+# status
+sudo virlink -c /opt/virlink/configs/my-tunnel.toml --status
+
+# generate WireGuard keys
+virlink keygen
+
+# print version
+virlink --version
+```
+
+---
+
+## Config structure
 
 ```toml
 [tunnel]
-type      = "gre-fou"        # see tunnel types above
+type      = "gre-fou"        # see tunnel types table above
 mode      = "client"         # client | server
 local_ip  = "81.12.35.242"   # this server's public IP
-remote_ip = "5.75.206.15"    # peer server's public IP
-cidr      = "10.20.10.0/24"  # overlay subnet  (client → .1  server → .2)
+remote_ip = "5.75.206.15"    # peer's public IP
+cidr      = "10.20.10.0/24"  # client → .1 / server → .2
 mtu       = 1420
 
 [transport]
 port               = 5556
-heartbeat_interval = 10      # heartbeat log every N seconds
+heartbeat_interval = 10      # status log every N seconds
 
 [tuning]
-bbr = true
+bbr          = true
+channel_size = 10_000
 
 [logging]
-level = "info"   # debug | info | warn | error
+level = "info"
 
-# ── client-only port forwarding ───────────────────────────────────────────────
+# client-only port forwarding
 [forward]
 enabled = true
 rules   = ["1000:2000", "8080:80/tcp"]
-# → local :1000  →  peer overlay :2000
-# → local :8080  →  peer overlay :80  (TCP)
 ```
 
-### Extra section for `udp-obfs`
+### udp-obfs extra section
 
 ```toml
 [obfs]
-key     = "your_shared_secret"   # same on both sides
-mask    = "quic"                 # noise | quic | dtls
-padding = true                   # add random padding to defeat length analysis
+key     = "shared_secret"   # same on both sides
+mask    = "quic"            # noise | quic | dtls
+padding = true
 ```
 
-| mask | Disguises traffic as |
-|------|----------------------|
-| `noise` | Random UDP noise |
-| `quic` | QUIC v1 (Google / Cloudflare) |
-| `dtls` | DTLS 1.2 (WebRTC) |
+### Raw-socket tunnels (gre / icmp / bip)
 
----
+These use IP-level raw sockets — no `port` needed:
 
-## Manual Usage
+```toml
+[tunnel]
+type      = "icmp"
+mode      = "client"
+local_ip  = "81.12.35.242"
+remote_ip = "5.75.206.15"
+cidr      = "10.20.10.0/24"
+mtu       = 1472
 
-```bash
-# bring the tunnel up (daemon mode — press Ctrl+C to tear down)
-sudo ./virlink -c configs/my-tunnel.toml
-
-# tear down immediately
-sudo ./virlink -c configs/my-tunnel.toml --down
-
-# show current status & stats
-sudo ./virlink -c configs/my-tunnel.toml --status
-
-# generate a WireGuard keypair
-./virlink keygen
+[transport]
+heartbeat_interval = 10
 ```
 
 ---
 
-## How It Works
+## How it works
 
-- **Native netlink** — all kernel objects (GRE, IPIP, VXLAN, TUN, addresses, routes) are created via the kernel's netlink API. No `ip` command subprocesses for core operations.  
-- **Direct sysctl** — parameters like `net.ipv4.ip_forward` and BBR are applied by writing to `/proc/sys/` — no `sysctl` command needed.  
-- **Daemon mode** — the binary blocks after bringing the tunnel up, printing a live heartbeat (interface state, Rx/Tx bytes) every N seconds.  
-- **Clean shutdown** — `Ctrl+C` / `SIGTERM` automatically removes all kernel objects (interfaces, routes, iptables rules).  
-- **udp-obfs** — fully userspace: a TUN device + Go goroutines encrypt every packet with AES-256-GCM before it reaches the kernel UDP socket.
+- All kernel objects (GRE, IPIP, TUN/TAP, routes, addresses) are created **natively via netlink** — no `ip` sub-process for core operations.
+- `sysctl` parameters are written directly to `/proc/sys/`.
+- `udp-obfs` runs entirely in userspace: every packet is AES-256-GCM encrypted before it touches the UDP socket.
+- `icmp` / `bip` / `tcp` / `udp` use a TUN device + Go goroutines for the transport; kernel handles IP routing normally.
+- **Ctrl+C** / **SIGTERM** → all kernel objects and iptables rules are removed automatically.
+- Goroutines hold private references to sockets/file descriptors so shutdown races cannot produce nil-pointer panics (v2.1.0+).
 
 ---
 
 ## Requirements
 
-| Requirement | Detail |
-|-------------|--------|
-| OS | Linux (Ubuntu 20.04+ recommended) |
-| Arch | x86_64 (amd64) |
-| Kernel | ≥ 5.4 |
-| Privileges | root / sudo |
-| `iptables` | MSS clamping & port forwarding |
-| Kernel modules | `linux-modules-extra-$(uname -r)` for L2TPv3, bonded, and VXLAN modes |
-
-```bash
-# install kernel modules (Ubuntu/Debian)
-apt install linux-modules-extra-$(uname -r)
-```
+- Linux kernel ≥ 5.4
+- x86_64 (amd64)
+- Root / sudo
+- `iptables` (MSS clamping and port forwarding)
+- `linux-modules-extra-$(uname -r)` — needed for L2TPv3 and bonded modes
+- `python3` — used by setup.sh for GitHub API JSON parsing
 
 ---
 
-## Repository Branches
+## Files
 
-| Branch | Contents |
-|--------|----------|
-| `main` | Binary (`virlink`) + `setup.sh` — public release |
-| `source` | Full Go source code — for development |
+| Path | Description |
+|------|-------------|
+| `/opt/virlink/virlink` | binary |
+| `/opt/virlink/setup.sh` | this script |
+| `/opt/virlink/configs/*.toml` | tunnel configs |
+| `/var/log/virlink/<name>.log` | per-tunnel logs |
+| `/var/run/virlink/<name>.pid` | PID files |
+| `/usr/local/bin/virlink` | symlink → binary |
+| `/usr/local/bin/virlink-setup` | symlink → setup.sh |
 
 ---
 
 ## License
 
-[MIT](LICENSE)
+MIT

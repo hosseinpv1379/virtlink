@@ -1,0 +1,30 @@
+# ── binary (distributed via GitHub Releases only) ────────────────────────────
+virlink
+virlink_new
+
+# ── Go source (kept in source branch only) ────────────────────────────────────
+*.go
+go.mod
+go.sum
+Makefile
+
+# ── user-generated files ──────────────────────────────────────────────────────
+configs/
+/var/run/virlink/
+/var/log/virlink/
+
+# ── dev / build artefacts ──────────────────────────────────────────────────────
+*.o
+*.a
+*.tar.gz
+
+# ── legacy directories (not part of public release) ───────────────────────────
+virtual-links/
+virtual-links.tar.gz
+kernel-tunnels/
+docs/
+
+# ── OS / IDE ──────────────────────────────────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
