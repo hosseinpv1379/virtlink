@@ -1,0 +1,37 @@
+# ── virlink · UDP-Obfs · SERVER (5.75.206.15) ────────────────────────────────
+# Obfuscated UDP tunnel — AES-256-GCM encrypted, DPI-resistant.
+#
+# Usage:   sudo ./virlink -c config.toml
+# Overlay: this host → 10.20.10.2/24
+#
+# ⚠  [obfs] key must be identical on both client and server.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tunnel]
+type      = "udp-obfs"
+mode      = "server"
+local_ip  = "5.75.206.15"
+remote_ip = "81.12.35.242"
+cidr      = "10.20.10.0/24"   # server → 10.20.10.2/24
+mtu       = 1400
+
+[transport]
+port               = 443
+proto              = "udp-obfs"
+heartbeat_interval = 10
+
+# ── obfuscation ───────────────────────────────────────────────────────────────
+[obfs]
+key     = "CHANGE_THIS_TO_A_STRONG_SECRET"   # must match client exactly
+mask    = "quic"    # noise | quic | dtls  ← must match client
+padding = true      # must match client
+
+[security]
+encryption = true
+
+[tuning]
+bbr          = true
+channel_size = 10_000
+
+[logging]
+level = "info"
