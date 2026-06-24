@@ -14,6 +14,7 @@ SCRIPT_VERSION="2.1.0"
 UPDATE_AVAILABLE=0
 LATEST_TAG=""
 LAST_CFG_PATH=""   # set by gen_* instead of echoing (avoids $() capture)
+PICKED_TUNNEL=""   # set by pick_tunnel (avoids printf -v scope bug with set -u)
 
 # ── colors ────────────────────────────────────────────────────────────────────
 R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
@@ -309,10 +310,10 @@ tunnel_status() {
 }
 
 # ── numbered tunnel picker ────────────────────────────────────────────────────
-# pick_tunnel <varname>  — shows numbered list, sets varname to selected tunnel
+# pick_tunnel — shows numbered list, sets PICKED_TUNNEL global.
 # Returns 1 if no tunnels exist.
 pick_tunnel() {
-  local var="$1"
+  PICKED_TUNNEL=""
   local cfgs=()
   mapfile -t cfgs < <(find "$CONFIGS_DIR" -maxdepth 1 -name "*.toml" 2>/dev/null | sort)
   if [[ ${#cfgs[@]} -eq 0 ]]; then
@@ -322,17 +323,17 @@ pick_tunnel() {
   tty_line
   tty_line "  ${BOLD}Tunnels:${NC}"
   tty_line "${DIM}────────────────────────────────────────────────${NC}"
-  local i cfg name type status_icon
+  local i cfg _tname _type _icon
   for i in "${!cfgs[@]}"; do
     cfg="${cfgs[$i]}"
-    name=$(basename "$cfg" .toml)
-    type=$(grep 'type ' "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}' || echo "?")
-    if tunnel_is_running "$name"; then
-      status_icon="${G}●${NC}"
+    _tname=$(basename "$cfg" .toml)
+    _type=$(grep 'type ' "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}' || echo "?")
+    if tunnel_is_running "$_tname"; then
+      _icon="${G}●${NC}"
     else
-      status_icon="${R}●${NC}"
+      _icon="${R}●${NC}"
     fi
-    tty_out "    ${C}$(printf '%2d' $((i+1)))${NC}  $(printf '%b' "$status_icon")  ${BOLD}${name}${NC}  ${DIM}(${type})${NC}\n"
+    tty_out "    ${C}$(printf '%2d' $((i+1)))${NC}  $(printf '%b' "$_icon")  ${BOLD}${_tname}${NC}  ${DIM}(${_type})${NC}\n"
   done
   tty_line
   local n
@@ -340,7 +341,7 @@ pick_tunnel() {
     tty_out "  ${W}?${NC} Choose [1-${#cfgs[@]}]: "
     read -r n < /dev/tty
     if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#cfgs[@]} )); then
-      printf -v "$var" '%s' "$(basename "${cfgs[$((n-1))]}" .toml)"
+      PICKED_TUNNEL="$(basename "${cfgs[$((n-1))]}" .toml)"
       return 0
     fi
     tty_line "  ${Y}⚠${NC} Invalid choice."
@@ -860,11 +861,11 @@ screen_manage() {
   echo -e "  ${BOLD}Manage Tunnels${NC}"
   sep
   ensure_dirs
-  local name
-  if ! pick_tunnel name; then
+  if ! pick_tunnel; then
     press_enter
     return
   fi
+  local name="$PICKED_TUNNEL"
 
   blank
   # Show brief status
@@ -931,11 +932,11 @@ screen_setup_forward() {
   echo -e "  ${BOLD}Add Port Forwarding Rule${NC}"
   sep
   ensure_dirs
-  local name
-  if ! pick_tunnel name; then
+  if ! pick_tunnel; then
     press_enter
     return
   fi
+  local name="$PICKED_TUNNEL"
   local cfg="${CONFIGS_DIR}/${name}.toml"
   blank
   echo -e "  ${W}Format:${NC}  listenPort:targetPort  or  port:port/tcp"
