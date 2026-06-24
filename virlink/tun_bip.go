@@ -46,6 +46,7 @@ func (t *BipTunnel) Up() error {
 	t.localIP = ipTo4(c.LocalIP)
 
 	header("bip / " + c.Mode)
+	applyPerfFromConfig(c)
 	t.doClean()
 	t.stop.reset()
 
@@ -55,7 +56,7 @@ func (t *BipTunnel) Up() error {
 		return err
 	}
 
-	t.tun, err = openTunMulti(dev, tunQueues)
+	t.tun, err = openTunMulti(dev, perfTunQueues())
 	if err != nil {
 		return fmt.Errorf("tun: %w", err)
 	}
@@ -64,7 +65,7 @@ func (t *BipTunnel) Up() error {
 	a, _ := netlink.ParseAddr(addr)
 	netlink.AddrAdd(l, a)
 	netlink.LinkSetUp(l)
-	logOK(fmt.Sprintf("%s  %s  queues=%d", dev, addr, tunQueues))
+	logOK(fmt.Sprintf("%s  %s  queues=%d", dev, addr, t.tun.QueueCount()))
 
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)
@@ -87,7 +88,7 @@ func (t *BipTunnel) Up() error {
 	}
 
 	done(dev, addr, peer,
-		fmt.Sprintf("proto : IPv4 proto %d  queues=%d", bipProto, tunQueues),
+		fmt.Sprintf("proto : IPv4 proto %d  queues=%d", bipProto, t.tun.QueueCount()),
 		"test  : ping -c3 "+peer,
 	)
 	return nil
@@ -104,7 +105,7 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 				return
 			}
 		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-			_ = pollFD(rawFd, unix.POLLIN, 100)
+			_ = pollFD(rawFd, unix.POLLIN, perfPollMs())
 			continue
 		}
 		if err == unix.EINTR {

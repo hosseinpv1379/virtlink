@@ -503,10 +503,16 @@ write_tuning() {
   cat >> "$file" << EOF
 
 [tuning]
-enabled      = true
-mode         = "balanced"
-multipath    = ${multipath}
-channel_size = 10_000
+enabled       = true
+mode          = "fast"
+multipath     = ${multipath}
+sock_buf_mb   = 128
+tun_queues    = 16
+batch_size    = 128
+tx_queue_len  = 100000
+poll_ms       = 1
+tcp_streams   = 16
+channel_size  = 10_000
 
 [logging]
 level = "info"

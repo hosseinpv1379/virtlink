@@ -13,9 +13,8 @@ import (
 )
 
 const (
-	maxPktBuf   = 65535 + 512
-	sockBufSize = 32 << 20 // 32 MB
-	icmpHdrLen  = 8
+	maxPktBuf  = 65535 + 512
+	icmpHdrLen = 8
 )
 
 var pktPool = sync.Pool{
@@ -79,20 +78,20 @@ func icmpChecksum(b []byte) uint16 {
 // ── socket tuning ─────────────────────────────────────────────────────────────
 
 func tuneUDPConn(conn *net.UDPConn) {
-	_ = conn.SetReadBuffer(sockBufSize)
-	_ = conn.SetWriteBuffer(sockBufSize)
+	_ = conn.SetReadBuffer(perfSockBuf())
+	_ = conn.SetWriteBuffer(perfSockBuf())
 }
 
 func tuneRawSock(fd int) {
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, sockBufSize)
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, sockBufSize)
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, perfSockBuf())
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, perfSockBuf())
 }
 
 func tuneTCPConn(conn net.Conn) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
-		_ = tc.SetReadBuffer(sockBufSize)
-		_ = tc.SetWriteBuffer(sockBufSize)
+		_ = tc.SetReadBuffer(perfSockBuf())
+		_ = tc.SetWriteBuffer(perfSockBuf())
 	}
 }
 
@@ -129,7 +128,7 @@ func closeFDs(fds []int) {
 // rrCounter round-robin index for multi-stream TX.
 type rrCounter struct{ n atomic.Uint32 }
 
-func (r *rrCounter) next() int { return int(r.n.Add(1)-1) % tunQueues }
+func (r *rrCounter) next(mod int) int { return int(r.n.Add(1)-1) % mod }
 
 // atomicSeqDedup — lock-free outer ICMP sequence dedup (no mutex in hot path).
 type atomicSeqDedup struct {

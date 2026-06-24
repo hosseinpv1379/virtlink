@@ -17,7 +17,6 @@ import (
 
 const (
 	tunSetIff = uintptr(0x400454ca)
-	tunQueues = 4
 )
 
 // TunDev holds one or more TUN queue file descriptors.
@@ -87,7 +86,7 @@ func openTunMultiTry(name string, n int) (*TunDev, error) {
 		td.fds = append(td.fds, os.NewFile(uintptr(fd), fmt.Sprintf("%s-q%d", name, i)))
 	}
 	if l, err := netlink.LinkByName(name); err == nil {
-		_ = netlink.LinkSetTxQLen(l, 10000)
+		_ = netlink.LinkSetTxQLen(l, perfTxQLen())
 	}
 	return td, nil
 }

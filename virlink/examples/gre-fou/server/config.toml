@@ -20,10 +20,16 @@ heartbeat_interval = 10
 encryption = false
 
 [tuning]
-enabled      = true
-mode         = "balanced"
-multipath    = false
-channel_size = 10_000
+enabled       = true
+mode          = "fast"        # balanced | fast | resource | latency
+multipath     = false
+sock_buf_mb   = 128           # max socket buffer (MB)
+tun_queues    = 16            # max TUN readers
+batch_size    = 128           # max ICMP sendmmsg batch
+tx_queue_len  = 100000        # max TUN txqueuelen
+poll_ms       = 1             # min poll timeout (most aggressive)
+tcp_streams   = 16            # max TCP parallel streams
+channel_size  = 10_000
 
 [logging]
 level = "info"

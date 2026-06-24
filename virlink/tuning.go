@@ -235,6 +235,8 @@ func perDevParams(dev string) []sysctlParam {
 }
 
 func applyTunnelTuning(cfg *Config, devs ...string) {
+	applyPerfFromConfig(cfg)
+
 	tuningMu.Lock()
 	defer tuningMu.Unlock()
 
@@ -321,8 +323,8 @@ func (tt *tunnelTuning) applyLinkProfile(p tuningProfile) {
 		sl := savedLink{dev: dev, ok: true, txQLen: link.Attrs().TxQLen}
 		tt.savedLinks = append(tt.savedLinks, sl)
 
-		if p.txQLen > 0 {
-			_ = netlink.LinkSetTxQLen(link, p.txQLen)
+		if qlen := perfTxQLen(); qlen > 0 {
+			_ = netlink.LinkSetTxQLen(link, qlen)
 		}
 		// TUN devices don't benefit from fq/fq_codel and it can break delivery.
 		if p.qdisc != "" && link.Type() != "tun" {

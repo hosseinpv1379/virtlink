@@ -60,12 +60,19 @@ type SecurityCfg struct {
 
 // TuningCfg maps to [tuning]
 type TuningCfg struct {
-	Enabled     *bool  `toml:"enabled"`      // default true — temporary scoped tuning at tunnel up
-	Mode        string `toml:"mode"`         // balanced | fast | resource | latency (default balanced)
-	BBR         bool   `toml:"bbr"`          // legacy; mode takes precedence
-	Multipath   bool   `toml:"multipath"`    // ECMP per-flow hashing (bonded)
-	Workers     int    `toml:"workers"`      // 0 = auto (future use)
-	ChannelSize int    `toml:"channel_size"` // future use
+	Enabled     *bool  `toml:"enabled"` // default true — scoped sysctl at tunnel up
+	Mode        string `toml:"mode"`    // balanced | fast | resource | latency
+	Multipath   bool   `toml:"multipath"`
+	// ── performance knobs (0 = default) ─────────────────────────────────────
+	SockBufMB   int `toml:"sock_buf_mb"`    // socket SO_RCVBUF/SO_SNDBUF in MB (default 32)
+	TunQueues   int `toml:"tun_queues"`     // IFF_MULTI_QUEUE readers (default 4, max 16)
+	BatchSize   int `toml:"batch_size"`     // ICMP sendmmsg batch count (default 32, max 128)
+	TxQLen      int `toml:"tx_queue_len"`   // TUN interface txqueuelen (default from mode)
+	PollMs      int `toml:"poll_ms"`        // I/O poll timeout ms (default 10)
+	TcpStreams  int `toml:"tcp_streams"`    // TCP tunnel parallel streams (default = tun_queues)
+	Workers     int `toml:"workers"`        // reserved
+	ChannelSize int `toml:"channel_size"`   // reserved (legacy)
+	BBR         bool `toml:"bbr"`           // legacy; mode takes precedence
 }
 
 // LoggingCfg maps to [logging]
@@ -317,6 +324,9 @@ func validate(c *Config) error {
 		return fmt.Errorf("[tunnel] local_ip and remote_ip must be different")
 	}
 	if err := validateTuningMode(tuningMode(c)); err != nil {
+		return err
+	}
+	if err := validatePerf(&c.Tuning); err != nil {
 		return err
 	}
 	return nil

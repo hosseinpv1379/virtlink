@@ -1,6 +1,6 @@
 // tun_tcp.go — TCP tunnel.
 //
-// Performance (v2.7): multi-queue TUN tx readers + tunQueues parallel TCP streams.
+// Performance (v2.7): multi-queue TUN tx readers + parallel TCP streams ([tuning] tcp_streams).
 package main
 
 import (
@@ -21,7 +21,7 @@ type TcpTunnel struct {
 	cfg    *Config
 	tun    *TunDev
 	ln     net.Listener
-	conns  [tunQueues]atomic.Pointer[net.Conn]
+	conns  [maxPerfQueues]atomic.Pointer[net.Conn]
 	done   chan struct{}
 	stop   stoppedFlag
 	rr     rrCounter
@@ -43,13 +43,14 @@ func (t *TcpTunnel) Up() error {
 	}
 
 	header("tcp / " + c.Mode)
+	applyPerfFromConfig(c)
 	step("cleanup...")
 	t.doClean()
 	t.stop.reset()
 
 	var err error
-	step(fmt.Sprintf("TUN device %s ×%d queues...", dev, tunQueues))
-	t.tun, err = openTunMulti(dev, tunQueues)
+	step(fmt.Sprintf("TUN device %s ×%d queues...", dev, perfTunQueues()))
+	t.tun, err = openTunMulti(dev, perfTunQueues())
 	if err != nil {
 		return fmt.Errorf("tun: %w", err)
 	}
@@ -67,7 +68,7 @@ func (t *TcpTunnel) Up() error {
 	if err := netlink.LinkSetUp(l); err != nil {
 		return fmt.Errorf("link up: %w", err)
 	}
-	logOK(fmt.Sprintf("%s  %s  MTU=%d  queues=%d", dev, addr, mtu, tunQueues))
+	logOK(fmt.Sprintf("%s  %s  MTU=%d  queues=%d", dev, addr, mtu, t.tun.QueueCount()))
 
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)
@@ -80,19 +81,20 @@ func (t *TcpTunnel) Up() error {
 		go t.txLoop(q)
 	}
 
+	streams := perfTcpStreams()
 	if c.Mode == "server" {
 		t.ln, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
 			return fmt.Errorf("tcp listen :%d: %w", port, err)
 		}
-		logOK(fmt.Sprintf("TCP listening :%d  streams=%d", port, tunQueues))
+		logOK(fmt.Sprintf("TCP listening :%d  streams=%d", port, streams))
 		go t.acceptLoop(tun0)
 	} else {
 		go t.connectLoop(tun0)
 	}
 
 	done(dev, addr, peer,
-		fmt.Sprintf("transport : TCP ×%d streams  queues=%d :%d", tunQueues, tunQueues, port),
+		fmt.Sprintf("transport : TCP ×%d streams  queues=%d :%d", streams, t.tun.QueueCount(), port),
 		"reconnect : automatic (client retries every 3 s)",
 		"test      : ping -c3 "+peer,
 	)
@@ -100,8 +102,9 @@ func (t *TcpTunnel) Up() error {
 }
 
 func (t *TcpTunnel) pickConn() net.Conn {
-	for i := 0; i < tunQueues; i++ {
-		idx := t.rr.next() % tunQueues
+	n := perfTcpStreams()
+	for i := 0; i < n; i++ {
+		idx := t.rr.next(n)
 		if c := t.conns[idx].Load(); c != nil {
 			return *c
 		}
@@ -161,8 +164,8 @@ func (t *TcpTunnel) acceptLoop(tun *os.File) {
 			continue
 		}
 		tuneTCPConn(conn)
-		logInfo(fmt.Sprintf("tcp: client connected from %s (stream %d)", conn.RemoteAddr(), slot%tunQueues))
-		idx := slot % tunQueues
+		logInfo(fmt.Sprintf("tcp: client connected from %s (stream %d)", conn.RemoteAddr(), slot%perfTcpStreams()))
+		idx := slot % perfTcpStreams()
 		slot++
 		t.setConn(idx, conn)
 		go t.rxLoop(conn, tun, idx)
@@ -171,7 +174,7 @@ func (t *TcpTunnel) acceptLoop(tun *os.File) {
 
 func (t *TcpTunnel) connectLoop(tun *os.File) {
 	addr := fmt.Sprintf("%s:%d", t.cfg.RemoteIP, t.cfg.Transport.Port)
-	for s := 0; s < tunQueues; s++ {
+	for s := 0; s < perfTcpStreams(); s++ {
 		go t.connectOne(tun, addr, s)
 	}
 	select {

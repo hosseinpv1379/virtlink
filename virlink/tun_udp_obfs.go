@@ -111,14 +111,15 @@ func (t *UdpObfsTunnel) Up() error {
 	}
 
 	header(fmt.Sprintf("udp-obfs / %s  mask=%s", c.Mode, mask))
+	applyPerfFromConfig(c)
 
 	step("cleanup...")
 	t.doClean()
 	t.stop.reset()
 
 	// ── TUN device (/dev/net/tun) ─────────────────────────────────────────────
-	step(fmt.Sprintf("TUN device %s ×%d queues...", dev, tunQueues))
-	t.tun, err = openTunMulti(dev, tunQueues)
+	step(fmt.Sprintf("TUN device %s ×%d queues...", dev, perfTunQueues()))
+	t.tun, err = openTunMulti(dev, perfTunQueues())
 	if err != nil {
 		return fmt.Errorf("tun: %w", err)
 	}
@@ -138,7 +139,7 @@ func (t *UdpObfsTunnel) Up() error {
 	if err := netlink.LinkSetUp(l); err != nil {
 		return fmt.Errorf("link up: %w", err)
 	}
-	logOK(fmt.Sprintf("%s  %s  MTU=%d  queues=%d", dev, addr, mtu, tunQueues))
+	logOK(fmt.Sprintf("%s  %s  MTU=%d  queues=%d", dev, addr, mtu, t.tun.QueueCount()))
 
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)

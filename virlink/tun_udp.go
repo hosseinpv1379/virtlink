@@ -45,6 +45,7 @@ func (t *UdpTunnel) Up() error {
 	t.localIP = ipTo4(c.LocalIP)
 
 	header("udp / " + c.Mode)
+	applyPerfFromConfig(c)
 	t.doClean()
 	t.stop.reset()
 
@@ -54,7 +55,7 @@ func (t *UdpTunnel) Up() error {
 		return err
 	}
 
-	t.tun, err = openTunMulti(dev, tunQueues)
+	t.tun, err = openTunMulti(dev, perfTunQueues())
 	if err != nil {
 		return fmt.Errorf("tun: %w", err)
 	}
@@ -63,7 +64,7 @@ func (t *UdpTunnel) Up() error {
 	a, _ := netlink.ParseAddr(addr)
 	netlink.AddrAdd(l, a)
 	netlink.LinkSetUp(l)
-	logOK(fmt.Sprintf("%s  %s  queues=%d", dev, addr, tunQueues))
+	logOK(fmt.Sprintf("%s  %s  queues=%d", dev, addr, t.tun.QueueCount()))
 
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)
@@ -89,7 +90,7 @@ func (t *UdpTunnel) Up() error {
 		go t.txLoop(conn, q)
 	}
 
-	done(dev, addr, peer, fmt.Sprintf("transport : UDP :%d  queues=%d", port, tunQueues))
+	done(dev, addr, peer, fmt.Sprintf("transport : UDP :%d  queues=%d", port, t.tun.QueueCount()))
 	return nil
 }
 

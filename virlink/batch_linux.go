@@ -9,7 +9,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const icmpBatchMax = 32
+const icmpBatchMax = maxPerfBatch
 
 type mmsghdr struct {
 	Hdr unix.Msghdr

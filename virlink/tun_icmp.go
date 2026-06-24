@@ -54,6 +54,9 @@ func (t *IcmpTunnel) Up() error {
 	t.localIP = ipTo4(c.LocalIP)
 
 	header("icmp / " + c.Mode)
+	applyPerfFromConfig(c)
+	step("perf: " + perfSummary())
+
 	step("cleanup...")
 	t.doClean()
 	t.stop.reset()
@@ -66,8 +69,8 @@ func (t *IcmpTunnel) Up() error {
 		return err
 	}
 
-	step(fmt.Sprintf("TUN device %s ×%d queues...", dev, tunQueues))
-	t.tun, err = openTunMulti(dev, tunQueues)
+	step(fmt.Sprintf("TUN device %s ×%d queues...", dev, perfTunQueues()))
+	t.tun, err = openTunMulti(dev, perfTunQueues())
 	if err != nil {
 		return fmt.Errorf("tun: %w", err)
 	}
@@ -133,7 +136,7 @@ func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File) {
 	for !t.stop.stopped() {
 		batch.reset()
 
-		for batch.n < icmpBatchMax {
+		for batch.n < perfBatchSize() {
 			n, err := tunReadNB(qfd, scratchPayload)
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				break
@@ -155,7 +158,7 @@ func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File) {
 		}
 
 		if batch.n == 0 {
-			_ = pollFD(tunFD, unix.POLLIN, 10)
+			_ = pollFD(tunFD, unix.POLLIN, perfPollMs())
 			continue
 		}
 
@@ -179,7 +182,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 				return
 			}
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-				_ = pollFD(rawFd, unix.POLLIN, 10)
+				_ = pollFD(rawFd, unix.POLLIN, perfPollMs())
 				continue
 			}
 			if err == unix.EINTR {
