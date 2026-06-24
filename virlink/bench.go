@@ -1,21 +1,16 @@
 // bench.go — multi-stream, time-based in-tunnel bandwidth test.
 //
-// Design goals (maximum throughput accuracy):
-//   • Time-based (not size-based): run for benchDuration seconds so TCP
-//     windows fully open and throughput stabilises regardless of link speed.
-//   • Parallel streams: benchStreams concurrent TCP connections saturate
-//     tunnels where a single flow can't fill the pipe (GRE-FOU, bonded, etc.).
-//   • Large buffers: 256 KB per stream, socket buffers tuned to 4 MB.
-//   • Symmetric: upload and download tested independently.
+// Follows speedtest.net convention:
+//   DOWNLOAD = data flowing FROM peer TO us  (we measure RX throughput)
+//   UPLOAD   = data flowing FROM us TO peer  (we measure TX throughput)
 //
-// Server listens on 0.0.0.0:benchPort (default 6544) /TCP.
-// All traffic flows through the tunnel overlay IPs → measures real link BW.
+// Order: download first, then upload (standard speedtest order).
 //
-// Protocol:
-//   connection → 1-byte mode:
-//     0x01 upload   client sends until deadline → server drains
-//     0x02 download server sends until deadline → client drains
-//   After upload, server replies 8 bytes = its measured RX speed (bytes/s).
+// Each test: benchStreams parallel TCP connections, each runs for
+// benchDuration seconds.  Timing starts after the TCP handshake so
+// connection setup overhead is excluded from the measurement.
+//
+// Server listens on 0.0.0.0:benchPort (healthPort+1, default 6544).
 package main
 
 import (
@@ -29,22 +24,22 @@ import (
 )
 
 const (
-	benchDuration = 5 * time.Second // test duration per direction
-	benchStreams   = 4               // parallel TCP connections
-	benchBufSize   = 256 * 1024     // 256 KB write/read buffer per stream
-	benchSockBuf   = 4 * 1024 * 1024 // 4 MB socket buffer
-	benchCacheTTL  = 2 * time.Minute
+	benchDuration  = 5 * time.Second  // test duration per direction
+	benchStreams    = 4                // parallel TCP connections
+	benchBufSize   = 256 * 1024       // 256 KB per-stream buffer
+	benchSockBuf   = 4 * 1024 * 1024  // 4 MB socket buffer
+	benchCacheTTL  = 2 * time.Minute  // cache result to avoid back-to-back runs
 
-	modeUpload   byte = 0x01
-	modeDownload byte = 0x02
+	modeSend byte = 0x01 // server → client  (client measures DOWNLOAD)
+	modeRecv byte = 0x02 // client → server  (client measures UPLOAD)
 )
 
 // BenchResult holds one complete measurement.
 type BenchResult struct {
-	UploadMbps    float64 `json:"upload_mbps"`
 	DownloadMbps  float64 `json:"download_mbps"`
-	UploadMBs     float64 `json:"upload_mb_s"`
 	DownloadMBs   float64 `json:"download_mb_s"`
+	UploadMbps    float64 `json:"upload_mbps"`
+	UploadMBs     float64 `json:"upload_mb_s"`
 	Streams       int     `json:"streams"`
 	TestDuration  string  `json:"test_duration"`
 	TotalDuration string  `json:"total_duration"`
@@ -67,13 +62,11 @@ func NewBenchMgr(healthPort int, peerIP string) *BenchMgr {
 	return &BenchMgr{port: healthPort + 1, peerIP: peerIP}
 }
 
-// ── socket tuning helpers ─────────────────────────────────────────────────────
-
 func tuneBenchConn(conn net.Conn) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetReadBuffer(benchSockBuf)
 		_ = tc.SetWriteBuffer(benchSockBuf)
-		_ = tc.SetNoDelay(false) // nagle ON for bulk throughput (opposite of low-latency)
+		_ = tc.SetNoDelay(false) // Nagle ON — better for bulk throughput
 	}
 }
 
@@ -86,7 +79,7 @@ func (b *BenchMgr) runServer() {
 		logWarn(fmt.Sprintf("bench server: listen %s: %v", addr, err))
 		return
 	}
-	logInfo(fmt.Sprintf("bench  server       listen=0.0.0.0:%d  GET /bench", b.port))
+	logInfo(fmt.Sprintf("bench  server   listen=0.0.0.0:%d  (healthPort+1)", b.port))
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -99,106 +92,64 @@ func (b *BenchMgr) runServer() {
 func (b *BenchMgr) serveConn(conn net.Conn) {
 	defer conn.Close()
 	tuneBenchConn(conn)
-	_ = conn.SetDeadline(time.Now().Add(benchDuration + 10*time.Second))
+	// generous deadline: mode byte + test duration + overhead
+	_ = conn.SetDeadline(time.Now().Add(benchDuration + 15*time.Second))
 
-	mode := make([]byte, 1)
-	if _, err := io.ReadFull(conn, mode); err != nil {
+	hdr := make([]byte, 1)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
 		return
 	}
 
-	switch mode[0] {
-	case modeUpload:
-		// drain incoming data, report server-side speed
-		start := time.Now()
-		n, _ := io.Copy(io.Discard, conn)
-		elapsed := time.Since(start).Seconds()
-		var bps uint64
-		if elapsed > 0 {
-			bps = uint64(float64(n) / elapsed)
-		}
-		rep := make([]byte, 8)
-		binary.BigEndian.PutUint64(rep, bps)
-		_, _ = conn.Write(rep)
-
-	case modeDownload:
-		// stream data until the client closes or deadline fires
+	switch hdr[0] {
+	case modeSend:
+		// Server sends data → client measures DOWNLOAD
 		buf := make([]byte, benchBufSize)
-		for {
-			if _, err := conn.Write(buf); err != nil {
+		start := time.Now()
+		var sent int64
+		for time.Now().Before(start.Add(benchDuration)) {
+			n, err := conn.Write(buf)
+			sent += int64(n)
+			if err != nil {
 				break
 			}
 		}
-	}
-}
-
-// ── multi-stream upload measurement ──────────────────────────────────────────
-
-// measureUpload opens benchStreams parallel connections, sends for benchDuration,
-// returns aggregate throughput in MB/s.
-func (b *BenchMgr) measureUpload() (mbPerSec float64, err error) {
-	var totalBytes atomic.Int64
-	var wg sync.WaitGroup
-	errs := make([]error, benchStreams)
-	deadline := time.Now().Add(benchDuration)
-
-	for i := 0; i < benchStreams; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			addr := fmt.Sprintf("%s:%d", b.peerIP, b.port)
-			conn, cerr := net.DialTimeout("tcp4", addr, 10*time.Second)
-			if cerr != nil {
-				errs[idx] = cerr
-				return
-			}
-			defer conn.Close()
-			tuneBenchConn(conn)
-			_ = conn.SetDeadline(deadline.Add(5 * time.Second))
-
-			if _, cerr = conn.Write([]byte{modeUpload}); cerr != nil {
-				errs[idx] = cerr
-				return
-			}
-
-			buf := make([]byte, benchBufSize)
-			var sent int64
-			for time.Now().Before(deadline) {
-				n, werr := conn.Write(buf)
-				sent += int64(n)
-				if werr != nil {
-					break
-				}
-			}
-			totalBytes.Add(sent)
-
-			// read server ack (best-effort)
-			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-			_, _ = io.ReadFull(conn, make([]byte, 8))
-		}(i)
-	}
-
-	start := time.Now()
-	wg.Wait()
-	elapsed := time.Since(start).Seconds()
-
-	for _, e := range errs {
-		if e != nil {
-			return 0, e
+		// send server-side TX speed back (8 bytes)
+		rep := make([]byte, 8)
+		bps := uint64(0)
+		if elapsed := time.Since(start).Seconds(); elapsed > 0 {
+			bps = uint64(float64(sent) / elapsed)
 		}
+		binary.BigEndian.PutUint64(rep, bps)
+		_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+		_, _ = conn.Write(rep)
+
+	case modeRecv:
+		// Server receives data → client measures UPLOAD
+		start := time.Now()
+		n, _ := io.Copy(io.Discard, conn)
+		elapsed := time.Since(start).Seconds()
+		// send server-side RX speed back (8 bytes, informational)
+		rep := make([]byte, 8)
+		bps := uint64(0)
+		if elapsed > 0 {
+			bps = uint64(float64(n) / elapsed)
+		}
+		binary.BigEndian.PutUint64(rep, bps)
+		_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+		_, _ = conn.Write(rep)
 	}
-	if elapsed <= 0 || totalBytes.Load() == 0 {
-		return 0, fmt.Errorf("no data transferred")
-	}
-	return float64(totalBytes.Load()) / elapsed / (1024 * 1024), nil
 }
 
-// ── multi-stream download measurement ────────────────────────────────────────
+// ── DOWNLOAD: server sends → we receive ──────────────────────────────────────
 
 func (b *BenchMgr) measureDownload() (mbPerSec float64, err error) {
-	var totalBytes atomic.Int64
+	type result struct {
+		bytes int64
+		dur   time.Duration
+		err   error
+	}
+	results := make([]result, benchStreams)
 	var wg sync.WaitGroup
-	errs := make([]error, benchStreams)
-	deadline := time.Now().Add(benchDuration)
 
 	for i := 0; i < benchStreams; i++ {
 		wg.Add(1)
@@ -207,48 +158,128 @@ func (b *BenchMgr) measureDownload() (mbPerSec float64, err error) {
 			addr := fmt.Sprintf("%s:%d", b.peerIP, b.port)
 			conn, cerr := net.DialTimeout("tcp4", addr, 10*time.Second)
 			if cerr != nil {
-				errs[idx] = cerr
+				results[idx].err = cerr
 				return
 			}
 			defer conn.Close()
 			tuneBenchConn(conn)
-			_ = conn.SetDeadline(deadline.Add(2 * time.Second))
 
-			if _, cerr = conn.Write([]byte{modeDownload}); cerr != nil {
-				errs[idx] = cerr
+			// Send mode byte — timing starts AFTER this
+			if _, cerr = conn.Write([]byte{modeSend}); cerr != nil {
+				results[idx].err = cerr
 				return
 			}
+
+			// Measure: read data for benchDuration
+			testDeadline := time.Now().Add(benchDuration + 1*time.Second)
+			_ = conn.SetReadDeadline(testDeadline)
 
 			buf := make([]byte, benchBufSize)
 			var received int64
-			for time.Now().Before(deadline) {
-				_ = conn.SetReadDeadline(deadline)
+			start := time.Now()
+			for time.Now().Before(testDeadline.Add(-500*time.Millisecond)) {
 				n, rerr := conn.Read(buf)
 				received += int64(n)
 				if rerr != nil {
 					break
 				}
 			}
-			totalBytes.Add(received)
+			results[idx].bytes = received
+			results[idx].dur = time.Since(start)
 		}(i)
 	}
-
-	start := time.Now()
 	wg.Wait()
-	elapsed := time.Since(start).Seconds()
 
-	for _, e := range errs {
-		if e != nil {
-			return 0, e
+	var totalBytes int64
+	var totalDur time.Duration
+	for _, r := range results {
+		if r.err != nil {
+			return 0, r.err
+		}
+		totalBytes += r.bytes
+		if r.dur > totalDur {
+			totalDur = r.dur
 		}
 	}
-	if elapsed <= 0 || totalBytes.Load() == 0 {
+	elapsed := totalDur.Seconds()
+	if elapsed <= 0 || totalBytes == 0 {
 		return 0, fmt.Errorf("no data received")
 	}
-	return float64(totalBytes.Load()) / elapsed / (1024 * 1024), nil
+	return float64(totalBytes) / elapsed / (1024 * 1024), nil
 }
 
-// ── RunBench — orchestrates upload + download, caches result ─────────────────
+// ── UPLOAD: we send → server receives ────────────────────────────────────────
+
+func (b *BenchMgr) measureUpload() (mbPerSec float64, err error) {
+	type result struct {
+		bytes int64
+		dur   time.Duration
+		err   error
+	}
+	results := make([]result, benchStreams)
+	var wg sync.WaitGroup
+
+	for i := 0; i < benchStreams; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			addr := fmt.Sprintf("%s:%d", b.peerIP, b.port)
+			conn, cerr := net.DialTimeout("tcp4", addr, 10*time.Second)
+			if cerr != nil {
+				results[idx].err = cerr
+				return
+			}
+			defer conn.Close()
+			tuneBenchConn(conn)
+
+			if _, cerr = conn.Write([]byte{modeRecv}); cerr != nil {
+				results[idx].err = cerr
+				return
+			}
+
+			// Send data for benchDuration — timing starts AFTER mode byte
+			sendEnd := time.Now().Add(benchDuration)
+			_ = conn.SetWriteDeadline(sendEnd.Add(1 * time.Second))
+
+			buf := make([]byte, benchBufSize)
+			var sent int64
+			start := time.Now()
+			for time.Now().Before(sendEnd) {
+				n, werr := conn.Write(buf)
+				sent += int64(n)
+				if werr != nil {
+					break
+				}
+			}
+			results[idx].bytes = sent
+			results[idx].dur = time.Since(start)
+
+			// Read server ack (best-effort, non-blocking)
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			_, _ = io.ReadFull(conn, make([]byte, 8))
+		}(i)
+	}
+	wg.Wait()
+
+	var totalBytes int64
+	var totalDur time.Duration
+	for _, r := range results {
+		if r.err != nil {
+			return 0, r.err
+		}
+		totalBytes += r.bytes
+		if r.dur > totalDur {
+			totalDur = r.dur
+		}
+	}
+	elapsed := totalDur.Seconds()
+	if elapsed <= 0 || totalBytes == 0 {
+		return 0, fmt.Errorf("no data sent")
+	}
+	return float64(totalBytes) / elapsed / (1024 * 1024), nil
+}
+
+// ── RunBench ──────────────────────────────────────────────────────────────────
 
 func (b *BenchMgr) RunBench() *BenchResult {
 	b.mu.Lock()
@@ -259,11 +290,11 @@ func (b *BenchMgr) RunBench() *BenchResult {
 	}
 	if b.running {
 		b.mu.Unlock()
-		// poll until done (max 2× benchDuration)
-		for i := 0; i < int(benchDuration*2/time.Second); i++ {
+		// wait for running test to finish
+		for i := 0; i < int((benchDuration*2+5*time.Second)/time.Second); i++ {
 			time.Sleep(time.Second)
 			b.mu.Lock()
-			if !b.running {
+			if !b.running && b.lastResult != nil {
 				res := b.lastResult
 				b.mu.Unlock()
 				return res
@@ -284,21 +315,23 @@ func (b *BenchMgr) RunBench() *BenchResult {
 	logInfo(fmt.Sprintf("bench  start  streams=%d  duration=%s  peer=%s:%d",
 		benchStreams, benchDuration, b.peerIP, b.port))
 
-	uplMBs, uplErr := b.measureUpload()
-	if uplErr != nil {
-		res.Error = "upload: " + uplErr.Error()
+	// ── 1. DOWNLOAD (speedtest order: download first) ──
+	dlMBs, dlErr := b.measureDownload()
+	if dlErr != nil {
+		res.Error = "download: " + dlErr.Error()
 		goto done
 	}
-	res.UploadMBs = round2(uplMBs)
-	res.UploadMbps = round2(uplMBs * 8)
-	logInfo(fmt.Sprintf("bench  upload   %.2f MB/s  (%.2f Mbps)", res.UploadMBs, res.UploadMbps))
+	res.DownloadMBs = round2(dlMBs)
+	res.DownloadMbps = round2(dlMBs * 8)
+	logInfo(fmt.Sprintf("bench  download  %.2f MB/s  (%.2f Mbps)", res.DownloadMBs, res.DownloadMbps))
 
-	if dlMBs, dlErr := b.measureDownload(); dlErr != nil {
-		res.Error = "download: " + dlErr.Error()
+	// ── 2. UPLOAD ──
+	if ulMBs, ulErr := b.measureUpload(); ulErr != nil {
+		res.Error = "upload: " + ulErr.Error()
 	} else {
-		res.DownloadMBs = round2(dlMBs)
-		res.DownloadMbps = round2(dlMBs * 8)
-		logInfo(fmt.Sprintf("bench  download %.2f MB/s  (%.2f Mbps)", res.DownloadMBs, res.DownloadMbps))
+		res.UploadMBs = round2(ulMBs)
+		res.UploadMbps = round2(ulMBs * 8)
+		logInfo(fmt.Sprintf("bench  upload    %.2f MB/s  (%.2f Mbps)", res.UploadMBs, res.UploadMbps))
 	}
 
 done:
@@ -311,11 +344,14 @@ done:
 	b.running = false
 	b.mu.Unlock()
 
-	logInfo(fmt.Sprintf("bench  done    upload=%.2f Mbps  download=%.2f Mbps  took=%s",
-		res.UploadMbps, res.DownloadMbps, res.TotalDuration))
+	logInfo(fmt.Sprintf("bench  done  ↓download=%.2f Mbps  ↑upload=%.2f Mbps  total=%s",
+		res.DownloadMbps, res.UploadMbps, res.TotalDuration))
 	return res
 }
 
 func round2(f float64) float64 {
-	return float64(int(f*100+0.5)) / 100
+	return float64(int64(f*100+0.5)) / 100
 }
+
+// atomic helper used by the parallel goroutines
+var _ = atomic.Int64{}

@@ -176,20 +176,22 @@ a{color:var(--blue);text-decoration:none}
       <span class="badge">4 streams × 5 s</span>
     </div>
 
+    <!-- DOWNLOAD first (speedtest standard) -->
     <div class="bw-row">
       <div class="bw-header">
-        <span class="bw-dir"><span class="bw-arrow" style="color:var(--blue)">▲</span> Upload</span>
-        <span><span class="bw-val" id="ul-mbps">—</span><span class="bw-mbs" id="ul-mbs"></span></span>
-      </div>
-      <div class="bar-track"><div class="bar-fill ul" id="ul-bar"></div></div>
-    </div>
-
-    <div class="bw-row">
-      <div class="bw-header">
-        <span class="bw-dir"><span class="bw-arrow" style="color:var(--purple)">▼</span> Download</span>
+        <span class="bw-dir"><span class="bw-arrow" style="color:var(--purple)">▼</span> Download  <span style="color:var(--muted);font-size:.65rem">peer → you</span></span>
         <span><span class="bw-val" id="dl-mbps">—</span><span class="bw-mbs" id="dl-mbs"></span></span>
       </div>
       <div class="bar-track"><div class="bar-fill dl" id="dl-bar"></div></div>
+    </div>
+
+    <!-- UPLOAD second -->
+    <div class="bw-row">
+      <div class="bw-header">
+        <span class="bw-dir"><span class="bw-arrow" style="color:var(--blue)">▲</span> Upload  <span style="color:var(--muted);font-size:.65rem">you → peer</span></span>
+        <span><span class="bw-val" id="ul-mbps">—</span><span class="bw-mbs" id="ul-mbs"></span></span>
+      </div>
+      <div class="bar-track"><div class="bar-fill ul" id="ul-bar"></div></div>
     </div>
 
     <div id="bench-meta" class="bench-meta" style="display:none">
@@ -285,23 +287,28 @@ async function runBench() {
 }
 
 function applyBench(d, animate) {
-  const ul = +(d.upload_mbps   || 0);
+  // download = peer→you, upload = you→peer  (speedtest convention)
   const dl = +(d.download_mbps || 0);
-  const peak = Math.max(ul, dl);
-  if (peak > maxMbps * 0.9) maxMbps = peak * 1.25;
-  const ulp = Math.min(100, ul / maxMbps * 100).toFixed(1);
+  const ul = +(d.upload_mbps   || 0);
+  const peak = Math.max(dl, ul, 1);
+  if (peak > maxMbps * 0.9) maxMbps = peak * 1.3;
   const dlp = Math.min(100, dl / maxMbps * 100).toFixed(1);
+  const ulp = Math.min(100, ul / maxMbps * 100).toFixed(1);
 
-  s('ul-mbps', ul.toFixed(1) + ' Mbps');
-  s('ul-mbs',  '(' + (+(d.upload_mb_s   || 0)).toFixed(1) + ' MB/s)');
   s('dl-mbps', dl.toFixed(1) + ' Mbps');
   s('dl-mbs',  '(' + (+(d.download_mb_s || 0)).toFixed(1) + ' MB/s)');
+  s('ul-mbps', ul.toFixed(1) + ' Mbps');
+  s('ul-mbs',  '(' + (+(d.upload_mb_s   || 0)).toFixed(1) + ' MB/s)');
 
-  const ub = document.getElementById('ul-bar');
   const db = document.getElementById('dl-bar');
-  if (!animate) { ub.style.transition = 'none'; db.style.transition = 'none'; }
-  setTimeout(() => { ub.style.width = ulp + '%'; db.style.width = dlp + '%'; }, 20);
-  if (!animate) setTimeout(() => { ub.style.transition = ''; db.style.transition = ''; }, 100);
+  const ub = document.getElementById('ul-bar');
+  if (!animate) {
+    db.style.transition = 'none'; ub.style.transition = 'none';
+  }
+  setTimeout(() => { db.style.width = dlp + '%'; ub.style.width = ulp + '%'; }, 20);
+  if (!animate) {
+    setTimeout(() => { db.style.transition = ''; ub.style.transition = ''; }, 100);
+  }
 
   document.getElementById('bench-meta').style.display = 'flex';
   s('b-streams', (d.streams || '—') + ' parallel');
