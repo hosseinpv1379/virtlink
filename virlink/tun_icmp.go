@@ -4,7 +4,8 @@
 //   • IFF_MULTI_QUEUE TUN — one goroutine per queue (parallel TX)
 //   • sendmmsg batching (32 packets) per queue
 //   • Non-blocking TUN reads + poll (no stall, no duplicate sends)
-//   • Lock-free sequence dedup, strict peer-IP filter
+//   • Inner IP payload dedup on TX+RX (multi-queue can deliver same skb to N readers)
+//   • Lock-free outer ICMP seq dedup, strict peer-IP filter
 package main
 
 import (
@@ -32,6 +33,8 @@ type IcmpTunnel struct {
 	stop    stoppedFlag
 	seq     atomic.Uint32
 	dedup   atomicSeqDedup
+	txDedup ipPktDedup
+	rxDedup ipPktDedup
 	lastSrc atomic.Value
 	peerIP  [4]byte
 	localIP [4]byte
@@ -61,6 +64,8 @@ func (t *IcmpTunnel) Up() error {
 	t.doClean()
 	t.stop.reset()
 	t.dedup.reset()
+	t.txDedup.reset()
+	t.rxDedup.reset()
 
 	step("instance lock...")
 	var err error
@@ -151,9 +156,13 @@ func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File) {
 			if !ok {
 				continue
 			}
+			payload := scratchPayload[:n]
+			if t.txDedup.dup(payload) {
+				continue
+			}
 			frame := getICMPFrame()
 			seq := uint16(t.seq.Add(1))
-			pkt := buildICMPFrame(frame, icmpTunID, seq, scratchPayload[:n])
+			pkt := buildICMPFrame(frame, icmpTunID, seq, payload)
 			batch.add(frame, len(pkt), dst)
 		}
 
@@ -210,10 +219,14 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 		if t.dedup.dup(seq) {
 			continue
 		}
+		inner := icmp[8:]
+		if t.rxDedup.dup(inner) {
+			continue
+		}
 		if t.cfg.Mode == "server" {
 			t.lastSrc.Store(sa.Addr)
 		}
-		if err := tunWrite(tun, icmp[8:]); err != nil && !t.stop.stopped() {
+		if err := tunWrite(tun, inner); err != nil && !t.stop.stopped() {
 			logWarn("tun write: " + err.Error())
 		}
 	}

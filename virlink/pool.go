@@ -155,6 +155,52 @@ func (d *atomicSeqDedup) reset() {
 	}
 }
 
+// ipPktDedup — dedup by inner IP packet hash (catches multi-queue TUN duplicate reads
+// and sendmmsg partial-send replays; outer ICMP seq differs per copy).
+type ipPktDedup struct {
+	slots [65536]atomic.Uint64
+}
+
+func hashIPPacket(p []byte) uint32 {
+	h := uint32(2166136261)
+	n := len(p)
+	if n > 96 {
+		n = 96
+	}
+	for i := 0; i < n; i++ {
+		h ^= uint32(p[i])
+		h *= 16777619
+	}
+	if h == 0 {
+		h = 1
+	}
+	return h
+}
+
+func (d *ipPktDedup) dup(p []byte) bool {
+	if len(p) < 20 {
+		return false
+	}
+	hash := hashIPPacket(p)
+	idx := hash & 65535
+	tag := (uint64(hash) << 16) | 1
+	for {
+		old := d.slots[idx].Load()
+		if old != 0 && uint32(old>>16) == hash {
+			return true
+		}
+		if d.slots[idx].CompareAndSwap(old, tag) {
+			return false
+		}
+	}
+}
+
+func (d *ipPktDedup) reset() {
+	for i := range d.slots {
+		d.slots[i].Store(0)
+	}
+}
+
 // stoppedFlag is checked occasionally in hot loops (no select per packet).
 type stoppedFlag struct{ v atomic.Bool }
 

@@ -75,7 +75,7 @@ func icmpSendBatch(rawFd int, b *icmpTxBatch) {
 		return
 	}
 	sent, err := sendmmsg(rawFd, b.msgs[:b.n])
-	if err != nil {
+	if err != nil && sent <= 0 {
 		sent = 0
 	}
 	for i := sent; i < b.n; i++ {
