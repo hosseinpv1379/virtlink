@@ -114,6 +114,7 @@ func (t *UdpObfsTunnel) Up() error {
 
 	step("cleanup...")
 	t.doClean()
+	t.stop.reset()
 
 	// ── TUN device (/dev/net/tun) ─────────────────────────────────────────────
 	step(fmt.Sprintf("TUN device %s ×%d queues...", dev, tunQueues))
@@ -211,7 +212,7 @@ func (t *UdpObfsTunnel) txLoop(conn *net.UDPConn, qfd *os.File, gcm cipher.AEAD,
 	buf := getBuf()
 	defer putBuf(buf)
 	for {
-		n, err := tunRead(qfd, buf)
+		n, err := qfd.Read(buf)
 		if err != nil {
 			if t.stop.stopped() {
 				return

@@ -47,6 +47,7 @@ func (t *BipTunnel) Up() error {
 
 	header("bip / " + c.Mode)
 	t.doClean()
+	t.stop.reset()
 
 	var err error
 	t.lockFd, err = acquireTunnelLock(dev)
@@ -102,9 +103,13 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 			if t.stop.stopped() {
 				return
 			}
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == unix.EINTR {
-				continue
-			}
+		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			_ = pollFD(rawFd, unix.POLLIN, 100)
+			continue
+		}
+		if err == unix.EINTR {
+			continue
+		}
 			logWarn("bip rx: " + err.Error())
 			continue
 		}
@@ -132,7 +137,7 @@ func (t *BipTunnel) txLoop(rawFd int, qfd *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
 	for {
-		n, err := tunRead(qfd, buf)
+		n, err := qfd.Read(buf)
 		if err != nil {
 			if t.stop.stopped() {
 				return

@@ -46,6 +46,7 @@ func (t *UdpTunnel) Up() error {
 
 	header("udp / " + c.Mode)
 	t.doClean()
+	t.stop.reset()
 
 	var err error
 	t.lockFd, err = acquireTunnelLock(dev)
@@ -129,7 +130,7 @@ func (t *UdpTunnel) txLoop(conn *net.UDPConn, qfd *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
 	for {
-		n, err := tunRead(qfd, buf)
+		n, err := qfd.Read(buf)
 		if err != nil {
 			if t.stop.stopped() {
 				return

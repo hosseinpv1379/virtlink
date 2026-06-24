@@ -45,6 +45,7 @@ func (t *TcpTunnel) Up() error {
 	header("tcp / " + c.Mode)
 	step("cleanup...")
 	t.doClean()
+	t.stop.reset()
 
 	var err error
 	step(fmt.Sprintf("TUN device %s ×%d queues...", dev, tunQueues))
@@ -112,7 +113,7 @@ func (t *TcpTunnel) txLoop(tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
 	for {
-		n, err := tunRead(tun, buf)
+		n, err := tun.Read(buf)
 		if err != nil {
 			if t.stop.stopped() {
 				return

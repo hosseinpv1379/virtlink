@@ -324,7 +324,8 @@ func (tt *tunnelTuning) applyLinkProfile(p tuningProfile) {
 		if p.txQLen > 0 {
 			_ = netlink.LinkSetTxQLen(link, p.txQLen)
 		}
-		if p.qdisc != "" {
+		// TUN devices don't benefit from fq/fq_codel and it can break delivery.
+		if p.qdisc != "" && link.Type() != "tun" {
 			if err := replaceDevQdisc(link, p.qdisc); err != nil {
 				warn(fmt.Sprintf("tuning qdisc %s on %s: %v", p.qdisc, dev, err))
 			}
@@ -391,7 +392,9 @@ func (tt *tunnelTuning) restoreLocked() {
 		if sl.ok && sl.txQLen > 0 {
 			_ = netlink.LinkSetTxQLen(link, sl.txQLen)
 		}
-		restoreDevQdisc(link)
+		if link.Type() != "tun" {
+			restoreDevQdisc(link)
+		}
 	}
 	if tt.hadNOFile {
 		_ = unix.Setrlimit(unix.RLIMIT_NOFILE, &tt.savedNOFile)

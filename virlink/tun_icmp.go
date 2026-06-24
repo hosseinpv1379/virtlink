@@ -55,6 +55,8 @@ func (t *IcmpTunnel) Up() error {
 	header("icmp / " + c.Mode)
 	step("cleanup...")
 	t.doClean()
+	t.stop.reset()
+	t.dedup.reset()
 
 	step("instance lock...")
 	var err error
@@ -99,7 +101,7 @@ func (t *IcmpTunnel) Up() error {
 	}
 
 	done(dev, addr, peer,
-		fmt.Sprintf("transport : ICMP ×%d TUN queues", tunQueues),
+		fmt.Sprintf("transport : ICMP ×%d TUN queues", t.tun.QueueCount()),
 		"filter   : peer="+c.RemoteIP,
 		"test     : ping -c3 "+peer,
 	)
@@ -116,9 +118,13 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 			if t.stop.stopped() {
 				return
 			}
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == unix.EINTR {
-				continue
-			}
+		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			_ = pollFD(rawFd, unix.POLLIN, 100)
+			continue
+		}
+		if err == unix.EINTR {
+			continue
+		}
 			logWarn("icmp rx: " + err.Error())
 			continue
 		}
@@ -156,7 +162,7 @@ func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File, _ int) {
 	payload := frame[icmpHdrLen:]
 
 	for {
-		n, err := tunRead(qfd, payload)
+		n, err := qfd.Read(payload)
 		if err != nil {
 			if t.stop.stopped() {
 				return

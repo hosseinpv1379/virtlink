@@ -3,6 +3,7 @@
 // IFF_MULTI_QUEUE gives N file descriptors for the same interface.
 // The kernel load-balances outbound packets (stack → userspace) across
 // queues, so N parallel txLoop goroutines can read at N× the rate of one.
+// Falls back to a single queue when the kernel rejects multi-queue.
 package main
 
 import (
@@ -21,7 +22,8 @@ const (
 
 // TunDev holds one or more TUN queue file descriptors.
 type TunDev struct {
-	fds []*os.File
+	fds    []*os.File
+	queues int
 }
 
 func (t *TunDev) Close() {
@@ -33,6 +35,13 @@ func (t *TunDev) Close() {
 }
 
 func (t *TunDev) Fd0() *os.File { return t.fds[0] }
+
+func (t *TunDev) QueueCount() int {
+	if t == nil {
+		return 0
+	}
+	return t.queues
+}
 
 func openTunDev(name string) (*os.File, error) {
 	td, err := openTunMulti(name, 1)
@@ -46,9 +55,19 @@ func openTunMulti(name string, n int) (*TunDev, error) {
 	if n < 1 {
 		n = 1
 	}
-	td := &TunDev{fds: make([]*os.File, 0, n)}
+	td, err := openTunMultiTry(name, n)
+	if err != nil && n > 1 {
+		warn(fmt.Sprintf("multi-queue TUN unavailable (%v) — falling back to 1 queue", err))
+		return openTunMultiTry(name, 1)
+	}
+	return td, err
+}
+
+func openTunMultiTry(name string, n int) (*TunDev, error) {
+	td := &TunDev{fds: make([]*os.File, 0, n), queues: n}
 	for i := 0; i < n; i++ {
-		fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		// Blocking TUN reads — non-blocking + spin caused 100% CPU and stalled I/O.
+		fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
 		if err != nil {
 			td.Close()
 			return nil, fmt.Errorf("open /dev/net/tun: %w", err)
@@ -74,26 +93,17 @@ func openTunMulti(name string, n int) (*TunDev, error) {
 	return td, nil
 }
 
-func tunRead(fd *os.File, buf []byte) (int, error) {
-	for {
-		n, err := fd.Read(buf)
-		if err == nil {
-			return n, nil
-		}
-		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-			continue
-		}
-		return n, err
-	}
+func tunWrite(fd *os.File, pkt []byte) error {
+	_, err := fd.Write(pkt)
+	return err
 }
 
-func tunWrite(fd *os.File, pkt []byte) error {
+// pollFD waits until fd is readable/writable or timeoutMs elapses.
+func pollFD(fd int, events int16, timeoutMs int) error {
+	fds := []unix.PollFd{{Fd: int32(fd), Events: events}}
 	for {
-		_, err := fd.Write(pkt)
-		if err == nil {
-			return nil
-		}
-		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+		_, err := unix.Poll(fds, timeoutMs)
+		if err == unix.EINTR {
 			continue
 		}
 		return err

@@ -138,10 +138,10 @@ type atomicSeqDedup struct {
 
 func (d *atomicSeqDedup) dup(seq uint16) bool {
 	idx := uint32(seq) & 4095
-	tag := uint32(seq) << 16
+	tag := (uint32(seq) << 16) | 1 // +1 so empty slot (0) never matches seq=0
 	for {
 		old := d.slots[idx].Load()
-		if old>>16 == uint32(seq) {
+		if old != 0 && old>>16 == uint32(seq) {
 			return true
 		}
 		if d.slots[idx].CompareAndSwap(old, tag) {
@@ -150,10 +150,17 @@ func (d *atomicSeqDedup) dup(seq uint16) bool {
 	}
 }
 
+func (d *atomicSeqDedup) reset() {
+	for i := range d.slots {
+		d.slots[i].Store(0)
+	}
+}
+
 // stoppedFlag is checked occasionally in hot loops (no select per packet).
 type stoppedFlag struct{ v atomic.Bool }
 
 func (s *stoppedFlag) stop()         { s.v.Store(true) }
+func (s *stoppedFlag) reset()        { s.v.Store(false) }
 func (s *stoppedFlag) stopped() bool { return s.v.Load() }
 
 // ipTo4 parses an IPv4 address into a fixed [4]byte (zero if invalid).
