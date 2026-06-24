@@ -222,6 +222,11 @@ func setDefaults(c *Config) {
 		case "vxlan-wg":        t.MTU = 1360
 		case "gre-fou-ipsec":   t.MTU = 1380
 		case "udp-obfs":        t.MTU = 1400
+		case "gre":             t.MTU = 1476
+		case "tcp":             t.MTU = 1460
+		case "udp":             t.MTU = 1472
+		case "icmp":            t.MTU = 1472
+		case "bip":             t.MTU = 1480
 		default:                t.MTU = 1420
 		}
 	}
@@ -234,7 +239,10 @@ func setDefaults(c *Config) {
 		case "l2tpv3":                   tr.Port = 5059
 		case "gre-wg":                   tr.Port = 51820
 		case "vxlan-wg":                 tr.Port = 51821
-		case "udp-obfs":                 tr.Port = 443   // default: looks like QUIC
+		case "udp-obfs":                 tr.Port = 443
+		case "tcp":                      tr.Port = 8443
+		case "udp":                      tr.Port = 5060
+		// gre, icmp, bip don't use ports (raw protocol tunnels)
 		default:                         tr.Port = 5556
 		}
 	}
@@ -276,6 +284,8 @@ func validate(c *Config) error {
 		"gre-fou", "ipip-fou", "bonded-gre-fou",
 		"l2tpv3", "gre-wg", "vxlan-wg", "gre-fou-ipsec",
 		"udp-obfs",
+		// raw protocol tunnels
+		"gre", "tcp", "udp", "icmp", "bip",
 	}
 	ok := false
 	for _, v := range valid {

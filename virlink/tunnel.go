@@ -34,6 +34,16 @@ func newTunnel(cfg *Config) (Tunnel, error) {
 		return &IpsecTunnel{cfg: cfg}, nil
 	case "udp-obfs":
 		return &UdpObfsTunnel{cfg: cfg}, nil
+	case "gre":
+		return &GreTunnel{cfg: cfg}, nil
+	case "tcp":
+		return &TcpTunnel{cfg: cfg}, nil
+	case "udp":
+		return &UdpTunnel{cfg: cfg}, nil
+	case "icmp":
+		return &IcmpTunnel{cfg: cfg}, nil
+	case "bip":
+		return &BipTunnel{cfg: cfg}, nil
 	}
 	return nil, fmt.Errorf("unknown tunnel type: %s", cfg.Tunnel.Type)
 }

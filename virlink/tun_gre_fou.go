@@ -93,7 +93,7 @@ func (t *GreFouTunnel) Status() {
 	} else {
 		fmt.Println("  interface not found:", t.dev())
 	}
-	addrs, _ := netlink.AddrList(nil, netlink.FAMILY_V4)
+	addrs, _ := netlink.AddrList(nil, 2 /* FAMILY_V4 */)
 	for _, a := range addrs {
 		if l, _ := netlink.LinkByIndex(a.LinkIndex); l != nil &&
 			l.Attrs().Name == t.dev() {
