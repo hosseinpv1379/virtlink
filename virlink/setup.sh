@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -168,13 +168,13 @@ fetch_geo_info() {
 show_banner() {
   clear
   echo -e "${BOLD}${C}"
-  echo "▗▄▄▖  ▗▄▖  ▗▄▄▖▗▖ ▗▖▗▖ ▗▖ ▗▄▖ ▗▖ ▗▖▗▖"
-  echo "▐▌ ▐▌▐▌ ▐▌▐▌   ▐▌▗▞▘▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▐▌"
-  echo "▐▛▀▚▖▐▛▀▜▌▐▌   ▐▛▚▖ ▐▛▀▜▌▐▛▀▜▌▐▌ ▐▌▐▌"
-  echo "▐▙▄▞▘▐▌ ▐▌▝▚▄▄▖▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▝▚▄▞▘▐▙▄▄▖"
+  echo "▗▄▄▖ ▗▖ ▗▖▗▖  ▗▖▗▙▄▖ ▗▖     ▗▖ ▗▖▗▖ ▗▖"
+  echo "▐▌ ▐▌▐▌ ▐▌▐▛ ▐▌▐▌ ▐▌▐▌     ▐▌ ▐▌▐▌ ▐▌"
+  echo "▐▛▀▚▖▐▛▀▜▌▐▌ ▐▌▐▌ ▐▌▐▌     ▐▌ ▐▌▐▛▀▜▌"
+  echo "▐▙▄▞▘▐▌ ▐▌▐▙▄▞▘▝▚▄▞▘▐▙▄▄▖    ▝▚▄▞▘▐▌ ▐▌"
   echo -e "${NC}"
-  echo -e "  ${DIM}${TAGLINE}${NC}"
-  blank
+  echo -e "  ${W}${BOLD}virlink${NC} ${DIM}— ${TAGLINE}${NC}"
+  echo
 
   local core_ver ip geo_loc geo_dc core_state
   core_ver=$(core_version)
