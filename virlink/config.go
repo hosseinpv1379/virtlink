@@ -105,6 +105,14 @@ type HealthCfg struct {
 	Port     int  `toml:"port"`     // default 6543
 }
 
+// MangleCfg maps to [mangle] — optional nftables source rewrite (manual config only).
+// Client example: srcip=1.1.1.1 dstip=2.2.2.2
+// Server example: srcip=2.2.2.2 dstip=1.1.1.1
+type MangleCfg struct {
+	SrcIP string `toml:"srcip"`
+	DstIP string `toml:"dstip"`
+}
+
 // ─── root config ─────────────────────────────────────────────────────────────
 
 type Config struct {
@@ -119,6 +127,7 @@ type Config struct {
 	Forward   ForwardCfg   `toml:"forward"`
 	Obfs      ObfsCfg      `toml:"obfs"`
 	Health    HealthCfg    `toml:"health"`
+	Mangle    MangleCfg    `toml:"mangle"`
 
 	// Convenience aliases (set after parse, not from TOML)
 	Mode     string `toml:"-"`
@@ -329,6 +338,9 @@ func validate(c *Config) error {
 		return err
 	}
 	if err := validatePerf(&c.Tuning); err != nil {
+		return err
+	}
+	if err := validateMangle(&c.Mangle); err != nil {
 		return err
 	}
 	return nil
