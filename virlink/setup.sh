@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -243,18 +243,22 @@ ensure_deps() {
   fi
 }
 
+_verify_setup_script() {
+  local f="$1"
+  grep -q 'SCRIPT_VERSION=' "$f" \
+    || die "Saved setup script is incomplete (missing SCRIPT_VERSION)"
+  grep -qE '^main\(\)' "$f" \
+    || die "Saved setup script is incomplete (missing main function)"
+}
+
 install_setup_script() {
   local dest="${INSTALL_DIR}/setup.sh"
-  if _is_piped_curl; then
-    info "Saving setup script to ${dest}..."
-    cp -f "$0" "$dest"
-  else
-    info "Downloading setup script..."
-    safe_download \
-      "https://github.com/${GITHUB_REPO}/releases/latest/download/setup.sh" \
-      "$dest"
-  fi
+  info "Saving setup script to ${dest}..."
+  safe_download \
+    "https://github.com/${GITHUB_REPO}/releases/latest/download/setup.sh" \
+    "$dest"
   chmod +x "$dest"
+  _verify_setup_script "$dest"
   ln -sf "$dest" /usr/local/bin/virlink-setup 2>/dev/null || true
 }
 
@@ -334,6 +338,7 @@ do_update_script() {
   safe_download "https://github.com/${GITHUB_REPO}/releases/latest/download/setup.sh" \
     "${INSTALL_DIR}/setup.sh.new"
   chmod +x "${INSTALL_DIR}/setup.sh.new"
+  _verify_setup_script "${INSTALL_DIR}/setup.sh.new"
   mv "${INSTALL_DIR}/setup.sh.new" "${INSTALL_DIR}/setup.sh"
   ln -sf "${INSTALL_DIR}/setup.sh" /usr/local/bin/virlink-setup 2>/dev/null || true
   ok "Setup script updated — restarting..."
