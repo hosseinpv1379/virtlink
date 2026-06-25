@@ -7,6 +7,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"unsafe"
@@ -101,8 +102,8 @@ func tunWrite(fd *os.File, pkt []byte) error {
 func tunReadNB(fd *os.File, buf []byte) (int, error) {
 	n, err := fd.Read(buf)
 	if err != nil {
-		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-			return 0, err
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+			return 0, unix.EAGAIN
 		}
 	}
 	return n, err

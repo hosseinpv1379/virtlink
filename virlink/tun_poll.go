@@ -5,6 +5,8 @@
 package main
 
 import (
+	"errors"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -43,7 +45,7 @@ func (p *tunPoller) Run(onEmpty func(), onPkt func(pkt []byte, n int) bool) {
 		for _, q := range p.tun.fds {
 			for {
 				n, err := tunReadNB(q, p.buf)
-				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
 					break
 				}
 				if err != nil || n == 0 {
