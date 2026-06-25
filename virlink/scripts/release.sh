@@ -6,7 +6,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-GITHUB_REPO="hosseinpv1379/virtlink-install"
+GITHUB_REPO="hosseinpv1379/virtlink"
 
 VERSION="${1:?Usage: $0 vX.Y.Z [release notes]}"
 NOTES="${2:-Release ${VERSION}}"

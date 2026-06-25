@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # virlink — kernel & userspace tunnel manager  (setup & management)
-# Public install: https://github.com/hosseinpv1379/virtlink-install
+# Public install: https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
 SCRIPT_VERSION="1.0.6"
-GITHUB_REPO="hosseinpv1379/virtlink-install"
+GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
 
