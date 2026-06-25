@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -110,7 +110,9 @@ press_enter() {
 core_version() {
   local ver
   ver=$("$VIRLINK_BIN" --version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
-  [[ -n "$ver" && "$ver" != v* ]] && ver="v${ver}"
+  if [[ -n "$ver" && "$ver" != v* ]]; then
+    ver="v${ver}"
+  fi
   echo "${ver:-?}"
 }
 
@@ -132,34 +134,49 @@ detect_local_ip() {
 detect_ip() {
   local ip
   ip=$(detect_public_ip)
-  [[ -n "$ip" ]] && { echo "$ip"; return; }
+  if [[ -n "$ip" ]]; then
+    echo "$ip"
+    return 0
+  fi
   ip=$(detect_local_ip)
   echo "${ip:-unknown}"
 }
 
-# Sets GEO_LOCATION and GEO_DATACENTER globals (or "null")
+# Sets GEO_LOCATION and GEO_DATACENTER globals (empty when unavailable)
 fetch_geo_info() {
-  GEO_LOCATION="null"
-  GEO_DATACENTER="null"
+  GEO_LOCATION=""
+  GEO_DATACENTER=""
   local ip="${1:-}"
-  [[ -z "$ip" || "$ip" == "unknown" ]] && return
+  if [[ -z "$ip" || "$ip" == "unknown" ]]; then
+    return 0
+  fi
 
   local raw city country isp org status
-  raw=$(curl -fsSL --connect-timeout 3 --max-time 5 \
+  raw=$(curl -fsSL --connect-timeout 3 --max-time 3 \
     "http://ip-api.com/json/${ip}?fields=status,city,country,isp,org" 2>/dev/null || echo "")
-  [[ -z "$raw" ]] && return
+  if [[ -z "$raw" ]]; then
+    return 0
+  fi
 
   status=$(echo "$raw" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
-  [[ "$status" != "success" ]] && return
+  if [[ "$status" != "success" ]]; then
+    return 0
+  fi
 
   city=$(echo "$raw"    | grep -o '"city":"[^"]*"'    | head -1 | cut -d'"' -f4)
   country=$(echo "$raw" | grep -o '"country":"[^"]*"' | head -1 | cut -d'"' -f4)
   isp=$(echo "$raw"     | grep -o '"isp":"[^"]*"'     | head -1 | cut -d'"' -f4)
   org=$(echo "$raw"     | grep -o '"org":"[^"]*"'     | head -1 | cut -d'"' -f4)
 
-  [[ -n "$city" || -n "$country" ]] && GEO_LOCATION="${city:-?}, ${country:-?}"
-  [[ -n "$org" ]] && GEO_DATACENTER="$org"
-  [[ "$GEO_DATACENTER" == "null" && -n "$isp" ]] && GEO_DATACENTER="$isp"
+  if [[ -n "$city" || -n "$country" ]]; then
+    GEO_LOCATION="${city:-?}, ${country:-?}"
+  fi
+  if [[ -n "$org" ]]; then
+    GEO_DATACENTER="$org"
+  elif [[ -n "$isp" ]]; then
+    GEO_DATACENTER="$isp"
+  fi
+  return 0
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -177,11 +194,11 @@ show_banner() {
   echo
 
   local core_ver ip geo_loc geo_dc core_state
-  core_ver=$(core_version)
-  ip=$(detect_ip)
-  fetch_geo_info "$ip"
-  geo_loc="${GEO_LOCATION:-null}"
-  geo_dc="${GEO_DATACENTER:-null}"
+  core_ver=$(core_version || echo "?")
+  ip=$(detect_ip || echo "unknown")
+  fetch_geo_info "$ip" || true
+  geo_loc="${GEO_LOCATION:-—}"
+  geo_dc="${GEO_DATACENTER:-—}"
 
   if core_is_installed; then
     core_state="${G}Installed${NC}  ${DIM}(${core_ver})${NC}"
@@ -194,12 +211,8 @@ show_banner() {
   echo -e "  ${DIM}Telegram Channel:${NC} ${TELEGRAM_CHANNEL}"
   sep
   echo -e "  ${DIM}IP Address:${NC}       ${W}${ip}${NC}"
-  if [[ "$geo_loc" != "null" ]]; then
-    echo -e "  ${DIM}Location:${NC}         ${geo_loc}"
-  fi
-  if [[ "$geo_dc" != "null" ]]; then
-    echo -e "  ${DIM}Datacenter:${NC}       ${geo_dc}"
-  fi
+  echo -e "  ${DIM}Location:${NC}         ${geo_loc}"
+  echo -e "  ${DIM}Datacenter:${NC}       ${geo_dc}"
   echo -e "  ${DIM}Virtlink Core:${NC}    ${core_state}"
   sep
 
@@ -1519,8 +1532,14 @@ _manage_keygen() {
 # Main loop
 # ══════════════════════════════════════════════════════════════════════════════
 main() {
-  require_bin
-  mkdir -p "$CONFIGS_DIR"
+  mkdir -p "$CONFIGS_DIR" 2>/dev/null || true
+
+  if [[ ! -t 0 ]] || [[ ! -e /dev/tty ]] || [[ ! -r /dev/tty ]]; then
+    show_banner
+    err "Interactive menu requires a TTY."
+    info "Run directly on the server: ${W}sudo virlink-setup${NC}  or  ${W}sudo bash setup.sh menu${NC}"
+    exit 1
+  fi
 
   check_update &
   local _bg=$!
