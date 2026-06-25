@@ -1,10 +1,11 @@
 # ── compiled binary (distributed via GitHub Releases only) ────────────────────
 virlink/virlink
+virlink/virlink-release
 virlink/virlink-test
+virlink/test/virlink-test
 virlink_new
 
 # ── user-generated runtime files ─────────────────────────────────────────────
-configs/
 /var/run/virlink/
 /var/log/virlink/
 

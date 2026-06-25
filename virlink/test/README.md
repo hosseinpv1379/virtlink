@@ -1,7 +1,7 @@
 # virlink-test — Benchmark & Validation Suite
 
 A standalone binary for bidirectional protocol benchmarking and validation of
-[virlink](https://github.com/hosseinpv1379/virtlink) tunnels.
+[virlink](https://github.com/hosseinpv1379/virtlink-install) tunnels.
 
 > **Does not modify virlink in any way.**  
 > Download it separately from the Releases page and run it alongside your tunnels.
@@ -12,7 +12,7 @@ A standalone binary for bidirectional protocol benchmarking and validation of
 
 ```bash
 # Download to current directory
-curl -fsSL -O https://github.com/hosseinpv1379/virtlink/releases/latest/download/virlink-test
+curl -fsSL -O https://github.com/hosseinpv1379/virtlink-install/releases/latest/download/virlink
 chmod +x virlink-test
 ```
 
@@ -266,8 +266,10 @@ Pass `--json report.json` to save a machine-readable report:
 
 ## Build from Source
 
+> Source repo is private — requires collaborator access.
+
 ```bash
-git clone https://github.com/hosseinpv1379/virtlink --branch source
+git clone git@github.com:hosseinpv1379/virtlink.git --branch source
 cd virtlink/virlink/test
 go build -o virlink-test .
 

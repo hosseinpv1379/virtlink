@@ -1,0 +1,36 @@
+# ── virlink · IPIP-FOU · CLIENT (81.12.35.242) ───────────────────────────────
+# Usage:  sudo ./virlink -c config.toml
+# Overlay: this host → 10.20.10.1/24
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tunnel]
+type      = "ipip-fou"
+mode      = "client"
+local_ip  = "81.12.35.242"
+remote_ip = "5.75.206.15"
+cidr      = "10.20.10.0/24"
+mtu       = 1440
+
+[transport]
+port  = 5055
+proto = "fou"
+
+[security]
+encryption = false
+
+[tuning]
+bbr          = true
+multipath    = false
+channel_size = 10_000
+
+[logging]
+level = "info"
+
+# ── port forwarding (client-only) ─────────────────────────────────────────────
+[forward]
+enabled = false
+rules = [
+  # "1000:2000",
+  # "8080:80/tcp",
+  # "53:53/udp",
+]

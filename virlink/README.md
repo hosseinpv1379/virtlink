@@ -2,16 +2,19 @@
 
 **Kernel-native virtual tunnel manager** — GRE, IPIP, L2TP, WireGuard, obfuscated UDP, raw ICMP/TCP/UDP/BIP tunnels, all managed through a single binary and interactive setup script.
 
-[![Release](https://img.shields.io/github/v/release/hosseinpv1379/virtlink)](https://github.com/hosseinpv1379/virtlink/releases/latest)
-[![Platform](https://img.shields.io/badge/platform-linux%20amd64-blue)](https://github.com/hosseinpv1379/virtlink/releases/latest)
+[![Release](https://img.shields.io/github/v/release/hosseinpv1379/virtlink-install)](https://github.com/hosseinpv1379/virtlink-install/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-linux%20amd64-blue)](https://github.com/hosseinpv1379/virtlink-install/releases/latest)
+
+> **Source code is private.** This document is for developers with repo access.
+> Public installs use the [virtlink-install](https://github.com/hosseinpv1379/virtlink-install) release repo only.
 
 ---
 
-## Quick Start
+## Quick Start (public install)
 
 ```bash
 # Install (as root)
-sudo bash <(curl -fsSL https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh)
+sudo bash <(curl -fsSL https://github.com/hosseinpv1379/virtlink-install/releases/latest/download/setup.sh)
 ```
 
 This downloads the binary and setup script to `/opt/virlink`, creates symlinks in `/usr/local/bin`, and launches the interactive menu.
@@ -48,163 +51,58 @@ sudo virlink-setup
 ```
 sudo virlink-setup
 
-  1  Create new tunnel
-  2  Manage tunnels  (start / stop / status / install as service)
-  3  Add port forward rule
-  4  Generate WireGuard keypair
-  5  List all tunnels
-  6  Update virlink  ← shows update badge when a new release is available
-  7  Exit
-```
-
-**Version check** — on every menu open the binary version is compared against the latest GitHub release. If an update is available, option 6 is highlighted in yellow. The update downloads both the binary and setup script atomically, then restarts.
-
-### Direct sub-commands
-
-```bash
-sudo virlink-setup start   my-tunnel
-sudo virlink-setup stop    my-tunnel
-sudo virlink-setup restart my-tunnel
-sudo virlink-setup status  my-tunnel
-sudo virlink-setup list
-sudo virlink-setup update      # one-shot update check + apply
+  1) Create tunnel config
+  2) Start tunnel
+  3) Stop tunnel
+  4) Status
+  5) Update virlink
+  6) Uninstall
 ```
 
 ---
 
-## Manual usage
+## Project layout
 
-```bash
-# bring up (blocks — tunnel lives while process runs)
-sudo virlink -c /opt/virlink/configs/my-tunnel.toml
-
-# tear down
-sudo virlink -c /opt/virlink/configs/my-tunnel.toml --down
-
-# status
-sudo virlink -c /opt/virlink/configs/my-tunnel.toml --status
-
-# generate WireGuard keys
-virlink keygen
-
-# print version
-virlink --version
+```
+virlink/
+├── cmd/virlink/           CLI entry (thin main)
+├── internal/virlink/      all tunnel + runtime logic (see doc.go)
+├── configs/
+│   ├── examples/          sample config.toml per tunnel type
+│   └── spooftest/       manual wire-spoof test configs
+├── scripts/
+│   ├── setup.sh           interactive installer / manager
+│   └── release.sh         publish binary + setup.sh to GitHub
+├── test/                  integration harness (separate go.mod)
+├── Makefile
+└── go.mod
 ```
 
----
-
-## Config structure
-
-```toml
-[tunnel]
-type      = "gre-fou"        # see tunnel types table above
-mode      = "client"         # client | server
-local_ip  = "81.12.35.242"   # this server's public IP
-remote_ip = "5.75.206.15"    # peer's public IP
-cidr      = "10.20.10.0/24"  # client → .1 / server → .2
-mtu       = 1420
-
-[transport]
-port               = 5556
-heartbeat_interval = 10      # status log every N seconds
-
-[tuning]
-bbr          = true
-channel_size = 10_000
-
-[logging]
-level = "info"
-
-# client-only port forwarding
-[forward]
-enabled = true
-rules   = ["1000:2000", "8080:80/tcp"]
-```
-
-### udp-obfs extra section
-
-```toml
-[obfs]
-key     = "shared_secret"   # same on both sides
-mask    = "quic"            # noise | quic | dtls
-padding = true
-```
-
-### Raw-socket tunnels (gre / icmp / bip)
-
-These use IP-level raw sockets — no `port` needed:
-
-```toml
-[tunnel]
-type      = "icmp"
-mode      = "client"
-local_ip  = "81.12.35.242"
-remote_ip = "5.75.206.15"
-cidr      = "10.20.10.0/24"
-mtu       = 1472
-
-[transport]
-heartbeat_interval = 10
-```
-
----
-
-## How it works
-
-- All kernel objects (GRE, IPIP, TUN/TAP, routes, addresses) are created **natively via netlink** — no `ip` sub-process for core operations.
-- `sysctl` parameters are written directly to `/proc/sys/`.
-- `udp-obfs` runs entirely in userspace: every packet is AES-256-GCM encrypted before it touches the UDP socket.
-- `icmp` / `bip` / `tcp` / `udp` use a TUN device + Go goroutines for the transport; kernel handles IP routing normally.
-- **Ctrl+C** / **SIGTERM** → all kernel objects and iptables rules are removed automatically.
-- Goroutines hold private references to sockets/file descriptors so shutdown races cannot produce nil-pointer panics (v2.1.0+).
-
----
-
-## Requirements
-
-- Linux kernel ≥ 5.4
-- x86_64 (amd64)
-- Root / sudo
-- `iptables` (MSS clamping and port forwarding)
-- `linux-modules-extra-$(uname -r)` — needed for L2TPv3 and bonded modes
-- `curl` — required by setup.sh for downloads and install
-
----
-
-## Files
-
-| Path | Description |
-|------|-------------|
-| `/opt/virlink/virlink` | binary |
-| `/opt/virlink/setup.sh` | this script |
-| `/opt/virlink/configs/*.toml` | tunnel configs |
-| `/var/log/virlink/<name>.log` | per-tunnel logs |
-| `/var/run/virlink/<name>.pid` | PID files |
-| `/usr/local/bin/virlink` | symlink → binary |
-| `/usr/local/bin/virlink-setup` | symlink → setup.sh |
+See `internal/virlink/doc.go` for the full source file map.
 
 ---
 
 ## Releasing
 
-Every GitHub release must include **both** assets so the install one-liner works:
+Releases go to the **public install repo** (`virtlink-install`), not this source repo.
+Every release must include **both** assets so the install one-liner works:
 
 | Asset | URL |
 |-------|-----|
-| `setup.sh` | `https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh` |
-| `virlink` | `https://github.com/hosseinpv1379/virtlink/releases/latest/download/virlink` |
+| `setup.sh` | `https://github.com/hosseinpv1379/virtlink-install/releases/latest/download/setup.sh` |
+| `virlink` | `https://github.com/hosseinpv1379/virtlink-install/releases/latest/download/virlink` |
 
-From the `virlink/` directory (after bumping `main.go` version):
+From the `virlink/` directory (after bumping version in `internal/virlink/cli.go`):
 
 ```bash
-./release.sh vX.Y.Z "Release notes"
+./scripts/release.sh vX.Y.Z "Release notes"
 ```
 
 Verify:
 
 ```bash
-curl -fsSL -I https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh
-curl -fsSL -I https://github.com/hosseinpv1379/virtlink/releases/latest/download/virlink
+curl -fsSL -I https://github.com/hosseinpv1379/virtlink-install/releases/latest/download/setup.sh
+curl -fsSL -I https://github.com/hosseinpv1379/virtlink-install/releases/latest/download/virlink
 ```
 
 ---

@@ -1,0 +1,47 @@
+# ── virlink · UDP-Obfs · CLIENT (81.12.35.242) ───────────────────────────────
+# Obfuscated UDP tunnel — AES-256-GCM encrypted, DPI-resistant.
+# Designed to bypass Iranian firewall/filtering.
+#
+# Usage:   sudo ./virlink -c config.toml
+# Overlay: this host → 10.20.10.1/24
+#
+# ⚠  [obfs] key must be identical on both client and server.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tunnel]
+type      = "udp-obfs"
+mode      = "client"
+local_ip  = "81.12.35.242"
+remote_ip = "5.75.206.15"
+cidr      = "10.20.10.0/24"   # client → 10.20.10.1/24
+mtu       = 1400
+
+[transport]
+port               = 443       # UDP 443 — looks like QUIC to DPI
+proto              = "udp-obfs"
+heartbeat_interval = 10
+
+# ── obfuscation ───────────────────────────────────────────────────────────────
+[obfs]
+key     = "CHANGE_THIS_TO_A_STRONG_SECRET"   # shared secret (both sides)
+mask    = "quic"    # noise | quic | dtls
+#   noise → pure random ciphertext (no header)
+#   quic  → fake QUIC v1 Initial header (best for port 443)
+#   dtls  → fake DTLS 1.2 Record header
+padding = true      # random-length padding defeats length-based analysis
+
+[security]
+encryption = true   # AES-256-GCM (always on for udp-obfs)
+
+[tuning]
+bbr          = true
+channel_size = 10_000
+
+[logging]
+level = "info"
+
+[forward]
+enabled = false
+rules = [
+  # "1000:2000",
+]
