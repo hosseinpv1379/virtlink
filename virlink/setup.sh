@@ -1,27 +1,46 @@
 #!/usr/bin/env bash
-# virlink — kernel tunnel manager  (setup & management)
+# virlink — kernel & userspace tunnel manager  (setup & management)
 # https://github.com/hosseinpv1379/virtlink
 set -euo pipefail
 
-# ── constants ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Constants & paths
+# ══════════════════════════════════════════════════════════════════════════════
+SCRIPT_VERSION="1.0.0"
 GITHUB_REPO="hosseinpv1379/virtlink"
+TELEGRAM_CHANNEL="@Gozar_XRay"
+TAGLINE="High-performance kernel & userspace tunneling"
+
 INSTALL_DIR="/opt/virlink"
 VIRLINK_BIN="${INSTALL_DIR}/virlink"
 CONFIGS_DIR="${INSTALL_DIR}/configs"
 LOGS_DIR="/var/log/virlink"
-SCRIPT_VERSION="2.7.6"
 
 UPDATE_AVAILABLE=0
 LATEST_TAG=""
 LAST_CFG_PATH=""   # set by gen_* instead of echoing (avoids $() capture)
 PICKED_TUNNEL=""   # set by pick_tunnel (avoids printf -v scope bug with set -u)
+PRESELECTED_MODE=""  # set during create flow (client/server chosen upfront)
 
-# ── colors ────────────────────────────────────────────────────────────────────
+# Kernel vs userspace tunnel classification
+# Note: vxlan-wg is supported by the binary but has no setup.sh generator yet.
+readonly -a KERNEL_TUNNEL_KEYS=(
+  gre-fou ipip-fou bonded-gre-fou l2tpv3 gre-wg gre-fou-ipsec gre
+)
+readonly -a USERSPACE_TUNNEL_KEYS=(
+  icmp udp bip tcp udp-obfs
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI — colors & formatting
+# ══════════════════════════════════════════════════════════════════════════════
 R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
 B='\033[0;34m' C='\033[0;36m' W='\033[1;37m'
 DIM='\033[2m' BOLD='\033[1m' NC='\033[0m'
 
-# ── I/O helpers ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# I/O helpers
+# ══════════════════════════════════════════════════════════════════════════════
 tty_out()  { printf '%b'   "$@" > /dev/tty; }
 tty_line() { printf '%b\n' "$@" > /dev/tty; }
 
@@ -31,7 +50,8 @@ warn()  { echo -e "  ${Y}⚠${NC} $*"; }
 err()   { echo -e "  ${R}✗${NC} $*" >&2; }
 die()   { err "$*"; exit 1; }
 blank() { echo; }
-sep()   { echo -e "${DIM}────────────────────────────────────────────────${NC}"; }
+sep()   { echo -e "${DIM}══════════════════════════════════════════════════${NC}"; }
+sep_thin() { echo -e "${DIM}────────────────────────────────────────────────${NC}"; }
 
 confirm() {
   tty_out "  ${W}?${NC} $1 [y/N]: "
@@ -61,7 +81,7 @@ pick() {
   local opts=("$@")
   tty_line
   tty_line "  ${W}${title}${NC}"
-  tty_line "${DIM}────────────────────────────────────────────────${NC}"
+  sep_thin
   local i
   for i in "${!opts[@]}"; do
     tty_out "    ${C}$(printf '%2d' $((i+1)))${NC}  ${opts[$i]}\n"
@@ -84,9 +104,117 @@ press_enter() {
   read -r < /dev/tty || true
 }
 
-# ── safe download helper ──────────────────────────────────────────────────────
-# Downloads URL to DEST using a temp file (avoids partial-write failures).
-# curl error 23 = cannot write to destination — solved by writing to /tmp first.
+# ══════════════════════════════════════════════════════════════════════════════
+# System info helpers
+# ══════════════════════════════════════════════════════════════════════════════
+core_version() {
+  local ver
+  ver=$("$VIRLINK_BIN" --version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+  [[ -n "$ver" && "$ver" != v* ]] && ver="v${ver}"
+  echo "${ver:-?}"
+}
+
+core_is_installed() {
+  [[ -x "$VIRLINK_BIN" ]]
+}
+
+detect_public_ip() {
+  local ip=""
+  ip=$(curl -fsSL --connect-timeout 3 --max-time 5 ifconfig.me 2>/dev/null || true)
+  [[ -z "$ip" ]] && ip=$(curl -fsSL --connect-timeout 3 --max-time 5 api.ipify.org 2>/dev/null || true)
+  echo "${ip:-}"
+}
+
+detect_local_ip() {
+  hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+detect_ip() {
+  local ip
+  ip=$(detect_public_ip)
+  [[ -n "$ip" ]] && { echo "$ip"; return; }
+  ip=$(detect_local_ip)
+  echo "${ip:-unknown}"
+}
+
+# Sets GEO_LOCATION and GEO_DATACENTER globals (or "null")
+fetch_geo_info() {
+  GEO_LOCATION="null"
+  GEO_DATACENTER="null"
+  local ip="${1:-}"
+  [[ -z "$ip" || "$ip" == "unknown" ]] && return
+
+  local raw city country isp org status
+  raw=$(curl -fsSL --connect-timeout 3 --max-time 5 \
+    "http://ip-api.com/json/${ip}?fields=status,city,country,isp,org" 2>/dev/null || echo "")
+  [[ -z "$raw" ]] && return
+
+  status=$(echo "$raw" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+  [[ "$status" != "success" ]] && return
+
+  city=$(echo "$raw"    | grep -o '"city":"[^"]*"'    | head -1 | cut -d'"' -f4)
+  country=$(echo "$raw" | grep -o '"country":"[^"]*"' | head -1 | cut -d'"' -f4)
+  isp=$(echo "$raw"     | grep -o '"isp":"[^"]*"'     | head -1 | cut -d'"' -f4)
+  org=$(echo "$raw"     | grep -o '"org":"[^"]*"'     | head -1 | cut -d'"' -f4)
+
+  [[ -n "$city" || -n "$country" ]] && GEO_LOCATION="${city:-?}, ${country:-?}"
+  [[ -n "$org" ]] && GEO_DATACENTER="$org"
+  [[ "$GEO_DATACENTER" == "null" && -n "$isp" ]] && GEO_DATACENTER="$isp"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Banner
+# ══════════════════════════════════════════════════════════════════════════════
+show_banner() {
+  clear
+  echo -e "${BOLD}${C}"
+  echo "▗▄▄▖  ▗▄▖  ▗▄▄▖▗▖ ▗▖▗▖ ▗▖ ▗▄▖ ▗▖ ▗▖▗▖"
+  echo "▐▌ ▐▌▐▌ ▐▌▐▌   ▐▌▗▞▘▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▐▌"
+  echo "▐▛▀▚▖▐▛▀▜▌▐▌   ▐▛▚▖ ▐▛▀▜▌▐▛▀▜▌▐▌ ▐▌▐▌"
+  echo "▐▙▄▞▘▐▌ ▐▌▝▚▄▄▖▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▝▚▄▞▘▐▙▄▄▖"
+  echo -e "${NC}"
+  echo -e "  ${DIM}${TAGLINE}${NC}"
+  blank
+
+  local core_ver ip geo_loc geo_dc core_state
+  core_ver=$(core_version)
+  ip=$(detect_ip)
+  fetch_geo_info "$ip"
+  geo_loc="${GEO_LOCATION:-null}"
+  geo_dc="${GEO_DATACENTER:-null}"
+
+  if core_is_installed; then
+    core_state="${G}Installed${NC}  ${DIM}(${core_ver})${NC}"
+  else
+    core_state="${R}Not installed${NC}"
+  fi
+
+  echo -e "  ${DIM}Script Version:${NC}   v${SCRIPT_VERSION}"
+  echo -e "  ${DIM}Core Version:${NC}     ${core_ver}"
+  echo -e "  ${DIM}Telegram Channel:${NC} ${TELEGRAM_CHANNEL}"
+  sep
+  echo -e "  ${DIM}IP Address:${NC}       ${W}${ip}${NC}"
+  if [[ "$geo_loc" != "null" ]]; then
+    echo -e "  ${DIM}Location:${NC}         ${geo_loc}"
+  fi
+  if [[ "$geo_dc" != "null" ]]; then
+    echo -e "  ${DIM}Datacenter:${NC}       ${geo_dc}"
+  fi
+  echo -e "  ${DIM}Virtlink Core:${NC}    ${core_state}"
+  sep
+
+  if (( UPDATE_AVAILABLE )); then
+    echo -e "  ${Y}${BOLD}⬆  Core update available → ${LATEST_TAG}${NC}  ${DIM}(menu option 4)${NC}"
+    blank
+  fi
+}
+
+# Legacy alias used by a few internal screens
+header() { show_banner; }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Download & install
+# ══════════════════════════════════════════════════════════════════════════════
 safe_download() {
   local url="$1" dest="$2"
   local tmp
@@ -98,7 +226,6 @@ safe_download() {
   mv "$tmp" "$dest"
 }
 
-# ── auto-install ──────────────────────────────────────────────────────────────
 _is_piped_install() {
   [[ "$0" == /dev/fd/* ]] || [[ "$0" == /proc/self/fd/* ]] || \
   [[ ! -f "$VIRLINK_BIN" ]]
@@ -108,34 +235,35 @@ do_install() {
   echo -e "\n${BOLD}${B}  virlink installer${NC}\n"
   [[ $EUID -eq 0 ]] || die "Installer requires root.  Re-run: sudo bash <(curl ...)"
 
-  echo -e "  ${C}→${NC} Creating ${INSTALL_DIR}..."
+  info "Creating ${INSTALL_DIR}..."
   mkdir -p "${INSTALL_DIR}/configs" || die "Cannot create ${INSTALL_DIR}"
 
-  echo -e "  ${C}→${NC} Downloading virlink binary..."
+  info "Downloading virlink binary..."
   safe_download \
     "https://github.com/${GITHUB_REPO}/releases/latest/download/virlink" \
     "${INSTALL_DIR}/virlink"
   chmod +x "${INSTALL_DIR}/virlink"
 
-  echo -e "  ${C}→${NC} Downloading setup script..."
+  info "Downloading setup script..."
   safe_download \
     "https://github.com/${GITHUB_REPO}/releases/latest/download/setup.sh" \
     "${INSTALL_DIR}/setup.sh"
   chmod +x "${INSTALL_DIR}/setup.sh"
 
-  # symlinks in PATH
   ln -sf "${INSTALL_DIR}/virlink"  /usr/local/bin/virlink      2>/dev/null || true
   ln -sf "${INSTALL_DIR}/setup.sh" /usr/local/bin/virlink-setup 2>/dev/null || true
 
   local ver
   ver=$("${INSTALL_DIR}/virlink" --version 2>/dev/null || echo "?")
-  echo -e "  ${G}✓${NC} ${BOLD}${ver}${NC} installed to ${INSTALL_DIR}"
-  echo -e "  ${G}✓${NC} Commands: ${W}virlink-setup${NC}  ${W}virlink${NC}"
+  ok "${BOLD}${ver}${NC} installed to ${INSTALL_DIR}"
+  ok "Commands: ${W}virlink-setup${NC}  ${W}virlink${NC}"
   echo
   exec "${INSTALL_DIR}/setup.sh"
 }
 
-# ── version / update ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Core update / remove
+# ══════════════════════════════════════════════════════════════════════════════
 check_update() {
   local current latest raw
   set +e
@@ -143,7 +271,6 @@ check_update() {
     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
   [[ -n "$current" && "$current" != v* ]] && current="v${current}"
 
-  # Use grep+sed only — no python3 dependency
   raw=$(curl -fsSL --connect-timeout 5 --max-time 8 \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null)
@@ -160,11 +287,11 @@ check_update() {
   fi
 }
 
-do_self_update() {
+do_update_core() {
   require_root
   [[ -z "$LATEST_TAG" ]] && { info "Checking latest release..."; check_update; }
   if (( ! UPDATE_AVAILABLE )); then
-    ok "Already up to date."
+    ok "Core is already up to date."
     blank; press_enter; return
   fi
   info "Downloading virlink ${LATEST_TAG}..."
@@ -172,55 +299,87 @@ do_self_update() {
     "${VIRLINK_BIN}.new"
   chmod +x "${VIRLINK_BIN}.new"
   mv "${VIRLINK_BIN}.new" "$VIRLINK_BIN"
+  ok "Core updated to ${LATEST_TAG}."
+  blank; press_enter
+}
 
-  info "Updating setup script..."
+do_update_script() {
+  require_root
+  info "Downloading latest setup script..."
   safe_download "https://github.com/${GITHUB_REPO}/releases/latest/download/setup.sh" \
     "${INSTALL_DIR}/setup.sh.new"
   chmod +x "${INSTALL_DIR}/setup.sh.new"
   mv "${INSTALL_DIR}/setup.sh.new" "${INSTALL_DIR}/setup.sh"
-
-  ok "Updated to ${LATEST_TAG} — restarting..."
+  ok "Setup script updated — restarting..."
   blank
   exec "${INSTALL_DIR}/setup.sh"
 }
 
-# ── header ────────────────────────────────────────────────────────────────────
-header() {
-  clear
-  echo -e "${BOLD}${B}"
-  echo "  ██╗   ██╗██╗██████╗ ██╗     ██╗███╗   ██╗██╗  ██╗"
-  echo "  ██║   ██║██║██╔══██╗██║     ██║████╗  ██║██║ ██╔╝"
-  echo "  ██║   ██║██║██████╔╝██║     ██║██╔██╗ ██║█████╔╝ "
-  echo "  ╚██╗ ██╔╝██║██╔══██╗██║     ██║██║╚██╗██║██╔═██╗ "
-  echo "   ╚████╔╝ ██║██║  ██║███████╗██║██║ ╚████║██║  ██╗"
-  echo "    ╚═══╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝"
-  echo -e "${NC}"
-  local cur_ver
-  cur_ver=$("$VIRLINK_BIN" --version 2>/dev/null | grep -oE 'v[0-9.]+' || echo "?")
-  if (( UPDATE_AVAILABLE )); then
-    echo -e "  ${DIM}${cur_ver}${NC}   ${Y}${BOLD}⬆  ${LATEST_TAG} available${NC}  ${DIM}(option 6)${NC}"
-  else
-    echo -e "  ${DIM}${cur_ver}  ✓ up to date${NC}"
+do_update_all() {
+  require_root
+  [[ -z "$LATEST_TAG" ]] && { info "Checking latest release..."; check_update; }
+  if (( ! UPDATE_AVAILABLE )); then
+    ok "Already up to date."
+    exit 0
   fi
-  blank
+  info "Downloading virlink ${LATEST_TAG}..."
+  safe_download "https://github.com/${GITHUB_REPO}/releases/latest/download/virlink" \
+    "${VIRLINK_BIN}.new"
+  chmod +x "${VIRLINK_BIN}.new"
+  mv "${VIRLINK_BIN}.new" "$VIRLINK_BIN"
+  ok "Core updated to ${LATEST_TAG}."
+  do_update_script
 }
 
-# ── prerequisites ─────────────────────────────────────────────────────────────
+do_remove_core() {
+  require_root
+  blank
+  warn "This removes the virlink binary, all tunnel services, configs, and logs."
+  if ! confirm "Remove Virtlink Core completely"; then
+    return
+  fi
+
+  local unit name
+  for unit in /etc/systemd/system/virlink-*.service; do
+    [[ -f "$unit" ]] || continue
+    name=$(basename "$unit" .service)
+    info "Stopping ${name}..."
+    systemctl stop    "$name" 2>/dev/null || true
+    systemctl disable "$name" 2>/dev/null || true
+    rm -f "$unit"
+  done
+  systemctl daemon-reload 2>/dev/null || true
+
+  info "Removing install directory ${INSTALL_DIR}..."
+  rm -rf "$INSTALL_DIR"
+  info "Removing logs ${LOGS_DIR}..."
+  rm -rf "$LOGS_DIR"
+  rm -f /usr/local/bin/virlink /usr/local/bin/virlink-setup 2>/dev/null || true
+
+  ok "Virtlink Core removed."
+  blank
+  press_enter
+  exit 0
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Prerequisites
+# ══════════════════════════════════════════════════════════════════════════════
 require_root() { [[ $EUID -eq 0 ]] || die "Requires root — run: sudo virlink-setup"; }
 require_bin()  { [[ -x "$VIRLINK_BIN" ]] || die "Binary not found: $VIRLINK_BIN"; }
 ensure_dirs()  { mkdir -p "$CONFIGS_DIR" "$LOGS_DIR"; }
 
-# ── systemd service helpers ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Systemd service helpers
+# ══════════════════════════════════════════════════════════════════════════════
 svc_name()       { echo "virlink-${1}"; }
 svc_unit()       { echo "/etc/systemd/system/virlink-${1}.service"; }
 svc_log()        { echo "${LOGS_DIR}/${1}.log"; }
 
-# tunnel_is_running: checks systemd active state (fallback: log last 5s activity)
 tunnel_is_running() {
   systemctl is-active "$(svc_name "$1")" &>/dev/null
 }
 
-# write_service_file: creates /etc/systemd/system/virlink-<name>.service
 write_service_file() {
   local name="$1"
   local cfg="${CONFIGS_DIR}/${name}.toml"
@@ -247,7 +406,6 @@ EOF
   systemctl daemon-reload
 }
 
-# tunnel_start: creates service, enables + starts it
 tunnel_start() {
   local name="$1"
   local cfg="${CONFIGS_DIR}/${name}.toml"
@@ -269,7 +427,6 @@ tunnel_start() {
   fi
 }
 
-# tunnel_remove: full purge — service, journal, log file, config
 tunnel_remove() {
   local name="$1"
   local svc; svc="$(svc_name "$name")"
@@ -286,14 +443,9 @@ tunnel_remove() {
   systemctl daemon-reload 2>/dev/null || true
   systemctl reset-failed  "$svc" 2>/dev/null || true
 
-  # purge journal entries for this unit
   info "Purging journal for ${svc}..."
   if journalctl --unit="$svc" --disk-usage &>/dev/null; then
-    # rotate + flush so the latest journal file is writable, then vacuum
     journalctl --rotate 2>/dev/null || true
-    # remove journal entries older than 1s (effectively all) for the unit.
-    # journalctl doesn't support per-unit vacuum, so we use --vacuum-time
-    # on the flush file that was just rotated — this only removes sealed files.
     journalctl --vacuum-time=1s 2>/dev/null || true
   fi
 
@@ -307,7 +459,6 @@ tunnel_remove() {
   blank
 }
 
-# tunnel_stop: stops + disables service
 tunnel_stop() {
   local name="$1"
   local svc; svc="$(svc_name "$name")"
@@ -321,14 +472,12 @@ tunnel_stop() {
   ok "Tunnel '${name}' stopped and disabled."
 }
 
-# tunnel_status: shows systemctl status + colorized binary log tail
 tunnel_status() {
   local name="$1"
   local cfg="${CONFIGS_DIR}/${name}.toml"
   local svc; svc="$(svc_name "$name")"
   local log; log="$(svc_log "$name")"
 
-  # colorize INF/WRN/ERR/heartbeat lines
   _clog() {
     sed -E \
       -e "s/  INF  /  $(printf '\033[90m')·$(printf '\033[0m')  /g" \
@@ -345,9 +494,8 @@ tunnel_status() {
 
   blank
   echo -e "  ${BOLD}${C}⬡  ${name}${NC}"
-  sep
+  sep_thin
 
-  # ── service state ──────────────────────────────────────────────
   local running=0
   if tunnel_is_running "$name"; then
     running=1
@@ -356,7 +504,6 @@ tunnel_status() {
     echo -e "  ${R}● STOPPED${NC}  ${DIM}(${svc})${NC}"
   fi
 
-  # ── config summary ─────────────────────────────────────────────
   if [[ -f "$cfg" ]]; then
     local type mode local_ip remote_ip cidr
     type=$(grep -E '^\s*type\s*='      "$cfg" 2>/dev/null | head -1 | awk -F'"' '{print $2}')
@@ -371,13 +518,11 @@ tunnel_status() {
     echo -e "  ${DIM}config${NC}   ${DIM}${cfg}${NC}"
   fi
 
-  # ── systemd stats ──────────────────────────────────────────────
   blank
   echo -e "  ${DIM}── systemd ──────────────────────────────────────${NC}"
   systemctl status "$svc" --no-pager -l --lines=0 2>/dev/null | \
     grep -E '(Loaded|Active|Main PID|Tasks|Memory|CPU)' | sed 's/^/  /' || true
 
-  # ── binary log tail (colorized) ────────────────────────────────
   blank
   echo -e "  ${DIM}── binary log (last 30 lines) ───────────────────${NC}"
   if [[ -f "$log" ]] && [[ -s "$log" ]]; then
@@ -394,9 +539,9 @@ tunnel_status() {
   blank
 }
 
-# ── numbered tunnel picker ────────────────────────────────────────────────────
-# pick_tunnel — shows numbered list, sets PICKED_TUNNEL global.
-# Returns 1 if no tunnels exist.
+# ══════════════════════════════════════════════════════════════════════════════
+# Tunnel listing & selection
+# ══════════════════════════════════════════════════════════════════════════════
 pick_tunnel() {
   PICKED_TUNNEL=""
   local cfgs=()
@@ -407,7 +552,7 @@ pick_tunnel() {
   fi
   tty_line
   tty_line "  ${BOLD}Tunnels:${NC}"
-  tty_line "${DIM}────────────────────────────────────────────────${NC}"
+  sep_thin
   local i cfg _tname _type _icon
   for i in "${!cfgs[@]}"; do
     cfg="${cfgs[$i]}"
@@ -433,7 +578,6 @@ pick_tunnel() {
   done
 }
 
-# list_tunnels: display only (no selection)
 list_tunnels() {
   local cfgs=()
   mapfile -t cfgs < <(find "$CONFIGS_DIR" -maxdepth 1 -name "*.toml" 2>/dev/null | sort)
@@ -443,7 +587,7 @@ list_tunnels() {
   fi
   blank
   printf "  ${BOLD}%-4s %-26s %-18s %-10s %s${NC}\n" "#" "NAME" "TYPE" "STATUS" "REMOTE"
-  sep
+  sep_thin
   local i cfg name type remote status
   for i in "${!cfgs[@]}"; do
     cfg="${cfgs[$i]}"
@@ -461,14 +605,82 @@ list_tunnels() {
   blank
 }
 
-# ── config helpers ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Tunnel type definitions & dispatch
+# ══════════════════════════════════════════════════════════════════════════════
+_kernel_tunnel_labels() {
+  cat << 'EOF'
+gre-fou        — GRE in UDP (FOU)                  fast, no encryption
+ipip-fou       — IPIP in UDP (FOU)                 minimal overhead
+bonded-gre-fou — Dual GRE-FOU ECMP                 2× bandwidth
+l2tpv3         — L2TPv3 over UDP                   Layer-2 tunnel
+gre-wg         — GRE inside WireGuard              encrypted
+gre-fou-ipsec  — GRE-FOU + IPsec ESP               encrypted + FOU
+gre            — Kernel GRE (proto 47)             no UDP wrapper
+EOF
+}
+
+_userspace_tunnel_labels() {
+  cat << 'EOF'
+icmp           — ICMP Echo tunnel (proto 1)        DPI bypass
+udp            — User-space UDP tunnel             plain UDP
+bip            — BIP tunnel (proto 58)             DPI bypass
+tcp            — User-space TCP tunnel             auto-reconnect
+udp-obfs       — Obfuscated UDP (AES-256-GCM)      DPI bypass (Iran)
+EOF
+}
+
+pick_tunnel_type() {
+  local category="$1"
+  local labels=() ttype key
+
+  if [[ "$category" == "kernel" ]]; then
+    mapfile -t labels < <(_kernel_tunnel_labels)
+    pick ttype "Kernel tunnel type" "${labels[@]}"
+  else
+    mapfile -t labels < <(_userspace_tunnel_labels)
+    pick ttype "Userspace tunnel type" "${labels[@]}"
+  fi
+
+  key="${ttype%%[[:space:]]*}"
+  printf '%s\n' "$key"
+}
+
+dispatch_tunnel_generator() {
+  local key="$1"
+  LAST_CFG_PATH=""
+  case "$key" in
+    gre-fou)        gen_gre_fou  ;;
+    ipip-fou)       gen_ipip_fou ;;
+    bonded-gre-fou) gen_bonded   ;;
+    l2tpv3)         gen_l2tpv3   ;;
+    gre-wg)         gen_gre_wg   ;;
+    udp-obfs)       gen_udp_obfs ;;
+    gre-fou-ipsec)  gen_ipsec    ;;
+    gre)            gen_gre      ;;
+    tcp)            gen_tcp      ;;
+    udp)            gen_udp      ;;
+    icmp)           gen_icmp     ;;
+    bip)            gen_bip      ;;
+    *) die "Unknown type: $key" ;;
+  esac
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Config helpers
+# ══════════════════════════════════════════════════════════════════════════════
 collect_base_inputs() {
   local _n _m _l _r _c
   blank
   prompt _n "Tunnel name (e.g. kharej-gre)" ""
   [[ -z "$_n" ]] && die "Name cannot be empty."
   _n="${_n// /-}"
-  pick _m "Mode" "client" "server"
+  if [[ -n "${PRESELECTED_MODE:-}" ]]; then
+    _m="$PRESELECTED_MODE"
+    info "Mode: ${_m}"
+  else
+    pick _m "Mode" "client" "server"
+  fi
   blank
   prompt _l "This server's public IP"    ""
   prompt _r "Peer server's public IP"    ""
@@ -610,7 +822,9 @@ EOF
   fi
 }
 
-# ── config generators ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Config generators
+# ══════════════════════════════════════════════════════════════════════════════
 gen_gre_fou() {
   local name mode local_ip remote_ip cidr port mtu cfg
   collect_base_inputs name mode local_ip remote_ip cidr
@@ -764,7 +978,7 @@ gen_udp_obfs() {
   prompt mtu  "MTU"                        "1400"
   blank
   tty_line "  ${W}Obfuscation settings${NC}"
-  sep
+  sep_thin
   prompt key "Shared secret key (same on both sides)" ""
   [[ -z "$key" ]] && die "Key cannot be empty."
   pick mask_val "Mask mode" \
@@ -966,53 +1180,38 @@ EOF
   LAST_CFG_PATH="$cfg"
 }
 
-# ── screens ───────────────────────────────────────────────────────────────────
-screen_create() {
-  header
-  echo -e "  ${BOLD}Create New Tunnel${NC}"
-  sep
-  local ttype
-  pick ttype "Tunnel type" \
-    "gre-fou        — GRE in UDP (FOU)                  fast, no encryption" \
-    "ipip-fou       — IPIP in UDP (FOU)                 minimal overhead" \
-    "bonded-gre-fou — Dual GRE-FOU ECMP                 2× bandwidth" \
-    "l2tpv3         — L2TPv3 over UDP                   Layer-2 tunnel" \
-    "gre-wg         — GRE inside WireGuard              encrypted" \
-    "udp-obfs       — Obfuscated UDP (AES-256-GCM)      DPI bypass (Iran)" \
-    "gre-fou-ipsec  — GRE-FOU + IPsec ESP               encrypted + FOU" \
-    "gre            — Kernel GRE (proto 47)             no UDP wrapper" \
-    "tcp            — User-space TCP tunnel             auto-reconnect" \
-    "udp            — User-space UDP tunnel             plain UDP" \
-    "icmp           — ICMP Echo tunnel (proto 1)        DPI bypass" \
-    "bip            — BIP tunnel (proto 58)             DPI bypass"
-  local key="${ttype%%[[:space:]]*}"
+# ══════════════════════════════════════════════════════════════════════════════
+# Menu handlers
+# ══════════════════════════════════════════════════════════════════════════════
+menu_create_tunnel() {
+  show_banner
+  echo -e "  ${BOLD}Configure a New Tunnel${NC}"
+  sep_thin
 
-  LAST_CFG_PATH=""
-  case "$key" in
-    gre-fou)        gen_gre_fou  ;;
-    ipip-fou)       gen_ipip_fou ;;
-    bonded-gre-fou) gen_bonded   ;;
-    l2tpv3)         gen_l2tpv3   ;;
-    gre-wg)         gen_gre_wg   ;;
-    udp-obfs)       gen_udp_obfs ;;
-    gre-fou-ipsec)  gen_ipsec    ;;
-    gre)            gen_gre      ;;
-    tcp)            gen_tcp      ;;
-    udp)            gen_udp      ;;
-    icmp)           gen_icmp     ;;
-    bip)            gen_bip      ;;
-    *) die "Unknown type: $key" ;;
-  esac
+  local mode_raw category_raw tunnel_key
+  pick mode_raw "Select mode" \
+    "client — initiator / outbound side" \
+    "server — listener / inbound side"
+  PRESELECTED_MODE="${mode_raw%%[[:space:]]*}"
+
+  blank
+  pick category_raw "Select tunnel category" \
+    "kernel     — Kernel datapath (GRE, FOU, WireGuard, IPsec...)" \
+    "userspace  — Userspace transport (ICMP, UDP, TCP, BIP, obfs)"
+  local category="${category_raw%%[[:space:]]*}"
+
+  tunnel_key=$(pick_tunnel_type "$category")
+  dispatch_tunnel_generator "$tunnel_key"
+  PRESELECTED_MODE=""
 
   blank
   ok "Config saved: ${LAST_CFG_PATH}"
   blank
   echo -e "  ${DIM}Config preview:${NC}"
-  sep
+  sep_thin
   grep -v '^#' "${LAST_CFG_PATH}" | grep -v '^$' | head -28 | sed 's/^/    /'
   blank
 
-  # Auto-install as service and start
   require_root
   ensure_dirs
   local name; name=$(basename "${LAST_CFG_PATH}" .toml)
@@ -1023,10 +1222,10 @@ screen_create() {
   press_enter
 }
 
-screen_manage() {
-  header
-  echo -e "  ${BOLD}Manage Tunnels${NC}"
-  sep
+menu_tunnel_management() {
+  show_banner
+  echo -e "  ${BOLD}Tunnel Management${NC}"
+  sep_thin
   ensure_dirs
   if ! pick_tunnel; then
     press_enter
@@ -1035,8 +1234,6 @@ screen_manage() {
   local name="$PICKED_TUNNEL"
 
   blank
-  # Show brief status
-  local svc; svc="$(svc_name "$name")"
   if tunnel_is_running "$name"; then
     echo -e "  ${G}●${NC} ${BOLD}${name}${NC} is ${G}RUNNING${NC}"
   else
@@ -1046,60 +1243,139 @@ screen_manage() {
 
   local action
   pick action "Action" \
-    "start    — install service + start" \
-    "stop     — stop + disable service" \
-    "restart  — restart service" \
-    "status   — show status, logs, and systemctl" \
-    "edit     — open config in editor" \
-    "remove   — delete tunnel + service"
+    "start     — install service + start" \
+    "stop      — stop + disable service" \
+    "restart   — restart service" \
+    "status    — show status, logs, and systemctl" \
+    "edit      — open config in editor" \
+    "logs      — tail / follow / search logs" \
+    "forward   — add port forwarding rule" \
+    "keygen    — generate WireGuard keypair" \
+    "remove    — delete tunnel + service"
   action="${action%%[[:space:]]*}"
 
-  require_root
   case "$action" in
-    start)
-      tunnel_start "$name"
+    start|stop|restart|status|edit|remove)
+      require_root
+      case "$action" in
+        start)
+          tunnel_start "$name"
+          ;;
+        stop)
+          tunnel_stop "$name"
+          ;;
+        restart)
+          systemctl restart "$(svc_name "$name")" 2>/dev/null || {
+            tunnel_stop "$name"
+            tunnel_start "$name"
+          }
+          ok "Restarted."
+          ;;
+        status)
+          tunnel_status "$name"
+          ;;
+        edit)
+          local editor="${EDITOR:-nano}"
+          "$editor" "${CONFIGS_DIR}/${name}.toml"
+          if confirm "Restart tunnel to apply changes"; then
+            systemctl restart "$(svc_name "$name")" 2>/dev/null || true
+            ok "Restarted."
+          fi
+          ;;
+        remove)
+          if confirm "Completely remove tunnel '${name}' (service + logs + config)"; then
+            tunnel_remove "$name"
+          fi
+          ;;
+      esac
       ;;
-    stop)
-      tunnel_stop "$name"
+    logs)
+      _manage_logs "$name"
       ;;
-    restart)
-      systemctl restart "$(svc_name "$name")" 2>/dev/null || {
-        tunnel_stop "$name"
-        tunnel_start "$name"
-      }
-      ok "Restarted."
+    forward)
+      _manage_forward "$name"
       ;;
-    status)
-      tunnel_status "$name"
-      ;;
-    edit)
-      local editor="${EDITOR:-nano}"
-      "$editor" "${CONFIGS_DIR}/${name}.toml"
-      if confirm "Restart tunnel to apply changes"; then
-        systemctl restart "$(svc_name "$name")" 2>/dev/null || true
-        ok "Restarted."
-      fi
-      ;;
-    remove)
-      if confirm "Completely remove tunnel '${name}' (service + logs + config)"; then
-        tunnel_remove "$name"
-      fi
+    keygen)
+      _manage_keygen
       ;;
   esac
   blank
   press_enter
 }
 
-screen_setup_forward() {
-  header
-  echo -e "  ${BOLD}Add Port Forwarding Rule${NC}"
-  sep
+menu_check_status() {
+  show_banner
+  echo -e "  ${BOLD}Check Tunnel Status${NC}"
+  sep_thin
   ensure_dirs
-  if ! pick_tunnel; then
+
+  if ! list_tunnels; then
     press_enter
     return
   fi
-  local name="$PICKED_TUNNEL"
+
+  if confirm "Show detailed status for a tunnel"; then
+    if pick_tunnel; then
+      tunnel_status "$PICKED_TUNNEL"
+    fi
+  fi
+  blank
+  press_enter
+}
+
+menu_update_core() {
+  show_banner
+  echo -e "  ${BOLD}Update Virtlink Core${NC}"
+  sep_thin
+  info "Checking GitHub for latest release..."
+  check_update
+  local cur_ver
+  cur_ver=$(core_version)
+  blank
+  echo -e "  Installed : ${W}${cur_ver}${NC}"
+  if [[ -z "$LATEST_TAG" ]]; then
+    echo -e "  Latest    : ${R}could not reach GitHub${NC}"
+    echo -e "  ${DIM}Check: curl -s https://api.github.com/repos/${GITHUB_REPO}/releases/latest | grep tag_name${NC}"
+    blank
+    press_enter
+    return
+  fi
+  echo -e "  Latest    : ${W}${LATEST_TAG}${NC}"
+  blank
+  if (( UPDATE_AVAILABLE )); then
+    if confirm "Update core to ${LATEST_TAG}"; then
+      do_update_core
+      return
+    fi
+  else
+    ok "Core is already up to date."
+  fi
+  blank
+  press_enter
+}
+
+menu_update_script() {
+  show_banner
+  echo -e "  ${BOLD}Update Setup Script${NC}"
+  sep_thin
+  if confirm "Download latest setup.sh from GitHub releases"; then
+    do_update_script
+  else
+    blank
+    press_enter
+  fi
+}
+
+menu_remove_core() {
+  show_banner
+  echo -e "  ${BOLD}Remove Virtlink Core${NC}"
+  sep_thin
+  do_remove_core
+}
+
+# Sub-handlers (formerly top-level menu items)
+_manage_forward() {
+  local name="$1"
   local cfg="${CONFIGS_DIR}/${name}.toml"
   blank
   echo -e "  ${W}Format:${NC}  listenPort:targetPort  or  port:port/tcp"
@@ -1120,23 +1396,14 @@ EOF
     ok "Forward section added: $rule"
   fi
   if tunnel_is_running "$name" && confirm "Restart tunnel to apply"; then
+    require_root
     systemctl restart "$(svc_name "$name")" 2>/dev/null || true
     ok "Restarted."
   fi
-  blank
-  press_enter
 }
 
-screen_logs() {
-  header
-  echo -e "  ${BOLD}Tunnel Logs${NC}"
-  sep
-  ensure_dirs
-  if ! pick_tunnel; then
-    press_enter
-    return
-  fi
-  local name="$PICKED_TUNNEL"
+_manage_logs() {
+  local name="$1"
   local log; log="$(svc_log "$name")"
   local svc; svc="$(svc_name "$name")"
 
@@ -1150,11 +1417,10 @@ screen_logs() {
     "tail-50   — last 50 lines" \
     "follow    — live tail (Ctrl+C to stop)" \
     "search    — grep keyword"
-  read -r mode _ <<< "$mode"   # extract first word only
+  read -r mode _ <<< "$mode"
 
   blank
 
-  # colorizer: INF=dim, WRN=yellow, ERR=red bold, ♥=green, states
   _colorize() {
     sed -E \
       -e "s/ INF / $(printf '\033[90m')INF$(printf '\033[0m') /g" \
@@ -1174,7 +1440,7 @@ screen_logs() {
       if [[ -f "$log" && -s "$log" ]]; then
         echo -e "${DIM}──── last 50 lines ─────────────────────────────${NC}"
         tail -50 "$log" | _colorize
-        sep
+        sep_thin
       else
         warn "Log file empty or not found: $log"
         if systemctl is-active "$svc" &>/dev/null; then
@@ -1186,7 +1452,7 @@ screen_logs() {
       ;;
     follow)
       echo -e "  ${Y}⚠${NC}  Press ${BOLD}Ctrl+C${NC} to stop following"
-      sep
+      sep_thin
       if [[ -f "$log" ]]; then
         tail -f "$log" | _colorize
       else
@@ -1204,63 +1470,27 @@ screen_logs() {
       else
         journalctl -u "$svc" --no-pager 2>/dev/null | grep -i "$kw" | _colorize | tail -100
       fi
-      sep
+      sep_thin
       ;;
   esac
-
-  blank
-  press_enter
 }
 
-screen_keygen() {
-  header
+_manage_keygen() {
+  blank
   echo -e "  ${BOLD}Generate WireGuard Keypair${NC}"
-  sep
+  sep_thin
   require_bin
   blank
   "$VIRLINK_BIN" keygen
-  blank
-  press_enter
 }
 
-screen_update() {
-  header
-  echo -e "  ${BOLD}Update virlink${NC}"
-  sep
-  info "Checking GitHub for latest release..."
-  check_update
-  local cur_ver
-  cur_ver=$("$VIRLINK_BIN" --version 2>/dev/null \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "?")
-  [[ "$cur_ver" != "?" && "$cur_ver" != v* ]] && cur_ver="v${cur_ver}"
-  blank
-  echo -e "  Installed : ${W}${cur_ver}${NC}"
-  if [[ -z "$LATEST_TAG" ]]; then
-    echo -e "  Latest    : ${R}could not reach GitHub${NC}"
-    echo -e "  ${DIM}Check: curl -s https://api.github.com/repos/${GITHUB_REPO}/releases/latest | grep tag_name${NC}"
-    blank
-    press_enter
-    return
-  fi
-  echo -e "  Latest    : ${W}${LATEST_TAG}${NC}"
-  blank
-  if (( UPDATE_AVAILABLE )); then
-    if confirm "Update to ${LATEST_TAG}"; then
-      do_self_update
-    fi
-  else
-    ok "Already up to date."
-  fi
-  blank
-  press_enter
-}
-
-# ── main menu ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Main loop
+# ══════════════════════════════════════════════════════════════════════════════
 main() {
   require_bin
   mkdir -p "$CONFIGS_DIR"
 
-  # background version check
   check_update &
   local _bg=$!
 
@@ -1270,43 +1500,39 @@ main() {
       _bg=""
     fi
 
-    header
+    show_banner
     echo -e "  ${BOLD}Main Menu${NC}"
-    sep
-    echo -e "    ${C}1${NC}  Create new tunnel"
-    echo -e "    ${C}2${NC}  Manage tunnels  (start / stop / status / restart)"
-    echo -e "    ${C}3${NC}  View tunnel logs  (tail / follow / search)"
-    echo -e "    ${C}4${NC}  Add port forward rule"
-    echo -e "    ${C}5${NC}  List all tunnels"
-    echo -e "    ${C}6${NC}  Generate WireGuard keypair"
+    sep_thin
+    echo -e "    ${C} 1${NC}  Configure a new tunnel"
+    echo -e "    ${C} 2${NC}  Tunnel management"
+    echo -e "    ${C} 3${NC}  Check tunnel status"
     if (( UPDATE_AVAILABLE )); then
-      echo -e "    ${Y}7${NC}  ${Y}Update available${NC} → ${LATEST_TAG}"
+      echo -e "    ${Y} 4${NC}  ${Y}Update Virtlink Core${NC}  → ${LATEST_TAG}"
     else
-      echo -e "    ${C}7${NC}  Check for updates"
+      echo -e "    ${C} 4${NC}  Update Virtlink Core"
     fi
-    echo -e "    ${C}8${NC}  Exit"
+    echo -e "    ${C} 5${NC}  Update script"
+    echo -e "    ${C} 6${NC}  Remove Virtlink Core"
+    echo -e "    ${C} 0${NC}  Exit"
     blank
-    tty_out "  ${W}?${NC} Choose [1-8]: "
+    tty_out "  ${W}?${NC} Choose [0-6]: "
     read -r choice < /dev/tty
     case "$choice" in
-      1) screen_create ;;
-      2) screen_manage ;;
-      3) screen_logs ;;
-      4) screen_setup_forward ;;
-      5)
-        header
-        list_tunnels || true
-        press_enter
-        ;;
-      6) screen_keygen ;;
-      7) screen_update ;;
-      8) blank; ok "Goodbye."; blank; exit 0 ;;
+      1) menu_create_tunnel ;;
+      2) menu_tunnel_management ;;
+      3) menu_check_status ;;
+      4) menu_update_core ;;
+      5) menu_update_script ;;
+      6) menu_remove_core ;;
+      0) blank; ok "Goodbye."; blank; exit 0 ;;
       *) warn "Invalid choice." ;;
     esac
   done
 }
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
 if _is_piped_install; then
   [[ $EUID -eq 0 ]] || die "Run as root: sudo bash <(curl ...)"
   do_install
@@ -1320,7 +1546,7 @@ case "${1:-menu}" in
            { tunnel_stop "${2}"; tunnel_start "${2}"; } ;;
   status)  tunnel_status "${2:?tunnel name required}" ;;
   list)    list_tunnels ;;
-  update)  require_root; check_update; do_self_update ;;
+  update)  require_root; check_update; do_update_all ;;
   menu)    main ;;
   *)       echo "Usage: $0 [menu|start|stop|restart|status|list|update] [name]"; exit 1 ;;
 esac
