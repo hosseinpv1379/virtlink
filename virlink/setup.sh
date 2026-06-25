@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -226,14 +226,42 @@ safe_download() {
   mv "$tmp" "$dest"
 }
 
+_is_piped_curl() {
+  [[ "$0" == /dev/fd/* ]] || [[ "$0" == /proc/self/fd/* ]]
+}
+
 _is_piped_install() {
-  [[ "$0" == /dev/fd/* ]] || [[ "$0" == /proc/self/fd/* ]] || \
-  [[ ! -f "$VIRLINK_BIN" ]]
+  _is_piped_curl || [[ ! -f "$VIRLINK_BIN" ]]
+}
+
+ensure_deps() {
+  local missing=()
+  command -v curl  &>/dev/null || missing+=(curl)
+  command -v chmod &>/dev/null || missing+=(coreutils)
+  if ((${#missing[@]})); then
+    die "Missing required tools: ${missing[*]}.  Install them and retry."
+  fi
+}
+
+install_setup_script() {
+  local dest="${INSTALL_DIR}/setup.sh"
+  if _is_piped_curl; then
+    info "Saving setup script to ${dest}..."
+    cp -f "$0" "$dest"
+  else
+    info "Downloading setup script..."
+    safe_download \
+      "https://github.com/${GITHUB_REPO}/releases/latest/download/setup.sh" \
+      "$dest"
+  fi
+  chmod +x "$dest"
+  ln -sf "$dest" /usr/local/bin/virlink-setup 2>/dev/null || true
 }
 
 do_install() {
   echo -e "\n${BOLD}${B}  virlink installer${NC}\n"
   [[ $EUID -eq 0 ]] || die "Installer requires root.  Re-run: sudo bash <(curl ...)"
+  ensure_deps
 
   info "Creating ${INSTALL_DIR}..."
   mkdir -p "${INSTALL_DIR}/configs" || die "Cannot create ${INSTALL_DIR}"
@@ -243,19 +271,14 @@ do_install() {
     "https://github.com/${GITHUB_REPO}/releases/latest/download/virlink" \
     "${INSTALL_DIR}/virlink"
   chmod +x "${INSTALL_DIR}/virlink"
+  ln -sf "${INSTALL_DIR}/virlink" /usr/local/bin/virlink 2>/dev/null || true
 
-  info "Downloading setup script..."
-  safe_download \
-    "https://github.com/${GITHUB_REPO}/releases/latest/download/setup.sh" \
-    "${INSTALL_DIR}/setup.sh"
-  chmod +x "${INSTALL_DIR}/setup.sh"
-
-  ln -sf "${INSTALL_DIR}/virlink"  /usr/local/bin/virlink      2>/dev/null || true
-  ln -sf "${INSTALL_DIR}/setup.sh" /usr/local/bin/virlink-setup 2>/dev/null || true
+  install_setup_script
 
   local ver
   ver=$("${INSTALL_DIR}/virlink" --version 2>/dev/null || echo "?")
   ok "${BOLD}${ver}${NC} installed to ${INSTALL_DIR}"
+  ok "Setup script saved to ${INSTALL_DIR}/setup.sh"
   ok "Commands: ${W}virlink-setup${NC}  ${W}virlink${NC}"
   echo
   exec "${INSTALL_DIR}/setup.sh"
@@ -305,11 +328,14 @@ do_update_core() {
 
 do_update_script() {
   require_root
+  ensure_deps
+  mkdir -p "$INSTALL_DIR"
   info "Downloading latest setup script..."
   safe_download "https://github.com/${GITHUB_REPO}/releases/latest/download/setup.sh" \
     "${INSTALL_DIR}/setup.sh.new"
   chmod +x "${INSTALL_DIR}/setup.sh.new"
   mv "${INSTALL_DIR}/setup.sh.new" "${INSTALL_DIR}/setup.sh"
+  ln -sf "${INSTALL_DIR}/setup.sh" /usr/local/bin/virlink-setup 2>/dev/null || true
   ok "Setup script updated — restarting..."
   blank
   exec "${INSTALL_DIR}/setup.sh"

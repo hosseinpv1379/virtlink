@@ -167,7 +167,7 @@ heartbeat_interval = 10
 - Root / sudo
 - `iptables` (MSS clamping and port forwarding)
 - `linux-modules-extra-$(uname -r)` — needed for L2TPv3 and bonded modes
-- `python3` — used by setup.sh for GitHub API JSON parsing
+- `curl` — required by setup.sh for downloads and install
 
 ---
 
@@ -182,6 +182,30 @@ heartbeat_interval = 10
 | `/var/run/virlink/<name>.pid` | PID files |
 | `/usr/local/bin/virlink` | symlink → binary |
 | `/usr/local/bin/virlink-setup` | symlink → setup.sh |
+
+---
+
+## Releasing
+
+Every GitHub release must include **both** assets so the install one-liner works:
+
+| Asset | URL |
+|-------|-----|
+| `setup.sh` | `https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh` |
+| `virlink` | `https://github.com/hosseinpv1379/virtlink/releases/latest/download/virlink` |
+
+From the `virlink/` directory (after bumping `main.go` version):
+
+```bash
+./release.sh vX.Y.Z "Release notes"
+```
+
+Verify:
+
+```bash
+curl -fsSL -I https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh
+curl -fsSL -I https://github.com/hosseinpv1379/virtlink/releases/latest/download/virlink
+```
 
 ---
 
