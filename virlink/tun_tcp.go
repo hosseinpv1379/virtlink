@@ -77,9 +77,7 @@ func (t *TcpTunnel) Up() error {
 	t.done = make(chan struct{})
 
 	tun0 := t.tun.Fd0()
-	for _, q := range t.tun.fds {
-		go t.txLoop(q)
-	}
+	go t.txPollLoop()
 
 	streams := perfTcpStreams()
 	if c.Mode == "server" {
@@ -94,7 +92,7 @@ func (t *TcpTunnel) Up() error {
 	}
 
 	done(dev, addr, peer,
-		fmt.Sprintf("transport : TCP ×%d streams  queues=%d :%d", streams, t.tun.QueueCount(), port),
+		fmt.Sprintf("transport : TCP ×%d streams  poller×1 :%d", streams, port),
 		"reconnect : automatic (client retries every 3 s)",
 		"test      : ping -c3 "+peer,
 	)
@@ -112,31 +110,25 @@ func (t *TcpTunnel) pickConn() net.Conn {
 	return nil
 }
 
-func (t *TcpTunnel) txLoop(tun *os.File) {
-	buf := getBuf()
-	defer putBuf(buf)
-	for {
-		n, err := tun.Read(buf)
-		if err != nil {
-			if t.stop.stopped() {
-				return
-			}
-			logWarn("tun read: " + err.Error())
-			continue
-		}
+func (t *TcpTunnel) txPollLoop() {
+	poller := newTunPoller(t.tun, &t.stop)
+	defer poller.close()
+
+	poller.Run(nil, func(pkt []byte, n int) bool {
 		statInc(statTCPTxRead)
 		c := t.pickConn()
 		if c == nil {
 			statInc(statTCPTxNoConn)
-			continue
+			return true
 		}
-		if err := tcpWriteFrame(c, buf[:n]); err != nil {
+		if err := tcpWriteFrame(c, pkt[:n]); err != nil {
 			logDebug("tcp tx: " + err.Error())
 			t.clearConn(c)
 		} else {
 			statInc(statTCPTxSend)
 		}
-	}
+		return !t.stop.stopped()
+	})
 }
 
 func (t *TcpTunnel) clearConn(c net.Conn) {

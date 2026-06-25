@@ -219,7 +219,7 @@ func profileHints(rows []statRate, elapsed float64) []string {
 	if rates["tcp.tx_noconn"] > send && send > 0 {
 		hints = append(hints, "tcp.tx_noconn high — TCP streams not connected yet")
 	}
-	if runtime.NumGoroutine() > perfTunQueues()*4+20 {
+	if runtime.NumGoroutine() > perfTunQueues()+perfTcpStreams()+12 {
 		hints = append(hints, fmt.Sprintf("goroutines=%d — more than expected; check duplicate processes", runtime.NumGoroutine()))
 	}
 	_ = elapsed

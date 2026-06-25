@@ -33,8 +33,6 @@ func init() {
 }
 
 func initPerfDefaults() {
-	// tun_queues defaults to CPU count, capped at 4 — more queues
-	// add goroutines and scheduling overhead without throughput gains.
 	ncpu := runtime.NumCPU()
 	if ncpu > defTunQueues {
 		ncpu = defTunQueues
@@ -52,10 +50,70 @@ func initPerfDefaults() {
 	}
 }
 
+func isUserspaceTunnel(typ string) bool {
+	switch typ {
+	case "icmp", "udp", "tcp", "bip", "udp-obfs":
+		return true
+	}
+	return false
+}
+
+// initUserspacePerfDefaults picks per-protocol defaults: low goroutine count,
+// enough buffers/batching for throughput without the 16-queue overhead.
+func initUserspacePerfDefaults(c *Config) {
+	ncpu := runtime.NumCPU()
+	if ncpu > 4 {
+		ncpu = 4
+	}
+	if ncpu < 1 {
+		ncpu = 1
+	}
+
+	perf = perfRuntime{
+		sockBuf:    defSockBufMB << 20,
+		tunQueues:  1,
+		batchSize:  defBatchSize,
+		txQLen:     defTxQLen,
+		pollMs:     defPollMs,
+		tcpStreams: 2,
+	}
+
+	switch c.Tunnel.Type {
+	case "icmp":
+		// 2 queues + sendmmsg batch = best throughput/resource ratio for ICMP
+		perf.sockBuf = 64 << 20
+		perf.tunQueues = clampInt(ncpu, 2, 4)
+		perf.batchSize = 64
+		perf.pollMs = 5
+	case "udp":
+		// single queue + single poller — UDP socket is already parallel enough
+		perf.sockBuf = 32 << 20
+		perf.tunQueues = 1
+		perf.pollMs = 10
+	case "bip":
+		perf.sockBuf = 32 << 20
+		perf.tunQueues = 1
+		perf.pollMs = 10
+	case "tcp":
+		perf.sockBuf = 32 << 20
+		perf.tunQueues = 1
+		perf.tcpStreams = clampInt(ncpu, 2, 4)
+		perf.pollMs = 10
+	case "udp-obfs":
+		perf.sockBuf = 16 << 20
+		perf.tunQueues = 1
+		perf.pollMs = 10
+	}
+}
+
 // applyPerfFromConfig loads [tuning] performance fields (0 = default for that field).
 func applyPerfFromConfig(c *Config) {
 	t := &c.Tuning
-	initPerfDefaults()
+	if isUserspaceTunnel(c.Tunnel.Type) {
+		initUserspacePerfDefaults(c)
+	} else {
+		initPerfDefaults()
+	}
 
 	if t.SockBufMB > 0 {
 		perf.sockBuf = clampInt(t.SockBufMB, 1, 128) << 20

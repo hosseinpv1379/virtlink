@@ -168,9 +168,7 @@ func (t *UdpObfsTunnel) Up() error {
 	// dereference a nil pointer — they simply get an error and check t.done.
 	gcm := t.gcm
 	go t.rxLoop(t.udpConn, t.tun.Fd0(), gcm, mask)
-	for _, q := range t.tun.fds {
-		go t.txLoop(t.udpConn, q, gcm, mask, fixedPeer)
-	}
+	go t.txPollLoop(t.udpConn, gcm, mask, fixedPeer)
 
 	logOK(fmt.Sprintf("encrypt=AES-256-GCM  mask=%s  padding=%v", mask, c.Obfs.Padding))
 
@@ -209,33 +207,28 @@ func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD,
 	}
 }
 
-func (t *UdpObfsTunnel) txLoop(conn *net.UDPConn, qfd *os.File, gcm cipher.AEAD, mask string, fixed *net.UDPAddr) {
-	buf := getBuf()
-	defer putBuf(buf)
-	for {
-		n, err := qfd.Read(buf)
+func (t *UdpObfsTunnel) txPollLoop(conn *net.UDPConn, gcm cipher.AEAD, mask string, fixed *net.UDPAddr) {
+	poller := newTunPoller(t.tun, &t.stop)
+	defer poller.close()
+
+	poller.Run(nil, func(pkt []byte, n int) bool {
+		frame, err := obfsEncrypt(pkt[:n], gcm, mask, t.cfg.Obfs.Padding)
 		if err != nil {
-			if t.stop.stopped() {
-				return
-			}
-			continue
-		}
-		frame, err := obfsEncrypt(buf[:n], gcm, mask, t.cfg.Obfs.Padding)
-		if err != nil {
-			continue
+			return true
 		}
 		dst := fixed
 		if dst == nil {
 			if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
 				dst = p
 			} else {
-				continue
+				return true
 			}
 		}
-		if _, err := conn.WriteToUDP(frame, dst); err != nil {
-			logDebug("udp send: " + err.Error())
+		if _, err := conn.WriteToUDP(frame, dst); err != nil && !t.stop.stopped() {
+			logDebug("obfs tx: " + err.Error())
 		}
-	}
+		return !t.stop.stopped()
+	})
 }
 
 func (t *UdpObfsTunnel) Down() error {

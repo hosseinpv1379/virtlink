@@ -498,6 +498,75 @@ heartbeat_interval = $2
 EOF
 }
 
+write_userspace_tuning() {
+  local file="$1" proto="$2"
+  case "$proto" in
+    icmp)
+      cat >> "$file" << EOF
+
+[tuning]
+enabled      = true
+mode         = "fast"
+sock_buf_mb  = 64
+tun_queues   = 2
+batch_size   = 64
+poll_ms      = 5
+tx_queue_len = 10000
+
+[logging]
+level            = "info"
+profile          = true
+profile_interval = 30
+EOF
+      ;;
+    udp|bip)
+      cat >> "$file" << EOF
+
+[tuning]
+enabled      = true
+mode         = "fast"
+sock_buf_mb  = 32
+tun_queues   = 1
+poll_ms      = 10
+tx_queue_len = 10000
+
+[logging]
+level            = "info"
+profile          = true
+profile_interval = 30
+EOF
+      ;;
+    tcp)
+      cat >> "$file" << EOF
+
+[tuning]
+enabled      = true
+mode         = "fast"
+sock_buf_mb  = 32
+tun_queues   = 1
+tcp_streams  = 2
+poll_ms      = 10
+tx_queue_len = 10000
+
+[logging]
+level            = "info"
+profile          = true
+profile_interval = 30
+EOF
+      ;;
+    *)
+      write_tuning "$file"
+      return
+      ;;
+  esac
+  cat >> "$file" << EOF
+
+[health]
+disabled = false
+port     = 6543
+EOF
+}
+
 write_tuning() {
   local file="$1" multipath="${2:-false}"
   cat >> "$file" << EOF
@@ -824,7 +893,7 @@ cidr      = "${cidr}"
 mtu       = ${mtu}
 EOF
   write_transport "$cfg" "$port" "tcp" "10"
-  write_tuning    "$cfg"
+  write_userspace_tuning "$cfg" "tcp"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 }
@@ -846,7 +915,7 @@ cidr      = "${cidr}"
 mtu       = ${mtu}
 EOF
   write_transport "$cfg" "$port" "udp" "10"
-  write_tuning    "$cfg"
+  write_userspace_tuning "$cfg" "udp"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 }
@@ -869,7 +938,7 @@ cidr      = "${cidr}"
 mtu       = ${mtu}
 EOF
   write_transport_no_port "$cfg" "10"
-  write_tuning "$cfg"
+  write_userspace_tuning "$cfg" "icmp"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 }
@@ -892,7 +961,7 @@ cidr      = "${cidr}"
 mtu       = ${mtu}
 EOF
   write_transport_no_port "$cfg" "10"
-  write_tuning "$cfg"
+  write_userspace_tuning "$cfg" "bip"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 }

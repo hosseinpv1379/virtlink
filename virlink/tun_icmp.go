@@ -1,11 +1,9 @@
 // tun_icmp.go — ICMP Echo tunnel (IP protocol 1).
 //
-// Performance (v2.7.9):
-//   • IFF_MULTI_QUEUE TUN — one goroutine per queue (parallel TX)
-//   • sendmmsg batching per queue, batch size from [tuning]
-//   • Non-blocking TUN reads + adaptive poll backoff (idle → saves CPU)
-//   • Inner IP hash dedup on TX catches multi-queue duplicate reads
-//   • Single RX goroutine + lock-free outer seq dedup
+// Performance (v2.8.1):
+//   • Single TX poller for all TUN queues (1 goroutine vs N)
+//   • sendmmsg batching, inner-IP dedup only when queues > 1
+//   • Per-protocol userspace defaults via applyPerfFromConfig
 package main
 
 import (
@@ -103,12 +101,10 @@ func (t *IcmpTunnel) Up() error {
 
 	rawFd := t.rawFd
 	go t.rxLoop(rawFd, t.tun.Fd0())
-	for _, qfd := range t.tun.fds {
-		go t.txLoop(rawFd, qfd)
-	}
+	go t.txPollLoop(rawFd)
 
 	done(dev, addr, peer,
-		fmt.Sprintf("transport : ICMP ×%d queues (batch TX)", t.tun.QueueCount()),
+		fmt.Sprintf("transport : ICMP poller×1  queues=%d  batch=%d", t.tun.QueueCount(), perfBatchSize()),
 		"filter   : peer="+c.RemoteIP,
 		"test     : ping -c3 "+peer,
 	)
@@ -125,73 +121,53 @@ func (t *IcmpTunnel) resolveDst() ([4]byte, bool) {
 	return [4]byte{}, false
 }
 
-// txLoop serves one TUN queue: non-blocking drain + sendmmsg batches.
-// Adaptive poll backoff: increases timeout each idle round (up to 50 ms),
-// resets immediately on traffic — saves CPU when the tunnel is quiet.
-func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File) {
-	_ = unix.SetNonblock(int(qfd.Fd()), true)
-	tunFD := int(qfd.Fd())
-
-	scratch := getICMPFrame()
-	defer putICMPFrame(scratch)
-	scratchPayload := scratch[icmpHdrLen:]
-
-	// Read tuning once per goroutine lifetime — avoid repeated struct reads in hot loop.
-	bsz := perfBatchSize()
-	baseMs := perfPollMs()
-	idleMs := baseMs
+// txPollLoop — single goroutine polls all TUN queues, batches ICMP sends.
+func (t *IcmpTunnel) txPollLoop(rawFd int) {
+	poller := newTunPoller(t.tun, &t.stop)
+	defer poller.close()
 
 	var batch icmpTxBatch
+	bsz := perfBatchSize()
+	useDedup := t.tun.QueueCount() > 1
 
-	for !t.stop.stopped() {
-		batch.reset()
-
-		for batch.n < bsz {
-			n, err := tunReadNB(qfd, scratchPayload)
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-				break
-			}
-			if err != nil || n == 0 {
-				if err != nil && !t.stop.stopped() {
-					logWarn("tun read: " + err.Error())
-				}
-				break
-			}
-			statInc(statICMPTxRead)
-			dst, ok := t.resolveDst()
-			if !ok {
-				statInc(statICMPTxNoDst)
-				continue
-			}
-			payload := scratchPayload[:n]
-			if t.txDedup.dup(payload) {
-				statInc(statICMPTxDedup)
-				continue
-			}
-			frame := getICMPFrame()
-			seq := uint16(t.seq.Add(1))
-			pkt := buildICMPFrame(frame, icmpTunID, seq, payload)
-			batch.add(frame, len(pkt), dst)
-		}
-
+	flush := func() {
 		if batch.n == 0 {
-			statInc(statICMPTxPoll)
-			_ = pollFD(tunFD, unix.POLLIN, idleMs)
-			// Back off exponentially up to 50 ms so idle goroutines don't spin.
-			if idleMs < 50 {
-				idleMs += baseMs
-			}
-			continue
+			return
 		}
-		idleMs = baseMs // reset backoff on activity
-
 		statAdd(statICMPTxSend, uint64(batch.n))
 		icmpSendBatch(rawFd, &batch)
 		for i := 0; i < batch.n; i++ {
 			putICMPFrame(batch.frames[i])
 			batch.frames[i] = nil
 		}
+		batch.reset()
 	}
+
+	poller.Run(
+		func() { statInc(statICMPTxPoll) },
+		func(pkt []byte, n int) bool {
+			statInc(statICMPTxRead)
+			dst, ok := t.resolveDst()
+			if !ok {
+				statInc(statICMPTxNoDst)
+				return true
+			}
+			payload := pkt[:n]
+			if useDedup && t.txDedup.dup(payload) {
+				statInc(statICMPTxDedup)
+				return true
+			}
+			frame := getICMPFrame()
+			seq := uint16(t.seq.Add(1))
+			built := buildICMPFrame(frame, icmpTunID, seq, payload)
+			batch.add(frame, len(built), dst)
+			if batch.n >= bsz {
+				flush()
+			}
+			return !t.stop.stopped()
+		},
+	)
+	flush()
 }
 
 func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {

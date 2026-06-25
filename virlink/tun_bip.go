@@ -83,12 +83,10 @@ func (t *BipTunnel) Up() error {
 
 	rawFd := t.rawFd
 	go t.rxLoop(rawFd, t.tun.Fd0())
-	for _, q := range t.tun.fds {
-		go t.txLoop(rawFd, q)
-	}
+	go t.txPollLoop(rawFd)
 
 	done(dev, addr, peer,
-		fmt.Sprintf("proto : IPv4 proto %d  queues=%d", bipProto, t.tun.QueueCount()),
+		fmt.Sprintf("proto : IPv4 proto %d  poller×1", bipProto),
 		"test  : ping -c3 "+peer,
 	)
 	return nil
@@ -145,47 +143,32 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 	}
 }
 
-func (t *BipTunnel) txLoop(rawFd int, qfd *os.File) {
-	_ = unix.SetNonblock(int(qfd.Fd()), true)
-	tunFD := int(qfd.Fd())
-	buf := getBuf()
-	defer putBuf(buf)
-	pollMs := perfPollMs()
-	idleMs := pollMs
-	for !t.stop.stopped() {
-		n, err := tunReadNB(qfd, buf)
-		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-			statInc(statBIPTxPoll)
-			_ = pollFD(tunFD, unix.POLLIN, idleMs)
-			if idleMs < 50 {
-				idleMs += pollMs
+func (t *BipTunnel) txPollLoop(rawFd int) {
+	poller := newTunPoller(t.tun, &t.stop)
+	defer poller.close()
+
+	poller.Run(
+		func() { statInc(statBIPTxPoll) },
+		func(pkt []byte, n int) bool {
+			statInc(statBIPTxRead)
+			var dst [4]byte
+			if t.cfg.Mode == "client" {
+				dst = t.peerIP
+			} else if v := t.lastSrc.Load(); v != nil {
+				dst = v.([4]byte)
+			} else {
+				statInc(statBIPTxNoDst)
+				return true
 			}
-			continue
-		}
-		if err != nil || n == 0 {
-			if err != nil && !t.stop.stopped() {
-				logWarn("bip tun read: " + err.Error())
+			sa := &unix.SockaddrInet4{Addr: dst}
+			if err := unix.Sendto(rawFd, pkt[:n], 0, sa); err != nil && err != unix.EAGAIN {
+				logDebug("bip tx: " + err.Error())
+			} else if err == nil {
+				statInc(statBIPTxSend)
 			}
-			continue
-		}
-		idleMs = pollMs
-		var dst [4]byte
-		if t.cfg.Mode == "client" {
-			dst = t.peerIP
-		} else if v := t.lastSrc.Load(); v != nil {
-			dst = v.([4]byte)
-		} else {
-			statInc(statBIPTxNoDst)
-			continue
-		}
-		statInc(statBIPTxRead)
-		sa := &unix.SockaddrInet4{Addr: dst}
-		if err := unix.Sendto(rawFd, buf[:n], 0, sa); err != nil && err != unix.EAGAIN {
-			logDebug("bip tx: " + err.Error())
-		} else if err == nil {
-			statInc(statBIPTxSend)
-		}
-	}
+			return !t.stop.stopped()
+		},
+	)
 }
 
 func (t *BipTunnel) Down() error {

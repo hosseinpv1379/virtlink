@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
 
 const udpRawSubnet = "10.20.42.0/24"
@@ -87,11 +86,9 @@ func (t *UdpTunnel) Up() error {
 
 	conn := t.udpConn
 	go t.rxLoop(conn, t.tun.Fd0())
-	for _, q := range t.tun.fds {
-		go t.txLoop(conn, q)
-	}
+	go t.txPollLoop(conn)
 
-	done(dev, addr, peer, fmt.Sprintf("transport : UDP :%d  queues=%d", port, t.tun.QueueCount()))
+	done(dev, addr, peer, fmt.Sprintf("transport : UDP :%d  poller×1", port))
 	return nil
 }
 
@@ -133,45 +130,30 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 	}
 }
 
-func (t *UdpTunnel) txLoop(conn *net.UDPConn, qfd *os.File) {
-	_ = unix.SetNonblock(int(qfd.Fd()), true)
-	tunFD := int(qfd.Fd())
-	buf := getBuf()
-	defer putBuf(buf)
-	pollMs := perfPollMs()
-	idleMs := pollMs
-	for !t.stop.stopped() {
-		n, err := tunReadNB(qfd, buf)
-		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-			statInc(statUDPTxPoll)
-			_ = pollFD(tunFD, unix.POLLIN, idleMs)
-			if idleMs < 50 {
-				idleMs += pollMs
+func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
+	poller := newTunPoller(t.tun, &t.stop)
+	defer poller.close()
+
+	poller.Run(
+		func() { statInc(statUDPTxPoll) },
+		func(pkt []byte, n int) bool {
+			statInc(statUDPTxRead)
+			var dst *net.UDPAddr
+			if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
+				dst = p
 			}
-			continue
-		}
-		if err != nil || n == 0 {
-			if err != nil && !t.stop.stopped() {
-				logWarn("udp tun read: " + err.Error())
+			if dst == nil {
+				statInc(statUDPTxNoDst)
+				return true
 			}
-			continue
-		}
-		idleMs = pollMs
-		var dst *net.UDPAddr
-		if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
-			dst = p
-		}
-		if dst == nil {
-			statInc(statUDPTxNoDst)
-			continue
-		}
-		statInc(statUDPTxRead)
-		if _, err := conn.WriteToUDP(buf[:n], dst); err != nil && !t.stop.stopped() {
-			logDebug("udp tx: " + err.Error())
-		} else if err == nil {
-			statInc(statUDPTxSend)
-		}
-	}
+			if _, err := conn.WriteToUDP(pkt[:n], dst); err != nil && !t.stop.stopped() {
+				logDebug("udp tx: " + err.Error())
+			} else if err == nil {
+				statInc(statUDPTxSend)
+			}
+			return !t.stop.stopped()
+		},
+	)
 }
 
 func (t *UdpTunnel) Down() error {
