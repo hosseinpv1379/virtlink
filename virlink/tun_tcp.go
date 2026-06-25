@@ -73,6 +73,10 @@ func (t *TcpTunnel) Up() error {
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)
 
+	if err := tcpTunnelWireUp(c); err != nil {
+		return err
+	}
+
 	addMSS(dev)
 	t.done = make(chan struct{})
 
@@ -256,6 +260,7 @@ func (t *TcpTunnel) Down() error {
 }
 
 func (t *TcpTunnel) doClean() {
+	tcpTunnelWireDown(t.cfg)
 	restoreTunnelTuning()
 	t.stop.stop()
 	if t.done != nil {

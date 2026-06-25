@@ -55,7 +55,7 @@ func validateMangle(m *MangleCfg) error {
 
 func validateWireSpoofTunnel(typ string) error {
 	switch typ {
-	case "tcp", "udp-obfs":
+	case "udp-obfs":
 		return fmt.Errorf("[mangle] wire spoof is not supported for %q tunnel", typ)
 	default:
 		return nil

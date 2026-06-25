@@ -42,6 +42,20 @@ func kernelTunnelWireDown(cfg *Config) {
 	restoreKernelMangle()
 }
 
+func tcpTunnelWireUp(cfg *Config) error {
+	if !wireSpoofEnabled(cfg) || cfg.Tunnel.Type != "tcp" {
+		return nil
+	}
+	return applyTCPWireMangle(cfg)
+}
+
+func tcpTunnelWireDown(cfg *Config) {
+	if !wireSpoofEnabled(cfg) || cfg.Tunnel.Type != "tcp" {
+		return
+	}
+	restoreKernelMangle()
+}
+
 // applyKernelMangle installs scoped nftables rules:
 //   output: daddr dstip → rewrite source to srcip
 //   input:  saddr srcip → rewrite source to dstip
@@ -77,6 +91,49 @@ table inet %s {
 	}
 	logOK("wire spoof enabled (kernel nftables mangle)")
 	logDebug(fmt.Sprintf("wire spoof srcip=%s dstip=%s mss=%d", src, dst, mangleMSS))
+	return nil
+}
+
+// applyTCPWireMangle rewrites outer TCP IP headers so the tunnel uses spoofed identities.
+// Output: only spoof source (dst stays real remote_ip, like hping3 -a).
+// Input: rewrite peer's spoofed source back to remote_ip so the TCP stack accepts replies.
+func applyTCPWireMangle(cfg *Config) error {
+	kernelMangleMu.Lock()
+	defer kernelMangleMu.Unlock()
+
+	restoreKernelMangleLocked()
+
+	src := cfg.Mangle.SrcIP
+	dst := cfg.Mangle.DstIP
+	remote := cfg.RemoteIP
+	port := cfg.Transport.Port
+	if port == 0 {
+		port = 8443
+	}
+	script := fmt.Sprintf(`table ip %s {
+	chain input {
+		type filter hook input priority mangle; policy accept;
+		ip saddr %s tcp sport %d ip saddr set %s
+		ip saddr %s tcp dport %d ip saddr set %s
+	}
+	chain output {
+		type filter hook output priority mangle; policy accept;
+		ip daddr %s tcp dport %d ip saddr set %s
+	}
+}
+table inet %s {
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		tcp flags syn tcp option maxseg size set %d
+	}
+}
+`, nftMangleTable, dst, port, remote, dst, port, remote, remote, port, src, nftFwdTable, mangleMSS)
+
+	if err := nftRunScript(script); err != nil {
+		return fmt.Errorf("tcp wire mangle nft: %w", err)
+	}
+	logOK("wire spoof enabled (TCP nftables mangle)")
+	logDebug(fmt.Sprintf("wire spoof srcip=%s dstip=%s port=%d", src, dst, port))
 	return nil
 }
 
