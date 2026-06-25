@@ -156,7 +156,12 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 	}
 
 	poller.Run(
-		func() { statInc(statICMPTxPoll) },
+		func() {
+			statInc(statICMPTxPoll)
+			if batch.n > 0 {
+				flush()
+			}
+		},
 		func(pkt []byte, n int) bool {
 			statInc(statICMPTxRead)
 			dst, ok := t.resolveDst()
