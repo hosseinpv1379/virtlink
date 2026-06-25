@@ -98,22 +98,28 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
 	peer, local := t.peerIP, t.localIP
+	pollMs := perfPollMs()
+	idleMs := pollMs
 	for {
 		n, from, err := unix.Recvfrom(rawFd, buf, 0)
 		if err != nil {
 			if t.stop.stopped() {
 				return
 			}
-		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-			_ = pollFD(rawFd, unix.POLLIN, perfPollMs())
-			continue
-		}
-		if err == unix.EINTR {
-			continue
-		}
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				_ = pollFD(rawFd, unix.POLLIN, idleMs)
+				if idleMs < 50 {
+					idleMs += pollMs
+				}
+				continue
+			}
+			if err == unix.EINTR {
+				continue
+			}
 			logWarn("bip rx: " + err.Error())
 			continue
 		}
+		idleMs = pollMs
 		sa, ok := from.(*unix.SockaddrInet4)
 		if !ok || sa.Addr == local || sa.Addr != peer {
 			continue
@@ -135,16 +141,28 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 }
 
 func (t *BipTunnel) txLoop(rawFd int, qfd *os.File) {
+	_ = unix.SetNonblock(int(qfd.Fd()), true)
+	tunFD := int(qfd.Fd())
 	buf := getBuf()
 	defer putBuf(buf)
-	for {
-		n, err := qfd.Read(buf)
-		if err != nil {
-			if t.stop.stopped() {
-				return
+	pollMs := perfPollMs()
+	idleMs := pollMs
+	for !t.stop.stopped() {
+		n, err := tunReadNB(qfd, buf)
+		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			_ = pollFD(tunFD, unix.POLLIN, idleMs)
+			if idleMs < 50 {
+				idleMs += pollMs
 			}
 			continue
 		}
+		if err != nil || n == 0 {
+			if err != nil && !t.stop.stopped() {
+				logWarn("bip tun read: " + err.Error())
+			}
+			continue
+		}
+		idleMs = pollMs
 		var dst [4]byte
 		if t.cfg.Mode == "client" {
 			dst = t.peerIP

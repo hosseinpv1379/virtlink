@@ -155,17 +155,18 @@ func (d *atomicSeqDedup) reset() {
 	}
 }
 
-// ipPktDedup — dedup by inner IP packet hash (catches multi-queue TUN duplicate reads
-// and sendmmsg partial-send replays; outer ICMP seq differs per copy).
+// ipPktDedup — lock-free dedup by inner IP packet hash.
+// 4096 slots = 32 KB; enough for any realistic in-flight window.
 type ipPktDedup struct {
-	slots [65536]atomic.Uint64
+	slots [4096]atomic.Uint64
 }
 
 func hashIPPacket(p []byte) uint32 {
+	// FNV-1a over first 40 bytes (covers IP+TCP/UDP headers — sufficient for dedup).
 	h := uint32(2166136261)
 	n := len(p)
-	if n > 96 {
-		n = 96
+	if n > 40 {
+		n = 40
 	}
 	for i := 0; i < n; i++ {
 		h ^= uint32(p[i])
@@ -182,7 +183,7 @@ func (d *ipPktDedup) dup(p []byte) bool {
 		return false
 	}
 	hash := hashIPPacket(p)
-	idx := hash & 65535
+	idx := hash & 4095
 	tag := (uint64(hash) << 16) | 1
 	for {
 		old := d.slots[idx].Load()

@@ -1,7 +1,10 @@
 // perf.go — runtime performance knobs from [tuning] in config.toml.
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"runtime"
+)
 
 const (
 	maxPerfQueues = 16
@@ -30,13 +33,22 @@ func init() {
 }
 
 func initPerfDefaults() {
+	// tun_queues defaults to CPU count, capped at 4 — more queues
+	// add goroutines and scheduling overhead without throughput gains.
+	ncpu := runtime.NumCPU()
+	if ncpu > defTunQueues {
+		ncpu = defTunQueues
+	}
+	if ncpu < 1 {
+		ncpu = 1
+	}
 	perf = perfRuntime{
 		sockBuf:    defSockBufMB << 20,
-		tunQueues:  defTunQueues,
+		tunQueues:  ncpu,
 		batchSize:  defBatchSize,
 		txQLen:     defTxQLen,
 		pollMs:     defPollMs,
-		tcpStreams: defTunQueues,
+		tcpStreams: ncpu,
 	}
 }
 

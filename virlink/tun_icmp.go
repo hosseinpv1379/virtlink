@@ -1,11 +1,11 @@
 // tun_icmp.go — ICMP Echo tunnel (IP protocol 1).
 //
-// Performance (v2.7.6):
+// Performance (v2.7.9):
 //   • IFF_MULTI_QUEUE TUN — one goroutine per queue (parallel TX)
-//   • sendmmsg batching (32 packets) per queue
-//   • Non-blocking TUN reads + poll (no stall, no duplicate sends)
-//   • Inner IP payload dedup on TX+RX (multi-queue can deliver same skb to N readers)
-//   • Lock-free outer ICMP seq dedup, strict peer-IP filter
+//   • sendmmsg batching per queue, batch size from [tuning]
+//   • Non-blocking TUN reads + adaptive poll backoff (idle → saves CPU)
+//   • Inner IP hash dedup on TX catches multi-queue duplicate reads
+//   • Single RX goroutine + lock-free outer seq dedup
 package main
 
 import (
@@ -34,7 +34,6 @@ type IcmpTunnel struct {
 	seq     atomic.Uint32
 	dedup   atomicSeqDedup
 	txDedup ipPktDedup
-	rxDedup ipPktDedup
 	lastSrc atomic.Value
 	peerIP  [4]byte
 	localIP [4]byte
@@ -65,7 +64,6 @@ func (t *IcmpTunnel) Up() error {
 	t.stop.reset()
 	t.dedup.reset()
 	t.txDedup.reset()
-	t.rxDedup.reset()
 
 	step("instance lock...")
 	var err error
@@ -128,6 +126,8 @@ func (t *IcmpTunnel) resolveDst() ([4]byte, bool) {
 }
 
 // txLoop serves one TUN queue: non-blocking drain + sendmmsg batches.
+// Adaptive poll backoff: increases timeout each idle round (up to 50 ms),
+// resets immediately on traffic — saves CPU when the tunnel is quiet.
 func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File) {
 	_ = unix.SetNonblock(int(qfd.Fd()), true)
 	tunFD := int(qfd.Fd())
@@ -136,12 +136,17 @@ func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File) {
 	defer putICMPFrame(scratch)
 	scratchPayload := scratch[icmpHdrLen:]
 
+	// Read tuning once per goroutine lifetime — avoid repeated struct reads in hot loop.
+	bsz := perfBatchSize()
+	baseMs := perfPollMs()
+	idleMs := baseMs
+
 	var batch icmpTxBatch
 
 	for !t.stop.stopped() {
 		batch.reset()
 
-		for batch.n < perfBatchSize() {
+		for batch.n < bsz {
 			n, err := tunReadNB(qfd, scratchPayload)
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				break
@@ -167,9 +172,14 @@ func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File) {
 		}
 
 		if batch.n == 0 {
-			_ = pollFD(tunFD, unix.POLLIN, perfPollMs())
+			_ = pollFD(tunFD, unix.POLLIN, idleMs)
+			// Back off exponentially up to 50 ms so idle goroutines don't spin.
+			if idleMs < 50 {
+				idleMs += baseMs
+			}
 			continue
 		}
+		idleMs = baseMs // reset backoff on activity
 
 		icmpSendBatch(rawFd, &batch)
 		for i := 0; i < batch.n; i++ {
@@ -220,9 +230,6 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 			continue
 		}
 		inner := icmp[8:]
-		if t.rxDedup.dup(inner) {
-			continue
-		}
 		if t.cfg.Mode == "server" {
 			t.lastSrc.Store(sa.Addr)
 		}

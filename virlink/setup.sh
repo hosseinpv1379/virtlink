@@ -503,15 +503,15 @@ write_tuning() {
   cat >> "$file" << EOF
 
 [tuning]
-enabled       = true
-mode          = "fast"
-multipath     = ${multipath}
-sock_buf_mb   = 128
-tun_queues    = 16
-batch_size    = 128
-tx_queue_len  = 100000
-poll_ms       = 1
-tcp_streams   = 16
+enabled      = true
+mode         = "balanced"
+multipath    = ${multipath}
+# sock_buf_mb  = 32     # socket buffer MB  (1–128, default 32)
+# tun_queues   = 4      # TUN readers       (1–16,  default = CPU count max 4)
+# batch_size   = 32     # ICMP sendmmsg     (1–128, default 32)
+# tx_queue_len = 10000  # TUN txqueuelen    (100–100000)
+# poll_ms      = 10     # idle poll ms      (adaptive backoff up to 50 ms)
+# tcp_streams  = 4      # TCP streams       (1–16,  default = tun_queues)
 channel_size  = 10_000
 
 [logging]
