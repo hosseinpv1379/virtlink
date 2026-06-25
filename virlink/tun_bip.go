@@ -46,6 +46,9 @@ func (t *BipTunnel) Up() error {
 	t.peerIP = ipTo4(c.RemoteIP)
 	t.localIP = ipTo4(c.LocalIP)
 	t.wire = wireSpoofFrom(c)
+	if c.Mode == "server" && t.wire.on {
+		t.lastSrc.Store(t.peerIP)
+	}
 
 	header("bip / " + c.Mode)
 	applyPerfFromConfig(c)
@@ -139,7 +142,7 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 			continue
 		}
 		if t.cfg.Mode == "server" {
-			t.lastSrc.Store(sa.Addr)
+			t.lastSrc.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
 		}
 		statInc(statBIPRxRecv)
 		if err := tunWrite(tun, buf[ihl:n]); err != nil && !t.stop.stopped() {
@@ -170,7 +173,7 @@ func (t *BipTunnel) txPollLoop(rawFd int) {
 			var out []byte
 			if t.wire.on {
 				frame := getBuf()
-				out = buildWireProto(frame, t.wire.src, t.wire.wireHdrDst(), bipProto, pkt[:n])
+				out = buildWireProto(frame, t.wire.src, routeDst, bipProto, pkt[:n])
 				defer putBuf(frame)
 			} else {
 				out = pkt[:n]

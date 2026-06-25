@@ -54,6 +54,9 @@ func (t *IcmpTunnel) Up() error {
 	t.peerIP = ipTo4(c.RemoteIP)
 	t.localIP = ipTo4(c.LocalIP)
 	t.wire = wireSpoofFrom(c)
+	if c.Mode == "server" && t.wire.on {
+		t.lastSrc.Store(t.peerIP)
+	}
 
 	header("icmp / " + c.Mode)
 	applyPerfFromConfig(c)
@@ -168,7 +171,7 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 			seq := uint16(t.seq.Add(1))
 			var built []byte
 			if t.wire.on {
-				built = buildWireICMP(frame, t.wire.src, t.wire.wireHdrDst(), icmpTunID, seq, payload)
+				built = buildWireICMP(frame, t.wire.src, dst, icmpTunID, seq, payload)
 			} else {
 				built = buildICMPFrame(frame, icmpTunID, seq, payload)
 			}
@@ -230,7 +233,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 		}
 		inner := icmp[8:]
 		if t.cfg.Mode == "server" {
-			t.lastSrc.Store(sa.Addr)
+			t.lastSrc.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
 		}
 		if err := tunWrite(tun, inner); err != nil && !t.stop.stopped() {
 			logWarn("tun write: " + err.Error())

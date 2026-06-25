@@ -49,6 +49,9 @@ func (t *UdpTunnel) Up() error {
 	t.peerIP = ipTo4(c.RemoteIP)
 	t.localIP = ipTo4(c.LocalIP)
 	t.wire = wireSpoofFrom(c)
+	if c.Mode == "server" && t.wire.on {
+		t.lastRoute.Store(t.peerIP)
+	}
 
 	header("udp / " + c.Mode)
 	applyPerfFromConfig(c)
@@ -158,7 +161,7 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 		}
 		payload := buf[ihl+udpHdrLen : n]
 		if t.cfg.Mode == "server" {
-			t.lastRoute.Store(sa.Addr)
+			t.lastRoute.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
 		}
 		statInc(statUDPRxRecv)
 		if err := tunWrite(tun, payload); err != nil && !t.stop.stopped() {
@@ -187,7 +190,7 @@ func (t *UdpTunnel) txPollLoopRaw(rawFd int, port int) {
 				return true
 			}
 			frame := getBuf()
-			out := buildWireUDP(frame, t.wire.src, t.wire.wireHdrDst(), uint16(port), uint16(port), pkt[:n])
+			out := buildWireUDP(frame, t.wire.src, routeDst, uint16(port), uint16(port), pkt[:n])
 			sa := &unix.SockaddrInet4{Addr: routeDst}
 			if err := unix.Sendto(rawFd, out, 0, sa); err != nil && err != unix.EAGAIN {
 				logDebug("udp tx: " + err.Error())

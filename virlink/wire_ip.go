@@ -86,6 +86,7 @@ func openRawHdrIncl(proto int) (int, error) {
 		unix.Close(fd)
 		return 0, err
 	}
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_FREEBIND, 1)
 	tuneRawSock(fd)
 	return fd, nil
 }

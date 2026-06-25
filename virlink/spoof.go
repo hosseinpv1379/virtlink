@@ -1,7 +1,8 @@
 // spoof.go — optional wire IP spoofing ([mangle] srcip / dstip).
 //
 // Userspace tunnels (icmp/udp/bip): IP_HDRINCL in-process.
-// Kernel tunnels (gre-fou, gre, …): nftables mangle installed on up.
+// TX outer IP: src=srcip, dst=real remote_ip (like hping3 -a).
+// RX accept: outer src = peer's srcip (= our mangle dstip).
 package main
 
 import (
@@ -60,7 +61,7 @@ func validateWireSpoofTunnel(typ string) error {
 	}
 }
 
-// wirePeer is the outer source IP we accept from the peer on RX.
+// wirePeer is the outer source IP we accept from the peer on RX (= peer's mangle srcip).
 func (w wireSpoof) wirePeer(fallback [4]byte) [4]byte {
 	if w.on {
 		return w.dst
@@ -68,8 +69,14 @@ func (w wireSpoof) wirePeer(fallback [4]byte) [4]byte {
 	return fallback
 }
 
-// wireHdrDst is the outer destination IP written into the IPv4 header.
-func (w wireSpoof) wireHdrDst() [4]byte { return w.dst }
+// rememberPeerRoute returns the real routable peer IP for sendto.
+// With wire spoof, recvfrom reports the spoofed outer src — not usable for routing.
+func rememberPeerRoute(w wireSpoof, fromAddr, configuredPeer [4]byte) [4]byte {
+	if w.on {
+		return configuredPeer
+	}
+	return fromAddr
+}
 
 func logWireSpoof(w wireSpoof) {
 	if !w.on {
