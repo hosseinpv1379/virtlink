@@ -25,6 +25,7 @@ type BipTunnel struct {
 	done    chan struct{}
 	stop    stoppedFlag
 	lastSrc atomic.Value
+	wire    wireSpoof
 	peerIP  [4]byte
 	localIP [4]byte
 }
@@ -44,6 +45,7 @@ func (t *BipTunnel) Up() error {
 	}
 	t.peerIP = ipTo4(c.RemoteIP)
 	t.localIP = ipTo4(c.LocalIP)
+	t.wire = wireSpoofFrom(c)
 
 	header("bip / " + c.Mode)
 	applyPerfFromConfig(c)
@@ -70,13 +72,17 @@ func (t *BipTunnel) Up() error {
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)
 
-	t.rawFd, err = unix.Socket(unix.AF_INET, unix.SOCK_RAW, bipProto)
+	if t.wire.on {
+		t.rawFd, err = openRawHdrIncl(bipProto)
+	} else {
+		t.rawFd, err = unix.Socket(unix.AF_INET, unix.SOCK_RAW, bipProto)
+	}
 	if err != nil {
 		return fmt.Errorf("SOCK_RAW proto=%d: %w", bipProto, err)
 	}
 	_ = unix.SetNonblock(t.rawFd, true)
-	tuneRawSock(t.rawFd)
 	logOK(fmt.Sprintf("raw proto=%d ready", bipProto))
+	logWireSpoof(t.wire)
 
 	addMSS(dev)
 	t.done = make(chan struct{})
@@ -95,7 +101,8 @@ func (t *BipTunnel) Up() error {
 func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
-	peer, local := t.peerIP, t.localIP
+	peer := t.wire.wirePeer(t.peerIP)
+	local := t.localIP
 	pollMs := perfPollMs()
 	idleMs := pollMs
 	for {
@@ -120,7 +127,7 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 		}
 		idleMs = pollMs
 		sa, ok := from.(*unix.SockaddrInet4)
-		if !ok || sa.Addr == local || sa.Addr != peer {
+		if !ok || !acceptWirePeer(sa, local, peer, t.wire.src, t.wire) {
 			statInc(statBIPRxDrop)
 			continue
 		}
@@ -151,17 +158,25 @@ func (t *BipTunnel) txPollLoop(rawFd int) {
 		func() { statInc(statBIPTxPoll) },
 		func(pkt []byte, n int) bool {
 			statInc(statBIPTxRead)
-			var dst [4]byte
+			var routeDst [4]byte
 			if t.cfg.Mode == "client" {
-				dst = t.peerIP
+				routeDst = t.peerIP
 			} else if v := t.lastSrc.Load(); v != nil {
-				dst = v.([4]byte)
+				routeDst = v.([4]byte)
 			} else {
 				statInc(statBIPTxNoDst)
 				return true
 			}
-			sa := &unix.SockaddrInet4{Addr: dst}
-			if err := unix.Sendto(rawFd, pkt[:n], 0, sa); err != nil && err != unix.EAGAIN {
+			var out []byte
+			if t.wire.on {
+				frame := getBuf()
+				out = buildWireProto(frame, t.wire.src, t.wire.wireHdrDst(), bipProto, pkt[:n])
+				defer putBuf(frame)
+			} else {
+				out = pkt[:n]
+			}
+			sa := &unix.SockaddrInet4{Addr: routeDst}
+			if err := unix.Sendto(rawFd, out, 0, sa); err != nil && err != unix.EAGAIN {
 				logDebug("bip tx: " + err.Error())
 			} else if err == nil {
 				statInc(statBIPTxSend)

@@ -99,6 +99,10 @@ func (t *GreWgTunnel) Up() error {
 	step("iptables MSS clamping...")
 	addMSS(greDev)
 
+	if err := kernelTunnelWireUp(c); err != nil {
+		return err
+	}
+
 	done(greDev, greAddr, grePeer,
 		fmt.Sprintf("WireGuard : %s  %s  port=%s", wgDev, wgAddr, port),
 		"test      : ping -c3 "+grePeer,
@@ -108,6 +112,7 @@ func (t *GreWgTunnel) Up() error {
 }
 
 func (t *GreWgTunnel) Down() error {
+	kernelTunnelWireDown(t.cfg)
 	delMSS(t.greDev())
 	t.doClean()
 	logOK("gre-wg torn down")

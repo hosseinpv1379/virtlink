@@ -102,6 +102,10 @@ func (t *BondedTunnel) Up() error {
 	addMSS(dev0)
 	addMSS(dev1)
 
+	if err := kernelTunnelWireUp(c); err != nil {
+		return err
+	}
+
 	done(dev0+"+"+dev1, addr, peer,
 		fmt.Sprintf("path-1 : %s  FOU:%d  GRE key=1", dev0, p0),
 		fmt.Sprintf("path-2 : %s  FOU:%d  GRE key=2", dev1, p1),
@@ -113,6 +117,7 @@ func (t *BondedTunnel) Up() error {
 }
 
 func (t *BondedTunnel) Down() error {
+	kernelTunnelWireDown(t.cfg)
 	peer := peerAddr(t.cfg, bondedSubnet)
 	nlRouteDel(peer)
 	delMSS(t.dev0())

@@ -28,9 +28,6 @@ func runDaemon(cfg *Config, tun Tunnel) int {
 		logError("tunnel up: " + err.Error())
 		return 1
 	}
-	if err := applyMangle(cfg); err != nil {
-		logWarn("mangle: " + err.Error())
-	}
 
 	// ── 2. port forwarding (client-only) ──────────────────────────────────────
 	var fwdRules []ForwardRule
@@ -108,7 +105,6 @@ func runDaemon(cfg *Config, tun Tunnel) int {
 	}
 
 	logInfo("[down] tearing down tunnel")
-	restoreMangle()
 	if err := tun.Down(); err != nil {
 		logError("[down] " + err.Error())
 		return 1

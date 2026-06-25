@@ -30,17 +30,17 @@ func putBuf(b []byte) {
 	pktPool.Put(&b)
 }
 
-// icmpFramePool holds reusable [8+maxIP] buffers for ICMP encapsulation.
+// icmpFramePool holds reusable buffers for ICMP encapsulation (+ optional IPv4 header).
 var icmpFramePool = sync.Pool{
 	New: func() any {
-		b := make([]byte, icmpHdrLen+maxPktBuf)
+		b := make([]byte, ipHdrLen+icmpHdrLen+maxPktBuf)
 		return &b
 	},
 }
 
 func getICMPFrame() []byte { return *icmpFramePool.Get().(*[]byte) }
 func putICMPFrame(b []byte) {
-	b = b[:icmpHdrLen+maxPktBuf]
+	b = b[:ipHdrLen+icmpHdrLen+maxPktBuf]
 	icmpFramePool.Put(&b)
 }
 

@@ -97,6 +97,10 @@ func (t *L2tpv3Tunnel) Up() error {
 	step("iptables MSS clamping...")
 	addMSS(dev)
 
+	if err := kernelTunnelWireUp(c); err != nil {
+		return err
+	}
+
 	done(dev, addr, peer,
 		fmt.Sprintf("port        : %s", port),
 		fmt.Sprintf("tunnel_id   : local=%d  peer=%d", localTID, peerTID),
@@ -106,6 +110,7 @@ func (t *L2tpv3Tunnel) Up() error {
 }
 
 func (t *L2tpv3Tunnel) Down() error {
+	kernelTunnelWireDown(t.cfg)
 	c := t.cfg
 	l := c.L2tpv3
 	var localTID, localSID int

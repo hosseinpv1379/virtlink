@@ -110,6 +110,10 @@ func (t *IpsecTunnel) Up() error {
 	step("iptables MSS clamping...")
 	addMSS(dev)
 
+	if err := kernelTunnelWireUp(c); err != nil {
+		return err
+	}
+
 	done(dev, addr, peer,
 		fmt.Sprintf("FOU port : %s", port),
 		fmt.Sprintf("IPsec SPI: out=%s  in=%s", spiOut, spiIn),
@@ -120,6 +124,7 @@ func (t *IpsecTunnel) Up() error {
 }
 
 func (t *IpsecTunnel) Down() error {
+	kernelTunnelWireDown(t.cfg)
 	c := t.cfg
 	ip := c.Ipsec
 	port := fmt.Sprint(ip.Port)

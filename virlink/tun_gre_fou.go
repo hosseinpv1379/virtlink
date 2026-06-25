@@ -67,6 +67,10 @@ func (t *GreFouTunnel) Up() error {
 	step("iptables MSS clamping...")
 	addMSS(dev)
 
+	if err := kernelTunnelWireUp(c); err != nil {
+		return err
+	}
+
 	done(dev, addr, peer,
 		fmt.Sprintf("FOU port : %d", port),
 		"test     : ping -c3 "+peer,
@@ -75,6 +79,7 @@ func (t *GreFouTunnel) Up() error {
 }
 
 func (t *GreFouTunnel) Down() error {
+	kernelTunnelWireDown(t.cfg)
 	delMSS(t.dev())
 	t.doClean()
 	logOK("gre-fou torn down")

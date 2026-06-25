@@ -97,6 +97,10 @@ func (t *VxlanWgTunnel) Up() error {
 	step("iptables MSS clamping...")
 	addMSS(vxDev)
 
+	if err := kernelTunnelWireUp(c); err != nil {
+		return err
+	}
+
 	done(vxDev, ovAddr, ovPeer,
 		fmt.Sprintf("WireGuard : %s  %s  port=%s", wgDev, wgAddr, port),
 		fmt.Sprintf("VXLAN VNI : %d", wg.VNI),
@@ -106,6 +110,7 @@ func (t *VxlanWgTunnel) Up() error {
 }
 
 func (t *VxlanWgTunnel) Down() error {
+	kernelTunnelWireDown(t.cfg)
 	delMSS(t.vxlanDev())
 	t.doClean()
 	logOK("vxlan-wg torn down")

@@ -5,26 +5,31 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
 	"sync/atomic"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const udpRawSubnet = "10.20.42.0/24"
 
 type UdpTunnel struct {
-	cfg      *Config
-	tun      *TunDev
-	udpConn  *net.UDPConn
-	lockFd   *os.File
-	done     chan struct{}
-	stop     stoppedFlag
-	lastPeer atomic.Value
-	peerIP   [4]byte
-	localIP  [4]byte
+	cfg       *Config
+	tun       *TunDev
+	udpConn   *net.UDPConn
+	rawFd     int
+	lockFd    *os.File
+	done      chan struct{}
+	stop      stoppedFlag
+	lastPeer  atomic.Value
+	lastRoute atomic.Value
+	wire      wireSpoof
+	peerIP    [4]byte
+	localIP   [4]byte
 }
 
 func (t *UdpTunnel) DevName() string   { return "udp-tun0" }
@@ -43,6 +48,7 @@ func (t *UdpTunnel) Up() error {
 	}
 	t.peerIP = ipTo4(c.RemoteIP)
 	t.localIP = ipTo4(c.LocalIP)
+	t.wire = wireSpoofFrom(c)
 
 	header("udp / " + c.Mode)
 	applyPerfFromConfig(c)
@@ -69,27 +75,129 @@ func (t *UdpTunnel) Up() error {
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)
 
-	t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{Port: port})
-	if err != nil {
-		return fmt.Errorf("udp :%d: %w", port, err)
+	if t.wire.on {
+		t.rawFd, err = openRawHdrIncl(unix.IPPROTO_UDP)
+		if err != nil {
+			return fmt.Errorf("SOCK_RAW udp: %w", err)
+		}
+		_ = unix.SetNonblock(t.rawFd, true)
+		logOK(fmt.Sprintf("raw UDP (IP_HDRINCL) :%d", port))
+		logWireSpoof(t.wire)
+	} else {
+		t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{Port: port})
+		if err != nil {
+			return fmt.Errorf("udp :%d: %w", port, err)
+		}
+		tuneUDPConn(t.udpConn)
+		if c.Mode == "client" {
+			dst := &net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port}
+			t.lastPeer.Store(dst)
+			_ = connectUDP(t.udpConn, dst)
+		}
+		logOK(fmt.Sprintf("UDP :%d", port))
 	}
-	tuneUDPConn(t.udpConn)
-	if c.Mode == "client" {
-		dst := &net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port}
-		t.lastPeer.Store(dst)
-		_ = connectUDP(t.udpConn, dst)
-	}
-	logOK(fmt.Sprintf("UDP :%d", port))
 
 	addMSS(dev)
 	t.done = make(chan struct{})
 
-	conn := t.udpConn
-	go t.rxLoop(conn, t.tun.Fd0())
-	go t.txPollLoop(conn)
+	if t.wire.on {
+		rawFd := t.rawFd
+		go t.rxLoopRaw(rawFd, t.tun.Fd0(), port)
+		go t.txPollLoopRaw(rawFd, port)
+	} else {
+		conn := t.udpConn
+		go t.rxLoop(conn, t.tun.Fd0())
+		go t.txPollLoop(conn)
+	}
 
 	done(dev, addr, peer, fmt.Sprintf("transport : UDP :%d  poller×1", port))
 	return nil
+}
+
+func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
+	buf := getBuf()
+	defer putBuf(buf)
+	peer := t.wire.wirePeer(t.peerIP)
+	local := t.localIP
+	pollMs := perfPollMs()
+	idleMs := pollMs
+	for {
+		n, from, err := unix.Recvfrom(rawFd, buf, 0)
+		if err != nil {
+			if t.stop.stopped() {
+				return
+			}
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				_ = pollFD(rawFd, unix.POLLIN, idleMs)
+				if idleMs < 50 {
+					idleMs += pollMs
+				}
+				continue
+			}
+			if err == unix.EINTR {
+				continue
+			}
+			logWarn("udp rx: " + err.Error())
+			continue
+		}
+		idleMs = pollMs
+		sa, ok := from.(*unix.SockaddrInet4)
+		if !ok || !acceptWirePeer(sa, local, peer, t.wire.src, t.wire) {
+			statInc(statUDPRxDrop)
+			continue
+		}
+		ihl, ok := parseIPv4Payload(buf[:n])
+		if !ok {
+			continue
+		}
+		if n < ihl+udpHdrLen {
+			continue
+		}
+		if int(binary.BigEndian.Uint16(buf[ihl+2:])) != port {
+			continue
+		}
+		payload := buf[ihl+udpHdrLen : n]
+		if t.cfg.Mode == "server" {
+			t.lastRoute.Store(sa.Addr)
+		}
+		statInc(statUDPRxRecv)
+		if err := tunWrite(tun, payload); err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
+		} else {
+			statInc(statUDPRxWrite)
+		}
+	}
+}
+
+func (t *UdpTunnel) txPollLoopRaw(rawFd int, port int) {
+	poller := newTunPoller(t.tun, &t.stop)
+	defer poller.close()
+
+	poller.Run(
+		func() { statInc(statUDPTxPoll) },
+		func(pkt []byte, n int) bool {
+			statInc(statUDPTxRead)
+			var routeDst [4]byte
+			if t.cfg.Mode == "client" {
+				routeDst = t.peerIP
+			} else if v := t.lastRoute.Load(); v != nil {
+				routeDst = v.([4]byte)
+			} else {
+				statInc(statUDPTxNoDst)
+				return true
+			}
+			frame := getBuf()
+			out := buildWireUDP(frame, t.wire.src, t.wire.wireHdrDst(), uint16(port), uint16(port), pkt[:n])
+			sa := &unix.SockaddrInet4{Addr: routeDst}
+			if err := unix.Sendto(rawFd, out, 0, sa); err != nil && err != unix.EAGAIN {
+				logDebug("udp tx: " + err.Error())
+			} else if err == nil {
+				statInc(statUDPTxSend)
+			}
+			putBuf(frame)
+			return !t.stop.stopped()
+		},
+	)
 }
 
 func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
@@ -172,6 +280,10 @@ func (t *UdpTunnel) doClean() {
 	if t.udpConn != nil {
 		t.udpConn.Close()
 		t.udpConn = nil
+	}
+	if t.rawFd > 0 {
+		unix.Close(t.rawFd)
+		t.rawFd = 0
 	}
 	if t.tun != nil {
 		t.tun.Close()

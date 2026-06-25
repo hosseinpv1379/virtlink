@@ -62,6 +62,10 @@ func (t *GreTunnel) Up() error {
 	step("iptables MSS clamping...")
 	addMSS(dev)
 
+	if err := kernelTunnelWireUp(c); err != nil {
+		return err
+	}
+
 	done(dev, addr, peer,
 		"proto  : GRE (IP protocol 47, no UDP wrapper)",
 		fmt.Sprintf("local  : %s   remote : %s", c.LocalIP, c.RemoteIP),
@@ -71,6 +75,7 @@ func (t *GreTunnel) Up() error {
 }
 
 func (t *GreTunnel) Down() error {
+	kernelTunnelWireDown(t.cfg)
 	delMSS(t.DevName())
 	restoreTunnelTuning()
 	nlDown(t.DevName())

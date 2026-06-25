@@ -105,9 +105,9 @@ type HealthCfg struct {
 	Port     int  `toml:"port"`     // default 6543
 }
 
-// MangleCfg maps to [mangle] — optional nftables source rewrite (manual config only).
-// Client example: srcip=1.1.1.1 dstip=2.2.2.2
-// Server example: srcip=2.2.2.2 dstip=1.1.1.1
+// MangleCfg maps to [mangle] — optional wire IP spoof (manual config only).
+// Userspace (icmp/udp/bip): IP_HDRINCL  ·  Kernel (gre-fou, gre, …): nftables mangle
+// Client: srcip=1.1.1.1 dstip=2.2.2.2  ·  Server: srcip=2.2.2.2 dstip=1.1.1.1
 type MangleCfg struct {
 	SrcIP string `toml:"srcip"`
 	DstIP string `toml:"dstip"`
@@ -342,6 +342,11 @@ func validate(c *Config) error {
 	}
 	if err := validateMangle(&c.Mangle); err != nil {
 		return err
+	}
+	if wireSpoofEnabled(c) {
+		if err := validateWireSpoofTunnel(c.Tunnel.Type); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -32,6 +32,7 @@ type IcmpTunnel struct {
 	seq     atomic.Uint32
 	dedup   atomicSeqDedup
 	txDedup ipPktDedup
+	wire    wireSpoof
 	lastSrc atomic.Value
 	peerIP  [4]byte
 	localIP [4]byte
@@ -52,6 +53,7 @@ func (t *IcmpTunnel) Up() error {
 	}
 	t.peerIP = ipTo4(c.RemoteIP)
 	t.localIP = ipTo4(c.LocalIP)
+	t.wire = wireSpoofFrom(c)
 
 	header("icmp / " + c.Mode)
 	applyPerfFromConfig(c)
@@ -89,12 +91,17 @@ func (t *IcmpTunnel) Up() error {
 	applyTunnelTuning(c, dev)
 
 	step("raw ICMP socket...")
-	t.rawFd, err = openRawICMP()
+	if t.wire.on {
+		t.rawFd, err = openRawHdrIncl(unix.IPPROTO_ICMP)
+	} else {
+		t.rawFd, err = openRawICMP()
+	}
 	if err != nil {
 		return fmt.Errorf("SOCK_RAW: %w", err)
 	}
 	_ = unix.SetNonblock(t.rawFd, true)
 	logOK("raw ICMP socket ready")
+	logWireSpoof(t.wire)
 
 	addMSS(dev)
 	t.done = make(chan struct{})
@@ -159,7 +166,12 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 			}
 			frame := getICMPFrame()
 			seq := uint16(t.seq.Add(1))
-			built := buildICMPFrame(frame, icmpTunID, seq, payload)
+			var built []byte
+			if t.wire.on {
+				built = buildWireICMP(frame, t.wire.src, t.wire.wireHdrDst(), icmpTunID, seq, payload)
+			} else {
+				built = buildICMPFrame(frame, icmpTunID, seq, payload)
+			}
 			batch.add(frame, len(built), dst)
 			if batch.n >= bsz {
 				flush()
@@ -173,7 +185,8 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
-	peer, local := t.peerIP, t.localIP
+	peer := t.wire.wirePeer(t.peerIP)
+	local := t.localIP
 
 	for !t.stop.stopped() {
 		n, from, err := unix.Recvfrom(rawFd, buf, 0)
@@ -193,7 +206,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 			continue
 		}
 		sa, ok := from.(*unix.SockaddrInet4)
-		if !ok || sa.Addr == local || sa.Addr != peer {
+		if !ok || !acceptWirePeer(sa, local, peer, t.wire.src, t.wire) {
 			statInc(statICMPRxDropPeer)
 			continue
 		}

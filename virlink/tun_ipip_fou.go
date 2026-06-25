@@ -63,6 +63,10 @@ func (t *IpipFouTunnel) Up() error {
 	step("iptables MSS clamping...")
 	addMSS(dev)
 
+	if err := kernelTunnelWireUp(c); err != nil {
+		return err
+	}
+
 	done(dev, addr, peer,
 		fmt.Sprintf("FOU port : %d", port),
 		"test     : ping -c3 "+peer,
@@ -71,6 +75,7 @@ func (t *IpipFouTunnel) Up() error {
 }
 
 func (t *IpipFouTunnel) Down() error {
+	kernelTunnelWireDown(t.cfg)
 	delMSS(t.dev())
 	t.doClean()
 	logOK("ipip-fou torn down")
