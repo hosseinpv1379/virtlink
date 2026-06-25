@@ -1,10 +1,11 @@
-// logger.go — structured, human-friendly logging.
+// logger.go — structured logging with optional CPU activity profiling.
 //
-// Terminal (tty):  colored symbols + aligned columns
-// File / pipe  :  plain ISO timestamp + 3-char level tag (grep-friendly)
+// Levels (least → most verbose): error < warn < info < debug
+// Profile reports ([prof]) are independent — enable with [logging] profile = true
 //
-// All paths (setup helpers, heartbeat, daemon) route through printLog
-// so log files are 100% uniform.
+// Output formats:
+//   tty  : colored symbols + aligned columns
+//   file : "2026-06-25 10:00:00  INF  message"  (grep-friendly)
 package main
 
 import (
@@ -14,66 +15,93 @@ import (
 	"time"
 )
 
-var globalLogLevel = "info"
+type logLevel int
 
-func initLogger(level string) {
-	if level != "" {
-		globalLogLevel = level
+const (
+	lvlError logLevel = iota
+	lvlWarn
+	lvlInfo
+	lvlDebug
+)
+
+var globalLevel = lvlInfo
+
+func initLogger(cfg *LoggingCfg) {
+	switch strings.ToLower(cfg.Level) {
+	case "debug":
+		globalLevel = lvlDebug
+	case "warn", "warning":
+		globalLevel = lvlWarn
+	case "error":
+		globalLevel = lvlError
+	default:
+		globalLevel = lvlInfo
 	}
+	initProfiler(&Config{Logging: *cfg})
 }
+
+func levelAllows(min logLevel) bool { return globalLevel >= min }
 
 // ── public log functions ──────────────────────────────────────────────────────
 
 func logDebug(msg string) {
-	if globalLogLevel == "debug" {
-		printLog("DBG", msg)
+	if levelAllows(lvlDebug) {
+		emit("DBG", msg)
 	}
 }
 
 func logInfo(msg string) {
-	if globalLogLevel == "debug" || globalLogLevel == "info" {
-		printLog("INF", msg)
+	if levelAllows(lvlInfo) {
+		emit("INF", msg)
 	}
 }
 
 func logWarn(msg string) {
-	printLog("WRN", msg)
+	if levelAllows(lvlWarn) {
+		emit("WRN", msg)
+	}
 }
 
 func logError(msg string) {
-	printLog("ERR", msg)
+	emit("ERR", msg)
 }
 
-// printLog is the single output path.
-//
-// Plain  (file/pipe): "2026-06-24 19:10:01  INF  message"
-// tty:                "2026-06-24 19:10:01  ·    message"  (colored symbols)
-func printLog(level, msg string) {
+// logProfile emits CPU activity reports (only when profile=true).
+func logProfile(msg string) {
+	if profEnabled.Load() {
+		emit("PRF", msg)
+	}
+}
+
+// emit is the single output path.
+func emit(level, msg string) {
 	ts := time.Now().Format("2006-01-02 15:04:05")
 	if isatty() {
-		var sym string
-		switch level {
-		case "INF":
-			sym = cGray + "·" + cReset
-		case "WRN":
-			sym = cYellow + "⚠" + cReset
-		case "ERR":
-			sym = cRed + cBold + "✗" + cReset
-		case "DBG":
-			sym = cCyan + "·" + cReset
-		default:
-			sym = level
-		}
-		fmt.Printf("%s  %s  %s\n", cGray+ts+cReset, sym, msg)
+		fmt.Printf("%s  %s  %s\n", cGray+ts+cReset, levelSym(level), msg)
 	} else {
 		fmt.Printf("%s  %s  %s\n", ts, level, msg)
 	}
 }
 
+func levelSym(level string) string {
+	switch level {
+	case "INF":
+		return cGray + "·" + cReset
+	case "WRN":
+		return cYellow + "⚠" + cReset
+	case "ERR":
+		return cRed + cBold + "✗" + cReset
+	case "DBG":
+		return cCyan + "·" + cReset
+	case "PRF":
+		return cBlue + "◈" + cReset
+	default:
+		return level
+	}
+}
+
 // ── startup banner ────────────────────────────────────────────────────────────
 
-// printBanner prints a framed startup summary.
-// tty: Unicode box + colors.  file: plain ASCII.
 func printBanner(tunnelType, mode, localIP, remoteIP, overlay, peer, iface string,
 	healthPort, benchPort int) {
 
@@ -89,25 +117,22 @@ func printBanner(tunnelType, mode, localIP, remoteIP, overlay, peer, iface strin
 
 		row := func(k, v string) {
 			fmt.Printf("  %s%-10s%s  %s│%s  %s\n",
-				cGray, k, cReset,
-				cGray, cReset,
-				v)
+				cGray, k, cReset, cGray, cReset, v)
 		}
 		row("local", localIP)
 		row("peer", remoteIP)
 		row("overlay", cCyan+overlay+cReset+" → "+cGreen+peer+cReset)
 		row("device", cBold+iface+cReset)
-		row("health", fmt.Sprintf("http://0.0.0.0:%d/", healthPort))
-		row("bench", fmt.Sprintf("0.0.0.0:%d (GET /bench)", benchPort))
+		row("health", fmt.Sprintf("http://0.0.0.0:%d/health", healthPort))
+		row("bench", fmt.Sprintf("0.0.0.0:%d  profile=:%d/profile", benchPort, healthPort))
 		fmt.Printf("%s\n\n", cBlue+line+cReset)
 	} else {
-		// plain log lines (one per field for easy grep)
 		ts := time.Now().Format("2006-01-02 15:04:05")
 		fields := []string{
 			fmt.Sprintf("type=%s  mode=%s", tunnelType, mode),
 			fmt.Sprintf("local=%s  peer=%s", localIP, remoteIP),
 			fmt.Sprintf("overlay=%s  peer_overlay=%s  dev=%s", overlay, peer, iface),
-			fmt.Sprintf("health=:%d  bench=:%d", healthPort, benchPort),
+			fmt.Sprintf("health=:%d  bench=:%d  profile=:%d/profile", healthPort, benchPort, healthPort),
 		}
 		for _, f := range fields {
 			fmt.Printf("%s  INF  [start] %s\n", ts, f)
@@ -115,14 +140,14 @@ func printBanner(tunnelType, mode, localIP, remoteIP, overlay, peer, iface strin
 	}
 }
 
-// ── setup-phase helpers (called from tun_*.go Up()) ──────────────────────────
+// ── setup-phase helpers ───────────────────────────────────────────────────────
 
 func step(msg string) {
 	if isatty() {
 		ts := time.Now().Format("2006-01-02 15:04:05")
 		fmt.Printf("%s  %s  %s %s\n", cGray+ts+cReset, cGray+"·"+cReset, cCyan+"→"+cReset, msg)
 	} else {
-		printLog("INF", "[setup] "+msg)
+		emit("INF", "[setup] "+msg)
 	}
 }
 
@@ -131,23 +156,20 @@ func logOK(msg string) {
 		ts := time.Now().Format("2006-01-02 15:04:05")
 		fmt.Printf("%s  %s  %s %s\n", cGray+ts+cReset, cGray+"·"+cReset, cGreen+"✓"+cReset, msg)
 	} else {
-		printLog("INF", "[setup] ✓ "+msg)
+		emit("INF", "[setup] ✓ "+msg)
 	}
 }
 
-func warn(msg string) {
-	printLog("WRN", msg)
-}
+func warn(msg string) { logWarn(msg) }
 
 func header(title string) {
 	if isatty() {
 		fmt.Printf("\n%s  virlink %s\n\n", cBlue+"⬡"+cReset, cBold+title+cReset)
 	} else {
-		printLog("INF", "[start] "+title)
+		emit("INF", "[start] "+title)
 	}
 }
 
-// done is called after tunnel.Up() succeeds.
 func done(iface, overlay, peer string, extras ...string) {
 	if isatty() {
 		ts := time.Now().Format("2006-01-02 15:04:05")
@@ -162,27 +184,23 @@ func done(iface, overlay, peer string, extras ...string) {
 			fmt.Printf("                         %s\n", cGray+e+cReset)
 		}
 	} else {
-		printLog("INF", fmt.Sprintf("[up] dev=%s  overlay=%s  peer=%s", iface, overlay, peer))
+		emit("INF", fmt.Sprintf("[up] dev=%s  overlay=%s  peer=%s", iface, overlay, peer))
 		for _, e := range extras {
-			printLog("INF", "[up] "+e)
+			emit("INF", "[up] "+e)
 		}
 	}
 }
 
 // ── heartbeat formatting ──────────────────────────────────────────────────────
 
-// fmtHeartbeat builds the heartbeat message string.
-// Called by daemon.go printHeartbeat.
 func fmtHeartbeat(dev, linkState, hsState, lastProbe string,
 	rxB, txB, rxPkt, txPkt uint64, uptime time.Duration) string {
 
 	if isatty() {
-		// link color
 		lc := cGreen
 		if linkState != "UP" {
 			lc = cRed
 		}
-		// handshake color
 		hc := cGray
 		switch hsState {
 		case "connected":
@@ -208,7 +226,6 @@ func fmtHeartbeat(dev, linkState, hsState, lastProbe string,
 			probe,
 		)
 	}
-	// plain (file)
 	probe := ""
 	if lastProbe != "" {
 		probe = "  probe=" + lastProbe

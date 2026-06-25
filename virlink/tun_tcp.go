@@ -124,13 +124,17 @@ func (t *TcpTunnel) txLoop(tun *os.File) {
 			logWarn("tun read: " + err.Error())
 			continue
 		}
+		statInc(statTCPTxRead)
 		c := t.pickConn()
 		if c == nil {
+			statInc(statTCPTxNoConn)
 			continue
 		}
 		if err := tcpWriteFrame(c, buf[:n]); err != nil {
 			logDebug("tcp tx: " + err.Error())
 			t.clearConn(c)
+		} else {
+			statInc(statTCPTxSend)
 		}
 	}
 }
@@ -234,11 +238,14 @@ func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 			}
 			return
 		}
+		statInc(statTCPRxFrame)
 		if _, err := tun.Write(buf[:n]); err != nil {
 			if t.stop.stopped() {
 				return
 			}
 			logWarn("tun write: " + err.Error())
+		} else {
+			statInc(statTCPRxWrite)
 		}
 	}
 }

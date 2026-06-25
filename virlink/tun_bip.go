@@ -107,6 +107,7 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 				return
 			}
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				statInc(statBIPRxPoll)
 				_ = pollFD(rawFd, unix.POLLIN, idleMs)
 				if idleMs < 50 {
 					idleMs += pollMs
@@ -122,6 +123,7 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 		idleMs = pollMs
 		sa, ok := from.(*unix.SockaddrInet4)
 		if !ok || sa.Addr == local || sa.Addr != peer {
+			statInc(statBIPRxDrop)
 			continue
 		}
 		if n < 20 {
@@ -134,8 +136,11 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 		if t.cfg.Mode == "server" {
 			t.lastSrc.Store(sa.Addr)
 		}
+		statInc(statBIPRxRecv)
 		if err := tunWrite(tun, buf[ihl:n]); err != nil && !t.stop.stopped() {
 			logWarn("tun write: " + err.Error())
+		} else {
+			statInc(statBIPRxWrite)
 		}
 	}
 }
@@ -150,6 +155,7 @@ func (t *BipTunnel) txLoop(rawFd int, qfd *os.File) {
 	for !t.stop.stopped() {
 		n, err := tunReadNB(qfd, buf)
 		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			statInc(statBIPTxPoll)
 			_ = pollFD(tunFD, unix.POLLIN, idleMs)
 			if idleMs < 50 {
 				idleMs += pollMs
@@ -169,11 +175,15 @@ func (t *BipTunnel) txLoop(rawFd int, qfd *os.File) {
 		} else if v := t.lastSrc.Load(); v != nil {
 			dst = v.([4]byte)
 		} else {
+			statInc(statBIPTxNoDst)
 			continue
 		}
+		statInc(statBIPTxRead)
 		sa := &unix.SockaddrInet4{Addr: dst}
 		if err := unix.Sendto(rawFd, buf[:n], 0, sa); err != nil && err != unix.EAGAIN {
 			logDebug("bip tx: " + err.Error())
+		} else if err == nil {
+			statInc(statBIPTxSend)
 		}
 	}
 }

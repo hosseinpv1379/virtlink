@@ -157,12 +157,15 @@ func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File) {
 				}
 				break
 			}
+			statInc(statICMPTxRead)
 			dst, ok := t.resolveDst()
 			if !ok {
+				statInc(statICMPTxNoDst)
 				continue
 			}
 			payload := scratchPayload[:n]
 			if t.txDedup.dup(payload) {
+				statInc(statICMPTxDedup)
 				continue
 			}
 			frame := getICMPFrame()
@@ -172,6 +175,7 @@ func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File) {
 		}
 
 		if batch.n == 0 {
+			statInc(statICMPTxPoll)
 			_ = pollFD(tunFD, unix.POLLIN, idleMs)
 			// Back off exponentially up to 50 ms so idle goroutines don't spin.
 			if idleMs < 50 {
@@ -181,6 +185,7 @@ func (t *IcmpTunnel) txLoop(rawFd int, qfd *os.File) {
 		}
 		idleMs = baseMs // reset backoff on activity
 
+		statAdd(statICMPTxSend, uint64(batch.n))
 		icmpSendBatch(rawFd, &batch)
 		for i := 0; i < batch.n; i++ {
 			putICMPFrame(batch.frames[i])
@@ -201,6 +206,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 				return
 			}
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				statInc(statICMPRxPoll)
 				_ = pollFD(rawFd, unix.POLLIN, perfPollMs())
 				continue
 			}
@@ -212,6 +218,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 		}
 		sa, ok := from.(*unix.SockaddrInet4)
 		if !ok || sa.Addr == local || sa.Addr != peer {
+			statInc(statICMPRxDropPeer)
 			continue
 		}
 		if n < 20 {
@@ -223,10 +230,13 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 		}
 		icmp := buf[ihl:n]
 		if icmp[0] != icmpEchoReq || binary.BigEndian.Uint16(icmp[4:6]) != icmpTunID {
+			statInc(statICMPRxDropProto)
 			continue
 		}
+		statInc(statICMPRxRecv)
 		seq := binary.BigEndian.Uint16(icmp[6:8])
 		if t.dedup.dup(seq) {
+			statInc(statICMPRxDropSeq)
 			continue
 		}
 		inner := icmp[8:]
@@ -235,6 +245,8 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 		}
 		if err := tunWrite(tun, inner); err != nil && !t.stop.stopped() {
 			logWarn("tun write: " + err.Error())
+		} else {
+			statInc(statICMPRxWrite)
 		}
 	}
 }

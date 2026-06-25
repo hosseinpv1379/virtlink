@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-const version = "2.7.9"
+const version = "2.8.0"
 
 func main() {
 	cfgFile  := flag.String("c", "", "path to config.toml")
@@ -56,7 +56,7 @@ func main() {
 
 	case *doDown:
 		// one-shot teardown
-		initLogger(cfg.Logging.Level)
+		initLogger(&cfg.Logging)
 		logInfo("tearing down tunnel...")
 		if err := tun.Down(); err != nil {
 			logError("teardown: " + err.Error())

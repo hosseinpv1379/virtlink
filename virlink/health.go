@@ -208,6 +208,8 @@ func (h *HealthMgr) runHTTPServer(port int, tun Tunnel, bm *BenchMgr) {
 		http.Redirect(w, r, "/health", http.StatusFound)
 	})
 
+	mux.HandleFunc("/profile", handleProfileHTTP)
+
 	// GET /bench  — run upload+download test through the tunnel overlay
 	// Blocks until complete (up to ~60s), then returns and caches for 2min.
 	mux.HandleFunc("/bench", func(w http.ResponseWriter, r *http.Request) {
@@ -252,7 +254,7 @@ func (h *HealthMgr) runHTTPServer(port int, tun Tunnel, bm *BenchMgr) {
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 120 * time.Second, // bench can take up to 60s
 	}
-	logInfo(fmt.Sprintf("health HTTP  listen=0.0.0.0:%d  /health  /bench(port %d)", port, port+1))
+	logInfo(fmt.Sprintf("health HTTP  listen=0.0.0.0:%d  /health  /profile  /bench(port %d)", port, port+1))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logWarn(fmt.Sprintf("health HTTP: %v", err))
 	}

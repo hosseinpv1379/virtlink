@@ -114,16 +114,21 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 		var sip [4]byte
 		copy(sip[:], ip4)
 		if sip == local {
+			statInc(statUDPRxDrop)
 			continue
 		}
 		if t.cfg.Mode == "client" && sip != peer {
+			statInc(statUDPRxDrop)
 			continue
 		}
 		if t.cfg.Mode == "server" {
 			t.lastPeer.Store(src)
 		}
+		statInc(statUDPRxRecv)
 		if err := tunWrite(tun, buf[:n]); err != nil && !t.stop.stopped() {
 			logWarn("tun write: " + err.Error())
+		} else {
+			statInc(statUDPRxWrite)
 		}
 	}
 }
@@ -138,6 +143,7 @@ func (t *UdpTunnel) txLoop(conn *net.UDPConn, qfd *os.File) {
 	for !t.stop.stopped() {
 		n, err := tunReadNB(qfd, buf)
 		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			statInc(statUDPTxPoll)
 			_ = pollFD(tunFD, unix.POLLIN, idleMs)
 			if idleMs < 50 {
 				idleMs += pollMs
@@ -156,10 +162,14 @@ func (t *UdpTunnel) txLoop(conn *net.UDPConn, qfd *os.File) {
 			dst = p
 		}
 		if dst == nil {
+			statInc(statUDPTxNoDst)
 			continue
 		}
+		statInc(statUDPTxRead)
 		if _, err := conn.WriteToUDP(buf[:n], dst); err != nil && !t.stop.stopped() {
 			logDebug("udp tx: " + err.Error())
+		} else if err == nil {
+			statInc(statUDPTxSend)
 		}
 	}
 }

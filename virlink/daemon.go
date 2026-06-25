@@ -20,7 +20,7 @@ import (
 )
 
 func runDaemon(cfg *Config, tun Tunnel) int {
-	initLogger(cfg.Logging.Level)
+	initLogger(&cfg.Logging)
 	header(fmt.Sprintf("%s · %s", cfg.Tunnel.Type, cfg.Tunnel.Mode))
 
 	// ── 1. bring up the tunnel ────────────────────────────────────────────────
@@ -77,7 +77,7 @@ func runDaemon(cfg *Config, tun Tunnel) int {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// ── 6. heartbeat loop ────────────────────────────────────────────────────
+	// ── 6. heartbeat + CPU profiler ───────────────────────────────────────────
 	stopHB := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(ivDur)
@@ -91,6 +91,7 @@ func runDaemon(cfg *Config, tun Tunnel) int {
 			}
 		}
 	}()
+	go startProfileLoop(stopHB)
 
 	// ── 7. wait ───────────────────────────────────────────────────────────────
 	sig := <-sigCh

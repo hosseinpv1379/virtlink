@@ -515,7 +515,9 @@ multipath    = ${multipath}
 channel_size  = 10_000
 
 [logging]
-level = "info"
+level            = "info"
+profile          = true
+profile_interval = 30
 
 [health]
 disabled = false

@@ -77,7 +77,9 @@ type TuningCfg struct {
 
 // LoggingCfg maps to [logging]
 type LoggingCfg struct {
-	Level string `toml:"level"` // debug | info | warn | error
+	Level           string `toml:"level"`            // debug | info | warn | error
+	Profile         bool   `toml:"profile"`          // periodic CPU activity report
+	ProfileInterval int    `toml:"profile_interval"` // seconds between reports (default 30)
 }
 
 // ObfsCfg maps to [obfs] — shared crypto config for udp-obfs tunnel.
