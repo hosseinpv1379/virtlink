@@ -70,16 +70,21 @@ func (b *icmpTxBatch) add(frame []byte, pktLen int, dst [4]byte) {
 }
 
 // icmpSendBatch sends batched ICMP frames; falls back to Sendto per packet.
-func icmpSendBatch(rawFd int, b *icmpTxBatch) {
+// Returns the number of packets that failed to send.
+func icmpSendBatch(rawFd int, b *icmpTxBatch) int {
 	if b.n == 0 {
-		return
+		return 0
 	}
+	errs := 0
 	sent, err := sendmmsg(rawFd, b.msgs[:b.n])
 	if err != nil && sent <= 0 {
 		sent = 0
 	}
 	for i := sent; i < b.n; i++ {
 		sa := &unix.SockaddrInet4{Addr: b.addrs[i].Addr}
-		_ = unix.Sendto(rawFd, b.frames[i][:b.lens[i]], 0, sa)
+		if e := unix.Sendto(rawFd, b.frames[i][:b.lens[i]], 0, sa); e != nil && e != unix.EAGAIN {
+			errs++
+		}
 	}
+	return errs
 }

@@ -77,16 +77,15 @@ func buildWireUDP(frame []byte, src, dst [4]byte, srcPort, dstPort uint16, paylo
 	return pkt
 }
 
-func openRawHdrIncl(proto int) (int, error) {
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, proto)
+// openRawWire uses IPPROTO_RAW to send/receive complete IPv4 packets (like hping3).
+// IP_HDRINCL on IPPROTO_ICMP/UDP is unreliable on many kernels — packets never leave the host.
+func openRawWire() (int, error) {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_RAW)
 	if err != nil {
 		return 0, err
 	}
-	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_HDRINCL, 1); err != nil {
-		unix.Close(fd)
-		return 0, err
-	}
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_FREEBIND, 1)
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_TRANSPARENT, 1)
 	tuneRawSock(fd)
 	return fd, nil
 }
@@ -114,14 +113,26 @@ func parseUDPInner(pkt []byte) (payload []byte, ok bool) {
 	return pkt[ihl+udpHdrLen:], true
 }
 
-func acceptWirePeer(sa *unix.SockaddrInet4, local, peer, spoofSrc [4]byte, w wireSpoof) bool {
+func acceptWirePeer(pkt []byte, sa *unix.SockaddrInet4, local, peer, spoofSrc [4]byte, w wireSpoof, wantProto byte) bool {
+	if w.on {
+		_, ok := parseIPv4Payload(pkt)
+		if !ok {
+			return false
+		}
+		if wantProto != 0 && pkt[9] != wantProto {
+			return false
+		}
+		var src [4]byte
+		copy(src[:], pkt[12:16])
+		if src == local || src == spoofSrc {
+			return false
+		}
+		return src == peer
+	}
 	if sa == nil {
 		return false
 	}
 	if sa.Addr == local {
-		return false
-	}
-	if w.on && sa.Addr == spoofSrc {
 		return false
 	}
 	return sa.Addr == peer

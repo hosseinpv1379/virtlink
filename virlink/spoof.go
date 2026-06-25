@@ -1,6 +1,6 @@
 // spoof.go — optional wire IP spoofing ([mangle] srcip / dstip).
 //
-// Userspace tunnels (icmp/udp/bip): IP_HDRINCL in-process.
+// Userspace tunnels (icmp/udp/bip): IPPROTO_RAW in-process.
 // TX outer IP: src=srcip, dst=real remote_ip (like hping3 -a).
 // RX accept: outer src = peer's srcip (= our mangle dstip).
 package main
@@ -8,6 +8,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"sync/atomic"
 )
 
 const ipHdrLen = 20
@@ -82,6 +83,17 @@ func logWireSpoof(w wireSpoof) {
 	if !w.on {
 		return
 	}
-	logOK("wire spoof enabled (userspace IP_HDRINCL)")
+	logOK("wire spoof enabled (IPPROTO_RAW)")
 	logDebug(fmt.Sprintf("wire spoof srcip=%v dstip=%v", w.src, w.dst))
+}
+
+var wireTxErrWarned atomic.Bool
+
+func noteWireTxErr(n int) {
+	if n <= 0 {
+		return
+	}
+	if wireTxErrWarned.CompareAndSwap(false, true) {
+		logWarn(fmt.Sprintf("wire tx: %d packet(s) failed — run as root, set rp_filter=0, check firewall", n))
+	}
 }

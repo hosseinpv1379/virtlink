@@ -1,4 +1,4 @@
-# spooftest · icmp · CLIENT (userspace IP_HDRINCL spoof)
+# spooftest · icmp · CLIENT (userspace IPPROTO_RAW spoof)
 # فایروال: proto 1 (ICMP) بین IPهای واقعی
 
 [tunnel]

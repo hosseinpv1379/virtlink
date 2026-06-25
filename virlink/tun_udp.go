@@ -79,12 +79,12 @@ func (t *UdpTunnel) Up() error {
 	applyTunnelTuning(c, dev)
 
 	if t.wire.on {
-		t.rawFd, err = openRawHdrIncl(unix.IPPROTO_UDP)
+		t.rawFd, err = openRawWire()
 		if err != nil {
 			return fmt.Errorf("SOCK_RAW udp: %w", err)
 		}
 		_ = unix.SetNonblock(t.rawFd, true)
-		logOK(fmt.Sprintf("raw UDP (IP_HDRINCL) :%d", port))
+		logOK(fmt.Sprintf("raw UDP (IPPROTO_RAW) :%d", port))
 		logWireSpoof(t.wire)
 	} else {
 		t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{Port: port})
@@ -145,7 +145,7 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 		}
 		idleMs = pollMs
 		sa, ok := from.(*unix.SockaddrInet4)
-		if !ok || !acceptWirePeer(sa, local, peer, t.wire.src, t.wire) {
+		if !ok || !acceptWirePeer(buf[:n], sa, local, peer, t.wire.src, t.wire, unix.IPPROTO_UDP) {
 			statInc(statUDPRxDrop)
 			continue
 		}
@@ -193,7 +193,7 @@ func (t *UdpTunnel) txPollLoopRaw(rawFd int, port int) {
 			out := buildWireUDP(frame, t.wire.src, routeDst, uint16(port), uint16(port), pkt[:n])
 			sa := &unix.SockaddrInet4{Addr: routeDst}
 			if err := unix.Sendto(rawFd, out, 0, sa); err != nil && err != unix.EAGAIN {
-				logDebug("udp tx: " + err.Error())
+				noteWireTxErr(1)
 			} else if err == nil {
 				statInc(statUDPTxSend)
 			}

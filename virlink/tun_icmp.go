@@ -95,7 +95,7 @@ func (t *IcmpTunnel) Up() error {
 
 	step("raw ICMP socket...")
 	if t.wire.on {
-		t.rawFd, err = openRawHdrIncl(unix.IPPROTO_ICMP)
+		t.rawFd, err = openRawWire()
 	} else {
 		t.rawFd, err = openRawICMP()
 	}
@@ -145,7 +145,9 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 			return
 		}
 		statAdd(statICMPTxSend, uint64(batch.n))
-		icmpSendBatch(rawFd, &batch)
+		if nerr := icmpSendBatch(rawFd, &batch); nerr > 0 {
+			noteWireTxErr(nerr)
+		}
 		for i := 0; i < batch.n; i++ {
 			putICMPFrame(batch.frames[i])
 			batch.frames[i] = nil
@@ -209,7 +211,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 			continue
 		}
 		sa, ok := from.(*unix.SockaddrInet4)
-		if !ok || !acceptWirePeer(sa, local, peer, t.wire.src, t.wire) {
+		if !ok || !acceptWirePeer(buf[:n], sa, local, peer, t.wire.src, t.wire, unix.IPPROTO_ICMP) {
 			statInc(statICMPRxDropPeer)
 			continue
 		}

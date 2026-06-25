@@ -76,7 +76,7 @@ func (t *BipTunnel) Up() error {
 	applyTunnelTuning(c, dev)
 
 	if t.wire.on {
-		t.rawFd, err = openRawHdrIncl(bipProto)
+		t.rawFd, err = openRawWire()
 	} else {
 		t.rawFd, err = unix.Socket(unix.AF_INET, unix.SOCK_RAW, bipProto)
 	}
@@ -130,7 +130,7 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 		}
 		idleMs = pollMs
 		sa, ok := from.(*unix.SockaddrInet4)
-		if !ok || !acceptWirePeer(sa, local, peer, t.wire.src, t.wire) {
+		if !ok || !acceptWirePeer(buf[:n], sa, local, peer, t.wire.src, t.wire, bipProto) {
 			statInc(statBIPRxDrop)
 			continue
 		}
@@ -180,7 +180,7 @@ func (t *BipTunnel) txPollLoop(rawFd int) {
 			}
 			sa := &unix.SockaddrInet4{Addr: routeDst}
 			if err := unix.Sendto(rawFd, out, 0, sa); err != nil && err != unix.EAGAIN {
-				logDebug("bip tx: " + err.Error())
+				noteWireTxErr(1)
 			} else if err == nil {
 				statInc(statBIPTxSend)
 			}
