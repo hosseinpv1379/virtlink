@@ -150,7 +150,15 @@ func nlRouteECMPWithSrc(dst, src string, devs ...string) error {
 			Hops:      0,
 		})
 	}
-	return netlink.RouteReplace(route)
+	if err := netlink.RouteReplace(route); err != nil {
+		// Some kernels reject multipath+src; fall back to first connected worker.
+		return netlink.RouteReplace(&netlink.Route{
+			LinkIndex: route.MultiPath[0].LinkIndex,
+			Dst:       dstNet,
+			Src:       srcIP,
+		})
+	}
+	return nil
 }
 
 // nlRouteECMP installs an ECMP /32 host route via multiple devices.
