@@ -158,7 +158,6 @@ user nobody
 group nogroup
 %s
 tls-server
-duplicate-cn
 ifconfig %s %s
 `, perf, proto, port, ovpnProto, dev,
 		filepath.Join(pkiDir, "ca.crt"),
