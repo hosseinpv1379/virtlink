@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.7"
+SCRIPT_VERSION="1.2.8"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -1337,22 +1337,26 @@ openvpn_cert_needs_openssl3_upgrade() {
 
 openvpn_sign_server_cert() {
   local dir="$1"
-  openssl req -new -key "$dir/server.key" -out "$dir/server.csr" -subj "/CN=vl-srv" 2>/dev/null
+  openssl req -new -key "$dir/server.key" -out "$dir/server.csr" -subj "/CN=vl-srv" \
+    || die "OpenSSL: cannot create server CSR"
   openssl x509 -req -days 3650 -in "$dir/server.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
     -CAcreateserial -out "$dir/server.crt" \
     -addext "basicConstraints=CA:FALSE" \
-    -addext "keyUsage=digitalSignature,keyEncipherment" \
-    -addext "extendedKeyUsage=serverAuth" 2>/dev/null
+    -addext "keyUsage=digitalSignature" \
+    -addext "extendedKeyUsage=serverAuth" \
+    || die "OpenSSL: cannot sign server certificate (need OpenSSL 1.1.1+ with -addext)"
 }
 
 openvpn_sign_client_cert() {
   local dir="$1"
-  openssl req -new -key "$dir/client.key" -out "$dir/client.csr" -subj "/CN=vl-cli" 2>/dev/null
+  openssl req -new -key "$dir/client.key" -out "$dir/client.csr" -subj "/CN=vl-cli" \
+    || die "OpenSSL: cannot create client CSR"
   openssl x509 -req -days 3650 -in "$dir/client.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
     -CAcreateserial -out "$dir/client.crt" \
     -addext "basicConstraints=CA:FALSE" \
-    -addext "keyUsage=digitalSignature,keyEncipherment" \
-    -addext "extendedKeyUsage=clientAuth" 2>/dev/null
+    -addext "keyUsage=digitalSignature" \
+    -addext "extendedKeyUsage=clientAuth" \
+    || die "OpenSSL: cannot sign client certificate (need OpenSSL 1.1.1+ with -addext)"
 }
 
 openvpn_upgrade_pki_openssl3() {
@@ -1385,21 +1389,27 @@ openvpn_gen_pki() {
   fi
 
   info "Generating OpenVPN PKI (ECDSA P-256, tls-crypt, OpenSSL 3 extensions)..."
-  openssl ecparam -genkey -name prime256v1 -out "$dir/ca.key" 2>/dev/null
+  openssl ecparam -genkey -name prime256v1 -out "$dir/ca.key" \
+    || die "OpenSSL: cannot generate CA key (install openssl)"
   openssl req -new -x509 -days 3650 -key "$dir/ca.key" -out "$dir/ca.crt" \
     -subj "/CN=vl-ca" \
-    -addext "basicConstraints=critical,CA:TRUE,keyCertSign" 2>/dev/null
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    || die "OpenSSL: cannot create CA certificate"
 
-  openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" 2>/dev/null
+  openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" \
+    || die "OpenSSL: cannot generate server key"
   openvpn_sign_server_cert "$dir"
 
-  openssl ecparam -genkey -name prime256v1 -out "$dir/client.key" 2>/dev/null
+  openssl ecparam -genkey -name prime256v1 -out "$dir/client.key" \
+    || die "OpenSSL: cannot generate client key"
   openvpn_sign_client_cert "$dir"
 
   if openvpn --genkey tls-crypt "$dir/tc.key" 2>/dev/null; then
     :
   else
-    openvpn --genkey secret "$dir/tc.key"
+    openvpn --genkey secret "$dir/tc.key" \
+      || die "OpenVPN: cannot generate tls-crypt key (tc.key)"
   fi
 
   rm -f "$dir/server.csr" "$dir/client.csr"
