@@ -141,6 +141,9 @@ func printHeartbeat(tun Tunnel, fwdRules []ForwardRule, since time.Time, hm *Hea
 	if hm != nil {
 		hsState = hm.Handshake()
 		lastProbe = hm.LastSeenStr()
+	} else if _, ok := tun.(*Hysteria2Tunnel); ok {
+		hsState = "hy2"
+		lastProbe = "n/a (check hysteria2 log)"
 	}
 
 	msg := fmtHeartbeat(dev, linkState, hsState, lastProbe,

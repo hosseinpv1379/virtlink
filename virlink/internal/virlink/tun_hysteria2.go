@@ -1,16 +1,19 @@
-// tun_hysteria2.go — Hysteria2 tunnel via the hysteria core (external daemon).
+// tun_hysteria2.go — Hysteria2 site-to-site via QUIC + UDP forwarding.
 //
-// Server: hysteria server + kernel TUN with overlay IP for health/probes.
-// Client: hysteria client with built-in TUN (QUIC/UDP, good for filtered paths).
+// Hysteria's built-in TUN is a client-only transparent proxy (no ICMP, no bidirectional
+// L3 VPN). Both sides use a real virlink kernel TUN; inner IP frames ride UDP on
+// 127.0.0.1:wrapPort, forwarded through QUIC by the hysteria client's udpForwarding.
 package virlink
 
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,10 +25,14 @@ const hysteria2Subnet = "10.20.52.0/30"
 type Hysteria2Tunnel struct {
 	cfg           *Config
 	cmd           *exec.Cmd
+	tun           *TunDev
+	udpConn       *net.UDPConn
+	wrapAddr      *net.UDPAddr // client: hysteria udpForwarding listen target
 	lockFd        *os.File
-	tunFd         *os.File // server: keeps overlay TUN up
 	pidPath       string
 	savedRpFilter []savedSysctl
+	stop          stoppedFlag
+	lastPeer      atomic.Value // *net.UDPAddr — server wrap return path
 }
 
 func (t *Hysteria2Tunnel) DevName() string {
@@ -38,9 +45,12 @@ func (t *Hysteria2Tunnel) DevName() string {
 func (t *Hysteria2Tunnel) OverlayIP() string { return overlayAddr(t.cfg, hysteria2Subnet) }
 func (t *Hysteria2Tunnel) PeerIP() string    { return peerAddr(t.cfg, hysteria2Subnet) }
 
-// hysteria2TunCIDR returns the /30 address Hysteria2 TUN requires (docs mandate /30).
-func hysteria2TunCIDR(cfg *Config) string {
-	return plainIP(overlayAddr(cfg, hysteria2Subnet)) + "/30"
+func hysteria2WrapPort(c *Config) int {
+	port := c.Transport.Port
+	if port == 0 {
+		port = 443
+	}
+	return 10000 + port
 }
 
 func (t *Hysteria2Tunnel) Up() error {
@@ -57,17 +67,23 @@ func (t *Hysteria2Tunnel) Up() error {
 	}
 
 	dev := t.DevName()
-	addr := hysteria2TunCIDR(c)
+	addr := t.OverlayIP()
 	peer := t.PeerIP()
 	port := c.Transport.Port
 	if port == 0 {
 		port = 443
+	}
+	wrapPort := hysteria2WrapPort(c)
+	mtu := c.Tunnel.MTU
+	if mtu == 0 {
+		mtu = 1400
 	}
 
 	header("hysteria2 / " + c.Mode)
 	applyPerfFromConfig(c)
 	step("cleanup...")
 	t.doClean()
+	t.stop.reset()
 
 	var err error
 	t.lockFd, err = acquireTunnelLock(dev)
@@ -75,11 +91,38 @@ func (t *Hysteria2Tunnel) Up() error {
 		return err
 	}
 
+	step(fmt.Sprintf("TUN device %s ×%d queues...", dev, perfTunQueues()))
+	t.tun, err = openTunMulti(dev, perfTunQueues())
+	if err != nil {
+		return fmt.Errorf("tun: %w", err)
+	}
+	l, err := netlink.LinkByName(dev)
+	if err != nil {
+		return fmt.Errorf("link %s: %w", dev, err)
+	}
+	if err := netlink.LinkSetMTU(l, mtu); err != nil {
+		return fmt.Errorf("mtu: %w", err)
+	}
+	a, err := netlink.ParseAddr(addr)
+	if err != nil {
+		return fmt.Errorf("parse overlay %s: %w", addr, err)
+	}
+	if err := netlink.AddrAdd(l, a); err != nil {
+		return fmt.Errorf("addr: %w", err)
+	}
+	if err := netlink.LinkSetUp(l); err != nil {
+		return fmt.Errorf("link up %s: %w", err)
+	}
+	logOK(fmt.Sprintf("%s  %s  MTU=%d  queues=%d", dev, addr, mtu, t.tun.QueueCount()))
+
 	if c.Mode == "server" {
-		step("creating overlay TUN " + dev + "...")
-		if err := t.setupServerTun(dev, addr); err != nil {
-			return err
+		step(fmt.Sprintf("UDP wrap listener 127.0.0.1:%d...", wrapPort))
+		t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wrapPort})
+		if err != nil {
+			return fmt.Errorf("udp wrap :%d: %w", wrapPort, err)
 		}
+		tuneUDPConn(t.udpConn)
+		logOK(fmt.Sprintf("UDP wrap 127.0.0.1:%d", wrapPort))
 	}
 
 	subcmd := "client"
@@ -107,14 +150,35 @@ func (t *Hysteria2Tunnel) Up() error {
 	}
 	go func() { _ = logFile.Close() }()
 
-	step("waiting for TUN device " + dev + "...")
-	if err := waitForHysteria2(dev, logPath, t.cmd, c.Mode, 120*time.Second); err != nil {
+	step("waiting for hysteria...")
+	if err := waitForHysteria2(logPath, t.cmd, c.Mode, 120*time.Second); err != nil {
 		t.stopProcess()
 		return err
 	}
 
-	if l, err := netlink.LinkByName(dev); err == nil && c.Tunnel.MTU > 0 {
-		_ = netlink.LinkSetMTU(l, c.Tunnel.MTU)
+	if c.Mode == "client" {
+		// hysteria client binds udpForwarding on 127.0.0.1:wrapPort — we send there from an ephemeral port.
+		step(fmt.Sprintf("UDP wrap socket → hysteria 127.0.0.1:%d...", wrapPort))
+		t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+		if err != nil {
+			return fmt.Errorf("udp wrap socket: %w", err)
+		}
+		tuneUDPConn(t.udpConn)
+		t.wrapAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wrapPort}
+		logOK(fmt.Sprintf("UDP wrap → 127.0.0.1:%d", wrapPort))
+		step("keepalive...")
+		if _, err := t.udpConn.WriteToUDP([]byte{0}, t.wrapAddr); err != nil {
+			logWarn("wrap keepalive: " + err.Error())
+		}
+	}
+
+	tun0 := t.tun.Fd0()
+	if c.Mode == "server" {
+		go t.rxLoopServer(t.udpConn, tun0)
+		go t.txPollLoopServer(t.udpConn)
+	} else {
+		go t.rxLoopClient(t.udpConn, tun0)
+		go t.txPollLoopClient(t.udpConn)
 	}
 
 	if c.Mode == "client" {
@@ -127,44 +191,103 @@ func (t *Hysteria2Tunnel) Up() error {
 	addMSS(dev)
 
 	logOK(fmt.Sprintf("hysteria2 running  pid=%d  dev=%s", t.cmd.Process.Pid, dev))
-	logOK(fmt.Sprintf("overlay %s  peer %s", addr, peer))
+	logOK(fmt.Sprintf("overlay %s  peer %s  wrap :%d", addr, peer, wrapPort))
 
 	done(dev, addr, peer,
-		fmt.Sprintf("transport : Hysteria2 QUIC :%d", port),
+		fmt.Sprintf("transport : Hysteria2 QUIC :%d  wrap UDP :%d", port, wrapPort),
 		"config    : "+hy.Config,
 		"log       : "+logPath,
-		"test      : echo test | nc -u -w2 "+peer+" 9999  (on peer: nc -ul 9999)",
-		"note      : ping RTT is NOT valid on hy2 TUN — use nc/iperf3 for real latency",
+		"test      : ping -c3 "+peer,
+		"test      : echo test | nc -u -w2 "+peer+" 9999  (peer: nc -ul 9999)",
 	)
 	return nil
 }
 
-func (t *Hysteria2Tunnel) setupServerTun(dev, addr string) error {
-	fd, err := openTunDev(dev)
-	if err != nil {
-		return fmt.Errorf("server TUN: %w", err)
+func (t *Hysteria2Tunnel) rxLoopServer(conn *net.UDPConn, tun *os.File) {
+	buf := getBuf()
+	defer putBuf(buf)
+	for {
+		n, src, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if t.stop.stopped() {
+				return
+			}
+			continue
+		}
+		t.lastPeer.Store(src)
+		statInc(statUDPRxRecv)
+		if err := tunWrite(tun, buf[:n]); err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
+		} else {
+			statInc(statUDPRxWrite)
+		}
 	}
-	t.tunFd = fd
+}
 
-	l, err := netlink.LinkByName(dev)
-	if err != nil {
-		return fmt.Errorf("link %s: %w", dev, err)
+func (t *Hysteria2Tunnel) txPollLoopServer(conn *net.UDPConn) {
+	poller := newTunPoller(t.tun, &t.stop)
+	defer poller.close()
+
+	poller.Run(
+		func() { statInc(statUDPTxPoll) },
+		func(pkt []byte, n int) bool {
+			statInc(statUDPTxRead)
+			p, ok := t.lastPeer.Load().(*net.UDPAddr)
+			if !ok || p == nil {
+				statInc(statUDPTxNoDst)
+				return true
+			}
+			if _, err := conn.WriteToUDP(pkt[:n], p); err != nil && !t.stop.stopped() {
+				logDebug("udp wrap tx: " + err.Error())
+			} else if err == nil {
+				statInc(statUDPTxSend)
+			}
+			return !t.stop.stopped()
+		},
+	)
+}
+
+func (t *Hysteria2Tunnel) rxLoopClient(conn *net.UDPConn, tun *os.File) {
+	buf := getBuf()
+	defer putBuf(buf)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			if t.stop.stopped() {
+				return
+			}
+			continue
+		}
+		statInc(statUDPRxRecv)
+		if err := tunWrite(tun, buf[:n]); err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
+		} else {
+			statInc(statUDPRxWrite)
+		}
 	}
-	mtu := t.cfg.Tunnel.MTU
-	if mtu == 0 {
-		mtu = 1400
-	}
-	_ = netlink.LinkSetMTU(l, mtu)
-	a, err := netlink.ParseAddr(addr)
-	if err != nil {
-		return fmt.Errorf("parse overlay %s: %w", addr, err)
-	}
-	_ = netlink.AddrReplace(l, a)
-	if err := netlink.LinkSetUp(l); err != nil {
-		return fmt.Errorf("link up %s: %w", dev, err)
-	}
-	logOK(fmt.Sprintf("%s  %s  (server overlay)", dev, addr))
-	return nil
+}
+
+func (t *Hysteria2Tunnel) txPollLoopClient(conn *net.UDPConn) {
+	poller := newTunPoller(t.tun, &t.stop)
+	defer poller.close()
+	dst := t.wrapAddr
+
+	poller.Run(
+		func() { statInc(statUDPTxPoll) },
+		func(pkt []byte, n int) bool {
+			statInc(statUDPTxRead)
+			if dst == nil {
+				statInc(statUDPTxNoDst)
+				return true
+			}
+			if _, err := conn.WriteToUDP(pkt[:n], dst); err != nil && !t.stop.stopped() {
+				logDebug("udp wrap tx: " + err.Error())
+			} else if err == nil {
+				statInc(statUDPTxSend)
+			}
+			return !t.stop.stopped()
+		},
+	)
 }
 
 func (t *Hysteria2Tunnel) Down() error {
@@ -198,11 +321,17 @@ func (t *Hysteria2Tunnel) restoreHysteria2ClientRpFilter() {
 }
 
 func (t *Hysteria2Tunnel) doClean() {
+	t.stop.stop()
 	t.stopProcess()
 	t.restoreHysteria2ClientRpFilter()
-	if t.tunFd != nil {
-		_ = t.tunFd.Close()
-		t.tunFd = nil
+	if t.udpConn != nil {
+		t.udpConn.Close()
+		t.udpConn = nil
+	}
+	t.wrapAddr = nil
+	if t.tun != nil {
+		t.tun.Close()
+		t.tun = nil
 	}
 	if t.lockFd != nil {
 		releaseTunnelLock(t.lockFd)
@@ -243,14 +372,15 @@ func (t *Hysteria2Tunnel) Status() {
 		fmt.Printf("  hysteria pid: %d\n", t.cmd.Process.Pid)
 	}
 	fmt.Printf("  config: %s\n", t.cfg.Hysteria2.Config)
+	fmt.Printf("  wrap port: %d\n", hysteria2WrapPort(t.cfg))
 }
 
-func waitForHysteria2(dev, logPath string, cmd *exec.Cmd, mode string, timeout time.Duration) error {
+func waitForHysteria2(logPath string, cmd *exec.Cmd, mode string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if cmd != nil && !hysteria2ProcessAlive(cmd) {
-			return fmt.Errorf("hysteria exited before %s came up:\n%s",
-				dev, hysteria2LogTail(logPath, 30))
+			return fmt.Errorf("hysteria exited before ready:\n%s",
+				hysteria2LogTail(logPath, 30))
 		}
 		if logPath != "" && hysteria2LogFailed(logPath) {
 			return fmt.Errorf("hysteria failed (see %s):\n%s", logPath, hysteria2LogTail(logPath, 30))
@@ -259,18 +389,17 @@ func waitForHysteria2(dev, logPath string, cmd *exec.Cmd, mode string, timeout t
 			if logPath != "" && hysteria2LogContains(logPath, "server up and running") {
 				return nil
 			}
-		} else if linkUp(dev) && logPath != "" &&
-			hysteria2LogContains(logPath, "connected to server") {
+		} else if logPath != "" && hysteria2LogContains(logPath, "connected to server") {
 			return nil
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	hint := "check " + logPath + " — server running? UDP port open on Hetzner? auth/TLS/obfs match?"
+	hint := "check " + logPath + " — server running? UDP port open? auth/TLS/obfs match?"
 	if logPath != "" {
-		return fmt.Errorf("timeout waiting for %s (%s):\n%s",
-			dev, hint, hysteria2LogTail(logPath, 30))
+		return fmt.Errorf("timeout waiting for hysteria (%s):\n%s",
+			hint, hysteria2LogTail(logPath, 30))
 	}
-	return fmt.Errorf("timeout waiting for interface %s", dev)
+	return fmt.Errorf("timeout waiting for hysteria")
 }
 
 func hysteria2LogFailed(path string) bool {
