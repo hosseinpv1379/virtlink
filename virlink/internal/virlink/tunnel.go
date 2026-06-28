@@ -39,6 +39,8 @@ func newTunnel(cfg *Config) (Tunnel, error) {
 		return &OpenvpnTunnel{cfg: cfg}, nil
 	case "hysteria2":
 		return &Hysteria2Tunnel{cfg: cfg}, nil
+	case "wireguard":
+		return &WireGuardTunnel{cfg: cfg}, nil
 	case "udp":
 		return &UdpTunnel{cfg: cfg}, nil
 	case "icmp":

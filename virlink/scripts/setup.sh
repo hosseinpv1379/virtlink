@@ -32,7 +32,7 @@ readonly -a KERNEL_TUNNEL_KEYS=(
   gre-fou ipip-fou bonded-gre-fou l2tpv3 gre-fou-ipsec gre
 )
 readonly -a USERSPACE_TUNNEL_KEYS=(
-  icmp udp bip tcp udp-obfs openvpn hysteria2
+  icmp udp bip tcp udp-obfs openvpn hysteria2 wireguard
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -540,6 +540,30 @@ ensure_openvpn_deps() {
   ok "OpenVPN core installed"
 }
 
+_wireguard_pkg_name() {
+  case "$(_detect_pkg_mgr)" in
+    dnf|yum|zypper) echo wireguard-tools ;;
+    pacman)         echo wireguard-tools ;;
+    apk)            echo wireguard-tools-wg ;;
+    *)              echo wireguard-tools ;;
+  esac
+}
+
+ensure_wireguard_deps() {
+  local -a need=() c pkg
+  for c in wg; do
+    command -v "$c" &>/dev/null || need+=("$(_wireguard_pkg_name)")
+  done
+  ((${#need[@]})) || { ok "WireGuard ready (wg)"; return 0; }
+  require_root
+  warn "WireGuard tools missing — installing wireguard-tools..."
+  _pkg_install "${need[@]}"
+  for c in wg; do
+    command -v "$c" &>/dev/null || die "'${c}' still missing after install"
+  done
+  ok "WireGuard tools installed"
+}
+
 ensure_hysteria2_deps() {
   if command -v hysteria &>/dev/null; then
     ok "Hysteria2 ready ($(hysteria version 2>/dev/null | head -1 || echo hysteria))"
@@ -630,6 +654,9 @@ tunnel_start() {
   fi
   if [[ "$(_cfg_tunnel_type "$cfg")" == "hysteria2" ]]; then
     ensure_hysteria2_deps
+  fi
+  if [[ "$(_cfg_tunnel_type "$cfg")" == "wireguard" ]]; then
+    ensure_wireguard_deps
   fi
   write_service_file "$name"
   local svc; svc="$(svc_name "$name")"
@@ -848,6 +875,7 @@ bip            — BIP tunnel (proto 58)             DPI bypass
 tcp            — User-space TCP tunnel             auto-reconnect
 openvpn        — OpenVPN core (encrypted link)     UDP/TCP · high throughput
 hysteria2      — Hysteria2 QUIC tunnel             fast · censorship-resistant
+wireguard      — WireGuard (kernel crypto)         UDP · fast site-to-site
 udp-obfs       — Obfuscated UDP (AES-256-GCM)      DPI bypass (Iran)
 EOF
 }
@@ -884,6 +912,7 @@ dispatch_tunnel_generator() {
     tcp)            gen_tcp      ;;
     openvpn)        gen_openvpn  ;;
     hysteria2)     gen_hysteria2 ;;
+    wireguard)     gen_wireguard ;;
     udp)            gen_udp      ;;
     icmp)           gen_icmp     ;;
     bip)            gen_bip      ;;
@@ -1012,6 +1041,10 @@ profile_interval = 30
 [health]
 disabled = true
 EOF
+      return
+      ;;
+    wireguard)
+      write_openvpn_tuning "$file" "fast"
       return
       ;;
     *)
@@ -2247,6 +2280,7 @@ virlink_make_client_toml() {
     -e "s|^remote_ip = .*|remote_ip = \"${server_pub}\"|" \
     -e 's|/server\.conf|/client.conf|g' \
     -e 's|/server\.yaml|/client.yaml|g' \
+    -e 's|/wg-server\.conf|/wg-client.conf|g' \
     "$out"
   if ! grep -q '^\[forward\]' "$out"; then
     add_forward_section "$out" client
@@ -2489,7 +2523,7 @@ hysteria2_write_server_yaml() {
   local dir="$1" port="$2" server_ip="$3" mtu="$4" dev="$5" obfs="$6"
   local pass; pass="$(tr -d '\n' < "${dir}/password")"
   cat > "${dir}/server.yaml" << EOF
-# virlink Hysteria2 — server (QUIC masquerade)
+# virlink Hysteria2 — server (QUIC proxy + virlink kernel TUN)
 listen: 0.0.0.0:${port}
 
 tls:
@@ -2509,6 +2543,10 @@ masquerade:
 bandwidth:
   up: 1 gbps
   down: 1 gbps
+
+quic:
+  keepAlivePeriod: 10s
+  maxIdleTimeout: 60s
 EOF
   if [[ -n "$obfs" ]]; then
     echo "$obfs" > "${dir}/obfs.password"
@@ -2525,6 +2563,7 @@ EOF
 
 hysteria2_write_client_yaml() {
   local dir="$1" port="$2" remote_ip="$3" client_ip="$4" server_ip="$5" mtu="$6" dev="$7" obfs="$8"
+  local wrap_port=$((10000 + port))
   local pass pin=""
   pass="$(tr -d '\n' < "${dir}/password")"
   if [[ -f "${dir}/pin.sha256" ]]; then
@@ -2534,7 +2573,7 @@ hysteria2_write_client_yaml() {
   fi
   [[ -n "$pin" ]] || die "Missing pin.sha256 — re-run server setup or copy export bundle"
   cat > "${dir}/client.yaml" << EOF
-# virlink Hysteria2 — client (site-to-site TUN)
+# virlink Hysteria2 — client (site-to-site via udpForwarding + kernel TUN)
 server: ${remote_ip}:${port}
 
 auth: ${pass}
@@ -2547,14 +2586,14 @@ bandwidth:
   up: 200 mbps
   down: 200 mbps
 
-tun:
-  name: ${dev}
-  mtu: ${mtu}
-  address:
-    ipv4: ${client_ip}/30
-  route:
-    ipv4: ["${server_ip}/32"]
-    ipv4Exclude: ["${remote_ip}/32"]
+quic:
+  keepAlivePeriod: 10s
+  maxIdleTimeout: 60s
+
+udpForwarding:
+  - listen: 127.0.0.1:${wrap_port}
+    remote: 127.0.0.1:${wrap_port}
+    timeout: 300s
 EOF
   if [[ -n "$obfs" ]]; then
     cat >> "${dir}/client.yaml" << EOF
@@ -2777,9 +2816,243 @@ EOF
   fi
 
   blank
-  info "Overlay TUN: client ${client_ip}/30  ·  server ${server_ip}/30"
-  info "Health/bench disabled for hysteria2 — use nc/iperf3 to test overlay (ping RTT is misleading)"
+  local wrap_port=$((10000 + port))
+  info "Overlay TUN: client ${client_ip}  ·  server ${server_ip}  (from ${cidr})"
+  info "UDP wrap port: 127.0.0.1:${wrap_port}  (10000 + QUIC port ${port})"
+  info "Test: ping peer overlay IP, or nc -u for UDP"
   info "Log: /var/log/virlink/${name}-hysteria2.log"
+}
+
+# ── WireGuard helpers ─────────────────────────────────────────────────────────
+
+wireguard_overlay_addrs() {
+  local cidr="$1" mode="$2"
+  openvpn_overlay_ips "$cidr" "$mode"
+  local ones="${cidr##*/}"
+  WIREGUARD_CLIENT_IP="${OPENVPN_CLIENT_IP}"
+  WIREGUARD_SERVER_IP="${OPENVPN_SERVER_IP}"
+  WIREGUARD_CLIENT_ADDR="${OPENVPN_CLIENT_IP}/${ones}"
+  WIREGUARD_SERVER_ADDR="${OPENVPN_SERVER_IP}/${ones}"
+}
+
+wireguard_allowed_ips() {
+  local peer_ip="$1" cidr="$2"
+  echo "${peer_ip}/32,${cidr}"
+}
+
+wireguard_gen_keys() {
+  local dir="$1"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  if [[ -f "$dir/server.key" && -f "$dir/client.key" ]]; then
+    ok "WireGuard keys already exist in ${dir}"
+    return 0
+  fi
+  ensure_wireguard_deps
+  info "Generating WireGuard keys (wg genkey)..."
+  wg genkey | tee "$dir/server.key" | wg pubkey > "$dir/server.pub"
+  wg genkey | tee "$dir/client.key" | wg pubkey > "$dir/client.pub"
+  chmod 600 "$dir"/*.key 2>/dev/null || true
+  chmod 644 "$dir"/*.pub 2>/dev/null || true
+  ok "WireGuard keys generated"
+}
+
+wireguard_write_server_conf() {
+  local pki_dir="$1" port="$2" server_addr="$3" client_pub="$4" client_ip="$5" cidr="$6"
+  local server_priv
+  server_priv=$(tr -d '\n' < "$pki_dir/server.key")
+  cat > "${pki_dir}/wg-server.conf" << EOF
+[Interface]
+PrivateKey = ${server_priv}
+Address = ${server_addr}
+ListenPort = ${port}
+
+[Peer]
+PublicKey = $(tr -d '\n' < "$pki_dir/client.pub")
+AllowedIPs = $(wireguard_allowed_ips "$client_ip" "$cidr")
+EOF
+}
+
+wireguard_write_client_conf() {
+  local pki_dir="$1" port="$2" endpoint_ip="$3" client_addr="$4" server_ip="$5" cidr="$6"
+  local client_priv
+  client_priv=$(tr -d '\n' < "$pki_dir/client.key")
+  cat > "${pki_dir}/wg-client.conf" << EOF
+[Interface]
+PrivateKey = ${client_priv}
+Address = ${client_addr}
+
+[Peer]
+PublicKey = $(tr -d '\n' < "$pki_dir/server.pub")
+AllowedIPs = $(wireguard_allowed_ips "$server_ip" "$cidr")
+Endpoint = ${endpoint_ip}:${port}
+PersistentKeepalive = 25
+EOF
+}
+
+wireguard_strip_server_secrets() {
+  local dir="$1"
+  rm -f "$dir/server.key" "$dir/server.pub" "$dir/wg-server.conf"
+}
+
+wireguard_show_fingerprint() {
+  local pki_dir="$1"
+  if [[ -f "${pki_dir}/server.pub" ]]; then
+    info "Server public key: $(tr -d '\n' < "${pki_dir}/server.pub")"
+  fi
+  if [[ -f "${pki_dir}/client.pub" ]]; then
+    info "Client public key: $(tr -d '\n' < "${pki_dir}/client.pub")"
+  fi
+}
+
+wireguard_fetch_from_server() {
+  local name="$1" server_host="$2" pki_dir="$3" ssh_user="$4" ssh_port="$5"
+  local remote="${INSTALL_DIR}/pki/${name}"
+  ensure_ssh_deps
+  mkdir -p "$pki_dir"
+  info "Fetching WireGuard client credentials from ${server_host}..."
+  scp -P "$ssh_port" -o StrictHostKeyChecking=accept-new \
+    "${ssh_user}@${server_host}:${remote}/client.key" \
+    "${ssh_user}@${server_host}:${remote}/client.pub" \
+    "${ssh_user}@${server_host}:${remote}/server.pub" \
+    "${ssh_user}@${server_host}:${remote}/wg-client.conf" \
+    "$pki_dir/" || die "SCP failed — check SSH access to ${server_host}"
+  wireguard_strip_server_secrets "$pki_dir"
+  ok "WireGuard credentials fetched from ${server_host}"
+}
+
+wireguard_acquire_client_pki() {
+  local name="$1" server_host="$2" pki_dir="$3"
+  if [[ -f "${pki_dir}/client.key" && -f "${pki_dir}/server.pub" && -f "${pki_dir}/wg-client.conf" ]]; then
+    ok "WireGuard client credentials present"
+    return 0
+  fi
+  blank
+  info "Client needs: client.key, server.pub, wg-client.conf from the server."
+  if confirm "Fetch from server ${server_host} via SSH?"; then
+    openvpn_prompt_ssh
+    wireguard_fetch_from_server "$name" "$server_host" "$pki_dir" \
+      "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
+    return 0
+  fi
+  die "Missing WireGuard credentials in ${pki_dir} — copy from server or use SSH fetch"
+}
+
+wireguard_push_to_client() {
+  local name="$1" client_host="$2" pki_dir="$3" ssh_user="$4" ssh_port="$5"
+  ensure_ssh_deps
+  local remote="${INSTALL_DIR}/pki/${name}"
+  info "Pushing WireGuard client credentials to ${client_host}..."
+  ssh -p "$ssh_port" -o StrictHostKeyChecking=accept-new \
+    "${ssh_user}@${client_host}" "mkdir -p '${remote}' && chmod 700 '${remote}'"
+  scp -P "$ssh_port" -o StrictHostKeyChecking=accept-new \
+    "${pki_dir}/client.key" \
+    "${pki_dir}/client.pub" \
+    "${pki_dir}/server.pub" \
+    "${pki_dir}/wg-client.conf" \
+    "${ssh_user}@${client_host}:${remote}/" || die "SCP push failed"
+  ok "WireGuard credentials pushed to ${client_host}:${remote}"
+}
+
+gen_wireguard() {
+  local name mode local_ip remote_ip cidr port mtu dev pki_dir wg_conf cfg hb
+  local client_ip server_ip client_addr server_addr
+  collect_base_inputs name mode local_ip remote_ip cidr
+  blank
+  info "WireGuard site-to-site — kernel crypto, UDP transport."
+  prompt port "WireGuard UDP port" "51820"
+  prompt mtu "Overlay MTU" "1420"
+  dev="wg-virlink0"
+
+  ensure_wireguard_deps
+  pki_dir="${INSTALL_DIR}/pki/${name}"
+  mkdir -p "$pki_dir"
+
+  if [[ "$mode" == "server" ]]; then
+    wireguard_gen_keys "$pki_dir"
+  else
+    wireguard_acquire_client_pki "$name" "$remote_ip" "$pki_dir"
+  fi
+
+  wireguard_overlay_addrs "$cidr" "$mode"
+  client_ip="$WIREGUARD_CLIENT_IP"
+  server_ip="$WIREGUARD_SERVER_IP"
+  client_addr="$WIREGUARD_CLIENT_ADDR"
+  server_addr="$WIREGUARD_SERVER_ADDR"
+
+  hb=20
+
+  if [[ "$mode" == "server" ]]; then
+    wireguard_write_server_conf "$pki_dir" "$port" "$server_addr" "" "$client_ip" "$cidr"
+    wireguard_write_client_conf "$pki_dir" "$port" "$local_ip" "$client_addr" "$server_ip" "$cidr"
+    wg_conf="${pki_dir}/wg-server.conf"
+    ok "Wrote ${wg_conf}"
+  else
+    wg_conf="${pki_dir}/wg-client.conf"
+    [[ -f "$wg_conf" ]] || die "Missing ${wg_conf}"
+    ok "Using ${wg_conf}"
+    blank
+    warn "Start the WireGuard SERVER on ${remote_ip} first."
+    warn "Firewall: allow UDP/${port} to server (cloud firewall too)."
+  fi
+
+  cfg="${CONFIGS_DIR}/${name}.toml"
+  cat > "$cfg" << EOF
+# virlink — ${name}  (WireGuard site-to-site · UDP)
+[tunnel]
+type      = "wireguard"
+mode      = "${mode}"
+local_ip  = "${local_ip}"
+remote_ip = "${remote_ip}"
+cidr      = "${cidr}"
+mtu       = ${mtu}
+name      = "${name}"
+
+[transport]
+port               = ${port}
+proto              = "udp"
+heartbeat_interval = ${hb}
+
+[wireguard]
+config = "${wg_conf}"
+dev    = "${dev}"
+
+[security]
+encryption = true
+EOF
+  write_openvpn_tuning "$cfg" "fast"
+  add_forward_section "$cfg" "$mode"
+  LAST_CFG_PATH="$cfg"
+
+  if [[ "$mode" == "server" ]]; then
+    local pki="${INSTALL_DIR}/pki/${name}"
+    virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "wireguard" "$port" \
+      "${pki}/client.key" "${pki_dir}/client.key" 600 \
+      "${pki}/client.pub" "${pki_dir}/client.pub" 644 \
+      "${pki}/server.pub" "${pki_dir}/server.pub" 644 \
+      "${pki}/wg-client.conf" "${pki_dir}/wg-client.conf" 644
+    blank
+    info "Privacy: server private key stays on this host only."
+    info "Client install: ${W}${MANUAL_CLIENT_CONF_DIR}/${remote_ip}-wireguard-${port}.txt${NC}"
+    if confirm "Push credentials to client ${remote_ip} via SSH"; then
+      openvpn_prompt_ssh
+      wireguard_push_to_client "$name" "$remote_ip" "$pki_dir" \
+        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
+    else
+      info "Copy ${pki_dir}/ or paste ${W}${MANUAL_CLIENT_CONF_DIR}/${remote_ip}-wireguard-${port}.txt${NC} on client."
+    fi
+    wireguard_show_fingerprint "$pki_dir"
+    blank
+    warn "Start this server tunnel before the client: virlink-setup → Start tunnel → ${name}"
+    warn "Firewall: allow UDP/${port} from client ${remote_ip}"
+  fi
+
+  blank
+  warn "Firewall: allow UDP/${port} between ${local_ip} and ${remote_ip}"
+  if [[ "$mode" == "server" ]]; then
+    info "Client overlay: ${client_addr}  ·  Server overlay: ${server_addr}"
+  fi
+  info "Test: ping peer overlay IP after both sides are up"
 }
 
 gen_tcp() {

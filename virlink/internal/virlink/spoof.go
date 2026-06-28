@@ -57,7 +57,7 @@ func validateWireSpoofTunnel(typ string) error {
 	switch typ {
 	case "udp-obfs":
 		return fmt.Errorf("[mangle] wire spoof is not supported for %q tunnel", typ)
-	case "openvpn", "hysteria2":
+	case "openvpn", "hysteria2", "wireguard":
 		return fmt.Errorf("[mangle] wire spoof is not supported for %q tunnel", typ)
 	default:
 		return nil

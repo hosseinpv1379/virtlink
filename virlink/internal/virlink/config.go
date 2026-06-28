@@ -109,6 +109,12 @@ type Hysteria2Cfg struct {
 	Dev    string `toml:"dev"`    // TUN name (default hy2-tun0)
 }
 
+// WireGuardCfg maps to [wireguard]
+type WireGuardCfg struct {
+	Config string `toml:"config"` // path to wg-quick-style .conf file
+	Dev    string `toml:"dev"`    // interface name (default wg-virlink0)
+}
+
 // MangleCfg maps to [mangle] — optional wire IP spoof (manual config only).
 // Userspace (icmp/udp/bip): IP_HDRINCL  ·  Kernel (gre-fou, gre, …): nftables mangle
 // Client: srcip=1.1.1.1 dstip=2.2.2.2  ·  Server: srcip=2.2.2.2 dstip=1.1.1.1
@@ -133,6 +139,7 @@ type Config struct {
 	Mangle    MangleCfg    `toml:"mangle"`
 	OpenVPN   OpenVPNCfg   `toml:"openvpn"`
 	Hysteria2 Hysteria2Cfg `toml:"hysteria2"`
+	WireGuard WireGuardCfg `toml:"wireguard"`
 
 	// Convenience aliases (set after parse, not from TOML)
 	Mode     string `toml:"-"`
@@ -233,10 +240,11 @@ func setDefaults(c *Config) {
 		case "icmp":            t.MTU = 1472
 		case "bip":             t.MTU = 1480
 		case "hysteria2":       t.MTU = 1400
+		case "wireguard":       t.MTU = 1420
 		default:                t.MTU = 1420
 		}
 	}
-	if tr.Proto == "" && (t.Type == "openvpn" || t.Type == "hysteria2") {
+	if tr.Proto == "" && (t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard") {
 		tr.Proto = "udp"
 	}
 	if t.MTU == 0 && t.Type == "openvpn" {
@@ -257,6 +265,7 @@ func setDefaults(c *Config) {
 		case "tcp":                      tr.Port = 8443
 		case "openvpn":                  tr.Port = 1194
 		case "hysteria2":                tr.Port = 443
+		case "wireguard":                tr.Port = 51820
 		case "udp":                      tr.Port = 5060
 		// gre, icmp, bip don't use ports (raw protocol tunnels)
 		default:                         tr.Port = 5556
@@ -270,6 +279,9 @@ func setDefaults(c *Config) {
 	}
 	if c.Hysteria2.Dev == "" && t.Type == "hysteria2" {
 		c.Hysteria2.Dev = "hy2-tun0"
+	}
+	if c.WireGuard.Dev == "" && t.Type == "wireguard" {
+		c.WireGuard.Dev = "wg-virlink0"
 	}
 
 	l := &c.L2TP
@@ -287,7 +299,7 @@ func setDefaults(c *Config) {
 	if s.AuthKeyIn == ""  { s.AuthKeyIn = "0xb2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1" }
 
 	if c.Tuning.Mode == "" {
-		if t.Type == "openvpn" || t.Type == "hysteria2" {
+		if t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard" {
 			c.Tuning.Mode = tuningFast
 		} else {
 			c.Tuning.Mode = tuningBalanced
@@ -296,6 +308,7 @@ func setDefaults(c *Config) {
 	if c.Tuning.ChannelSize == 0 { c.Tuning.ChannelSize = 10_000 }
 	if c.Logging.Level == ""     { c.Logging.Level = "info" }
 	if c.Health.Port == 0        { c.Health.Port = defaultHealthPort }
+	if t.Type == "hysteria2"     { c.Health.Disabled = true }
 }
 
 // ─── validation ───────────────────────────────────────────────────────────────
@@ -310,7 +323,7 @@ func validate(c *Config) error {
 		"l2tpv3", "gre-fou-ipsec",
 		"udp-obfs",
 		// raw protocol tunnels
-		"gre", "tcp", "udp", "icmp", "bip", "openvpn", "hysteria2",
+		"gre", "tcp", "udp", "icmp", "bip", "openvpn", "hysteria2", "wireguard",
 	}
 	ok := false
 	for _, v := range valid {
@@ -350,6 +363,11 @@ func validate(c *Config) error {
 	if c.Tunnel.Type == "hysteria2" {
 		if c.Hysteria2.Config == "" {
 			return fmt.Errorf("[hysteria2] config path is required")
+		}
+	}
+	if c.Tunnel.Type == "wireguard" {
+		if c.WireGuard.Config == "" {
+			return fmt.Errorf("[wireguard] config path is required")
 		}
 	}
 	return nil

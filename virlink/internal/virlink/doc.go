@@ -49,5 +49,5 @@
 //	  tun_ipsec.go   tun_gre.go
 //
 //	Userspace tunnels (TUN + raw/UDP/TCP/OpenVPN)
-//	  tun_icmp.go  tun_udp.go  tun_tcp.go  tun_bip.go  tun_udp_obfs.go  tun_openvpn.go  tun_hysteria2.go
+//	  tun_icmp.go  tun_udp.go  tun_tcp.go  tun_bip.go  tun_udp_obfs.go  tun_openvpn.go  tun_hysteria2.go  tun_wireguard.go
 package virlink
