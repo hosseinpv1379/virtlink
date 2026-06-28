@@ -41,8 +41,8 @@ func newTunnel(cfg *Config) (Tunnel, error) {
 		return &Hysteria2Tunnel{cfg: cfg}, nil
 	case "wireguard":
 		return &WireGuardTunnel{cfg: cfg}, nil
-	case "ikev2":
-		return &Ikev2Tunnel{cfg: cfg}, nil
+	case "amneziawg":
+		return &AmneziaWGTunnel{cfg: cfg}, nil
 	case "udp":
 		return &UdpTunnel{cfg: cfg}, nil
 	case "icmp":

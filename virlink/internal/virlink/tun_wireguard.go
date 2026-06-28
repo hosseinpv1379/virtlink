@@ -125,15 +125,15 @@ func (t *WireGuardTunnel) Up() error {
 	applyTunnelTuning(c, dev)
 	addMSS(dev)
 
-	logWireGuardStatus(dev, c.Mode)
+	logWireGuardStatus(dev, c.Mode, "wg")
 
 	step("waiting for WireGuard handshake...")
 	if c.Mode == "client" {
-		if err := waitForWireGuardHandshake(dev, 45*time.Second); err != nil {
+		if err := waitForWireGuardHandshake(dev, "wg", 45*time.Second); err != nil {
 			t.doClean()
 			return err
 		}
-	} else if _, ok := wireguardLatestHandshake(dev); !ok {
+	} else if _, ok := wireguardLatestHandshake(dev, "wg"); !ok {
 		logInfo("server listening — handshake will complete when the client starts")
 		logInfo("ensure UDP listen-port is open in firewall (Hetzner + iptables/ufw)")
 	} else {
@@ -142,7 +142,7 @@ func (t *WireGuardTunnel) Up() error {
 
 	addr := t.OverlayIP()
 	peer := t.PeerIP()
-	if _, ok := wireguardLatestHandshake(dev); ok {
+	if _, ok := wireguardLatestHandshake(dev, "wg"); ok {
 		logOK(fmt.Sprintf("wireguard up  dev=%s  wg-handshake=ok", dev))
 	} else {
 		logOK(fmt.Sprintf("wireguard up  dev=%s  wg-handshake=pending (start client)", dev))
@@ -198,7 +198,7 @@ func (t *WireGuardTunnel) Status() {
 	if l, err := netlink.LinkByName(dev); err == nil {
 		fmt.Printf("  %s: flags=%v\n", l.Attrs().Name, l.Attrs().Flags)
 	}
-	logWireGuardStatus(dev, t.cfg.Mode)
+	logWireGuardStatus(dev, t.cfg.Mode, "wg")
 	fmt.Printf("  config: %s\n", t.cfg.WireGuard.Config)
 }
 
@@ -211,22 +211,26 @@ func firstWireGuardAddress(conf *wgConf) string {
 }
 
 func wireguardPeerIP(conf *wgConf, c *Config) string {
+	return wireguardPeerIPSubnet(conf, c, wireguardSubnet)
+}
+
+func wireguardPeerIPSubnet(conf *wgConf, c *Config, fallback string) string {
 	if ips := conf.peer.kv["allowedips"]; ips != "" {
 		part := strings.TrimSpace(strings.Split(ips, ",")[0])
 		if ip, _, err := net.ParseCIDR(part); err == nil && ip != nil {
 			return ip.String()
 		}
 	}
-	return peerAddr(c, wireguardSubnet)
+	return peerAddr(c, fallback)
 }
 
-func logWireGuardStatus(dev, mode string) {
-	out, err := runOut("wg", "show", dev)
+func logWireGuardStatus(dev, mode, wgCmd string) {
+	out, err := runOut(wgCmd, "show", dev)
 	if err != nil {
-		logWarn("wg show: " + err.Error())
+		logWarn(wgCmd + " show: " + err.Error())
 		return
 	}
-	logInfo("── wg show " + dev + " ──")
+	logInfo("── " + wgCmd + " show " + dev + " ──")
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -234,7 +238,7 @@ func logWireGuardStatus(dev, mode string) {
 		}
 		logInfo("  " + line)
 	}
-	if ts, ok := wireguardLatestHandshake(dev); ok {
+	if ts, ok := wireguardLatestHandshake(dev, wgCmd); ok {
 		logOK(fmt.Sprintf("latest handshake: %s ago", time.Since(ts).Round(time.Second)))
 	} else if mode == "server" {
 		logInfo("  no handshake yet — start the client, ensure UDP port is open on this host")
@@ -243,8 +247,8 @@ func logWireGuardStatus(dev, mode string) {
 	}
 }
 
-func wireguardLatestHandshake(dev string) (time.Time, bool) {
-	out, err := runOut("wg", "show", dev, "latest-handshakes")
+func wireguardLatestHandshake(dev, wgCmd string) (time.Time, bool) {
+	out, err := runOut(wgCmd, "show", dev, "latest-handshakes")
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -266,16 +270,16 @@ func wireguardLatestHandshake(dev string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func waitForWireGuardHandshake(dev string, timeout time.Duration) error {
+func waitForWireGuardHandshake(dev, wgCmd string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if _, ok := wireguardLatestHandshake(dev); ok {
+		if _, ok := wireguardLatestHandshake(dev, wgCmd); ok {
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	hint := wireguardHandshakeHint("client")
-	out, _ := runOut("wg", "show", dev)
+	out, _ := runOut(wgCmd, "show", dev)
 	return fmt.Errorf("WireGuard handshake timeout (%s)\n%s\n%s", timeout.Round(time.Second), hint, out)
 }
 
@@ -341,7 +345,7 @@ func applyWireGuardConf(dev string, conf *wgConf, mtu int) error {
 	}
 
 	privKey := conf.iface.kv["privatekey"]
-	if err := wgSetKey(dev, "private-key", privKey); err != nil {
+	if err := wgSetKey(dev, "private-key", privKey, "wg"); err != nil {
 		nlDown(dev)
 		return err
 	}
@@ -400,17 +404,17 @@ func applyWireGuardConf(dev string, conf *wgConf, mtu int) error {
 	return nil
 }
 
-func wgSetKey(dev, keyType, value string) error {
-	cmd := exec.Command("wg", "set", dev, keyType, "/dev/stdin")
+func wgSetKey(dev, keyType, value, wgCmd string) error {
+	cmd := exec.Command(wgCmd, "set", dev, keyType, "/dev/stdin")
 	cmd.Stdin = strings.NewReader(value + "\n")
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(stderr.String())
 		if msg != "" {
-			return fmt.Errorf("wg %s: %s", keyType, msg)
+			return fmt.Errorf("%s %s: %s", wgCmd, keyType, msg)
 		}
-		return fmt.Errorf("wg %s: %w", keyType, err)
+		return fmt.Errorf("%s %s: %w", wgCmd, keyType, err)
 	}
 	return nil
 }

@@ -147,7 +147,7 @@ func printHeartbeat(tun Tunnel, fwdRules []ForwardRule, since time.Time, hm *Hea
 	}
 	if wg, ok := tun.(*WireGuardTunnel); ok {
 		dev := wg.DevName()
-		if ts, wgOK := wireguardLatestHandshake(dev); wgOK {
+		if ts, wgOK := wireguardLatestHandshake(dev, "wg"); wgOK {
 			wgAge := time.Since(ts).Round(time.Second).String()
 			if hsState == "" || hsState == "waiting" {
 				hsState = "wg-ok"
@@ -158,19 +158,17 @@ func printHeartbeat(tun Tunnel, fwdRules []ForwardRule, since time.Time, hm *Hea
 			lastProbe = "no wg handshake"
 		}
 	}
-	if ik, ok := tun.(*Ikev2Tunnel); ok {
-		conn := ik.cfg.Ikev2.Conn
-		if conn == "" {
-			conn = ikev2ConnDefault
-		}
-		if ikev2SAEstablished(conn) {
+	if awg, ok := tun.(*AmneziaWGTunnel); ok {
+		dev := awg.DevName()
+		if ts, ok := wireguardLatestHandshake(dev, "awg"); ok {
+			wgAge := time.Since(ts).Round(time.Second).String()
 			if hsState == "" || hsState == "waiting" {
-				hsState = "ike-ok"
+				hsState = "awg-ok"
 			}
-			lastProbe = "ikev2 SA up"
+			lastProbe = "awg " + wgAge + " ago"
 		} else if hsState == "" || hsState == "waiting" {
-			hsState = "ike-wait"
-			lastProbe = "no IKE SA"
+			hsState = "awg-wait"
+			lastProbe = "no awg handshake"
 		}
 	}
 

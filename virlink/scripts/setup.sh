@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.5.0"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -729,10 +729,11 @@ tunnel_start() {
       wireguard_allow_firewall_port "$(_cfg_transport_port "$cfg")"
     fi
   fi
-  if [[ "$(_cfg_tunnel_type "$cfg")" == "ikev2" ]]; then
-    ensure_ikev2_deps
+  if [[ "$(_cfg_tunnel_type "$cfg")" == "amneziawg" ]]; then
+    ensure_amneziawg_deps
+    ensure_amneziawg_module
     if [[ "$(_cfg_tunnel_mode "$cfg")" == "server" ]]; then
-      ikev2_allow_firewall
+      wireguard_allow_firewall_port "$(_cfg_transport_port "$cfg")"
     fi
   fi
   write_service_file "$name"
@@ -953,7 +954,7 @@ tcp            — User-space TCP tunnel             auto-reconnect
 openvpn        — OpenVPN core (encrypted link)     UDP/TCP · high throughput
 hysteria2      — Hysteria2 QUIC tunnel             fast · censorship-resistant
 wireguard      — WireGuard (kernel crypto)         UDP · fast site-to-site
-ikev2          — IKEv2 / strongSwan IPsec          UDP 500/4500 · kernel multi-core
+amneziawg      — AmneziaWG obfuscated WireGuard    UDP · DPI-resistant (Iran)
 udp-obfs       — Obfuscated UDP (AES-256-GCM)      DPI bypass (Iran)
 EOF
 }
@@ -991,7 +992,7 @@ dispatch_tunnel_generator() {
     openvpn)        gen_openvpn  ;;
     hysteria2)     gen_hysteria2 ;;
     wireguard)     gen_wireguard ;;
-    ikev2)         gen_ikev2 ;;
+    amneziawg)     gen_amneziawg ;;
     udp)            gen_udp      ;;
     icmp)           gen_icmp     ;;
     bip)            gen_bip      ;;
@@ -1126,7 +1127,7 @@ EOF
       write_openvpn_tuning "$file" "fast"
       return
       ;;
-    ikev2)
+    amneziawg)
       write_openvpn_tuning "$file" "fast"
       return
       ;;
@@ -3192,275 +3193,269 @@ EOF
   info "Test: ping peer overlay IP after both sides are up"
 }
 
-# ── IKEv2 / strongSwan helpers ────────────────────────────────────────────────
+# ── AmneziaWG helpers ─────────────────────────────────────────────────────────
 
-_ikev2_pkg_names() {
-  case "$(_detect_pkg_mgr)" in
-    dnf|yum|zypper) echo strongswan strongswan-swanctl ;;
-    pacman)         echo strongswan ;;
-    apk)            echo strongswan swanctl ;;
-    *)              echo strongswan strongswan-swanctl strongswan-charon strongswan-starter ;;
-  esac
+ensure_amneziawg_module() {
+  modprobe amneziawg 2>/dev/null || true
+  [[ -d /sys/module/amneziawg ]] && return 0
+  require_root
+  warn "amneziawg kernel module not loaded — run ensure_amneziawg_deps or install PPA amnezia/ppa"
 }
 
-ikev2_start_charon() {
-  local svc started=0
-  for svc in strongswan-starter charon-systemd strongswan; do
-    if systemctl list-unit-files "${svc}.service" &>/dev/null 2>&1; then
-      systemctl enable "$svc" 2>/dev/null || true
-      if systemctl start "$svc" 2>/dev/null; then
-        started=1
-      fi
-    fi
-  done
-  local i
-  for ((i=0; i<20; i++)); do
-    [[ -S /var/run/charon.vici ]] && return 0
-    sleep 0.5
-  done
-  (( started )) || return 1
-  warn "charon started but /var/run/charon.vici missing — check: journalctl -u strongswan-starter -n 30"
-  return 1
-}
-
-ensure_ikev2_deps() {
-  if command -v swanctl &>/dev/null && command -v ip &>/dev/null && [[ -S /var/run/charon.vici ]]; then
-    ok "IKEv2 ready (strongSwan swanctl + charon)"
+ensure_amneziawg_deps() {
+  if command -v awg &>/dev/null && [[ -d /sys/module/amneziawg || -f /sys/module/amneziawg/refcnt ]]; then
+    ok "AmneziaWG ready (awg + kernel module)"
     return 0
+  fi
+  if command -v awg &>/dev/null; then
+    ensure_amneziawg_module
+    command -v awg &>/dev/null && { ok "AmneziaWG ready (awg)"; return 0; }
   fi
   require_root
-  if ! command -v swanctl &>/dev/null; then
-    warn "strongSwan missing — installing..."
-    local -a pkgs=()
-    read -ra pkgs <<< "$(_ikev2_pkg_names)"
-    _pkg_install "${pkgs[@]}"
-  fi
-  if ! command -v swanctl &>/dev/null; then
-    die "swanctl not found — run: apt install strongswan-swanctl strongswan-starter"
-  fi
-  if ! ikev2_start_charon; then
-    die "charon not running — run: apt install strongswan-starter && systemctl start strongswan-starter"
-  fi
-  ok "strongSwan ready ($(swanctl --version 2>/dev/null | head -1 || echo swanctl))"
+  warn "AmneziaWG missing — installing (Ubuntu/Debian: PPA amnezia/ppa)..."
+  case "$(_detect_pkg_mgr)" in
+    apt)
+      _pkg_install software-properties-common gnupg2 linux-headers-"$(uname -r)" 2>/dev/null || \
+        _pkg_install software-properties-common gnupg2
+      add-apt-repository -y ppa:amnezia/ppa 2>/dev/null || true
+      apt-get update -qq 2>/dev/null || true
+      _pkg_install amneziawg amneziawg-tools 2>/dev/null || _pkg_install amneziawg
+      ;;
+    dnf|yum|zypper)
+      _pkg_install amneziawg amneziawg-tools 2>/dev/null || _pkg_install amneziawg
+      ;;
+    *)
+      die "Install AmneziaWG manually — see https://docs.amnezia.org/documentation/amnezia-wg/"
+      ;;
+  esac
+  ensure_amneziawg_module
+  command -v awg &>/dev/null || die "awg not found after install — try: apt install amneziawg"
+  ok "AmneziaWG installed ($(awg --version 2>/dev/null | head -1 || echo awg))"
 }
 
-ikev2_allow_firewall() {
-  wireguard_allow_firewall_port 500
-  wireguard_allow_firewall_port 4500
+amneziawg_gen_obfs_params() {
+  AMNEZIAWG_JC=4
+  AMNEZIAWG_JMIN=8
+  AMNEZIAWG_JMAX=80
+  AMNEZIAWG_S1=15
+  AMNEZIAWG_S2=15
+  AMNEZIAWG_H1=$(( RANDOM * RANDOM % 2000000000 + 10000000 ))
+  AMNEZIAWG_H2=$(( RANDOM * RANDOM % 2000000000 + 10000000 ))
+  AMNEZIAWG_H3=$(( RANDOM * RANDOM % 2000000000 + 10000000 ))
+  AMNEZIAWG_H4=$(( RANDOM * RANDOM % 2000000000 + 10000000 ))
+  while [[ "$AMNEZIAWG_H2" == "$AMNEZIAWG_H1" ]]; do AMNEZIAWG_H2=$((RANDOM * 100000)); done
+  while [[ "$AMNEZIAWG_H3" == "$AMNEZIAWG_H1" || "$AMNEZIAWG_H3" == "$AMNEZIAWG_H2" ]]; do AMNEZIAWG_H3=$((RANDOM * 100000)); done
+  while [[ "$AMNEZIAWG_H4" == "$AMNEZIAWG_H1" || "$AMNEZIAWG_H4" == "$AMNEZIAWG_H2" || "$AMNEZIAWG_H4" == "$AMNEZIAWG_H3" ]]; do AMNEZIAWG_H4=$((RANDOM * 100000)); done
 }
 
-ikev2_default_if_id() {
-  local name="$1" h=0 i c
-  for ((i=0; i<${#name}; i++)); do
-    c=$(printf '%d' "'${name:$i:1}")
-    h=$(( (h * 31 + c) % 60000 + 1 ))
-  done
-  (( h < 2 )) && h=42
-  echo "$h"
-}
-
-ikev2_gen_pki() {
-  local dir="$1"
-  mkdir -p "$dir"
-  chmod 700 "$dir"
-  if [[ -f "$dir/ca.crt" && -f "$dir/server.crt" && -f "$dir/client.crt" ]]; then
-    ok "IKEv2 PKI already exists in ${dir}"
-    return 0
-  fi
-  info "Generating IKEv2 PKI (ECDSA P-256, CA + server + client)..."
-  openvpn_openssl_extfile "$dir"
-  openssl ecparam -genkey -name prime256v1 -out "$dir/ca.key" \
-    || die "OpenSSL: cannot generate CA key"
-  openvpn_create_ca_cert "$dir"
-  openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" \
-    || die "OpenSSL: cannot generate server key"
-  openvpn_sign_server_cert "$dir"
-  openssl ecparam -genkey -name prime256v1 -out "$dir/client.key" \
-    || die "OpenSSL: cannot generate client key"
-  openvpn_sign_client_cert "$dir"
-  rm -f "$dir/server.csr" "$dir/client.csr"
-  chmod 600 "$dir"/*.key 2>/dev/null || true
-  chmod 644 "$dir"/*.crt 2>/dev/null || true
-  ok "IKEv2 PKI generated"
-}
-
-ikev2_install_swanctl_layout() {
-  local pki_dir="$1" mode="$2"
-  local swanctl="${pki_dir}/swanctl"
-  mkdir -p "${swanctl}/conf.d" "${swanctl}/x509ca" "${swanctl}/x509" "${swanctl}/private"
-  cp -f "${pki_dir}/ca.crt" "${swanctl}/x509ca/"
-  if [[ "$mode" == "server" ]]; then
-    cp -f "${pki_dir}/server.crt" "${swanctl}/x509/"
-    cp -f "${pki_dir}/server.key" "${swanctl}/private/"
-    rm -f "${swanctl}/private/client.key" "${swanctl}/x509/client.crt"
-  else
-    cp -f "${pki_dir}/client.crt" "${swanctl}/x509/"
-    cp -f "${pki_dir}/client.key" "${swanctl}/private/"
-    rm -f "${swanctl}/private/server.key" "${swanctl}/x509/server.crt"
-  fi
-  chmod 600 "${swanctl}/private/"* 2>/dev/null || true
-  chmod 644 "${swanctl}/x509/"* "${swanctl}/x509ca/"* 2>/dev/null || true
-}
-
-ikev2_write_swanctl_conf() {
-  local mode="$1" local_ip="$2" remote_ip="$3" cidr="$4" if_id="$5" swanctl_dir="$6"
-  local start_action local_cert remote_id local_id
-  if [[ "$mode" == "server" ]]; then
-    start_action="trap"
-    local_cert="server.crt"
-    local_id="$local_ip"
-    remote_id="$remote_ip"
-  else
-    start_action="start"
-    local_cert="client.crt"
-    local_id="$local_ip"
-    remote_id="$remote_ip"
-  fi
-  cat > "${swanctl_dir}/conf.d/virlink.conf" << EOF
-connections {
-  virlink {
-    version = 2
-    mobike = no
-    reauth_time = 0
-
-    local_addrs = ${local_ip}
-    remote_addrs = ${remote_ip}
-
-    local {
-      auth = pubkey
-      certs = ${local_cert}
-      id = ${local_id}
-    }
-    remote {
-      auth = pubkey
-      id = ${remote_id}
-    }
-
-    children {
-      net {
-        local_ts = ${cidr}
-        remote_ts = ${cidr}
-        esp_proposals = aes256gcm-modp2048,aes128gcm-modp2048,aes256-sha256-modp2048
-        start_action = ${start_action}
-        close_action = restart
-        dpd_action = restart
-        if_id_in = ${if_id}
-        if_id_out = ${if_id}
-      }
-    }
-  }
-}
+amneziawg_obfs_block() {
+  cat << EOF
+Jc = ${AMNEZIAWG_JC}
+Jmin = ${AMNEZIAWG_JMIN}
+Jmax = ${AMNEZIAWG_JMAX}
+S1 = ${AMNEZIAWG_S1}
+S2 = ${AMNEZIAWG_S2}
+H1 = ${AMNEZIAWG_H1}
+H2 = ${AMNEZIAWG_H2}
+H3 = ${AMNEZIAWG_H3}
+H4 = ${AMNEZIAWG_H4}
 EOF
 }
 
-ikev2_build_client_swanctl() {
-  local pki_dir="$1" server_ip="$2" client_ip="$3" cidr="$4" if_id="$5"
-  local target="${pki_dir}/swanctl-client"
-  mkdir -p "${target}/conf.d" "${target}/x509ca" "${target}/x509" "${target}/private"
-  cp -f "${pki_dir}/ca.crt" "${target}/x509ca/"
-  cp -f "${pki_dir}/client.crt" "${target}/x509/"
-  cp -f "${pki_dir}/client.key" "${target}/private/"
-  chmod 600 "${target}/private/client.key"
-  ikev2_write_swanctl_conf client "$client_ip" "$server_ip" "$cidr" "$if_id" "$target"
+amneziawg_load_obfs_from_conf() {
+  local conf="$1"
+  [[ -f "$conf" ]] || return 1
+  AMNEZIAWG_JC=$(grep -E '^Jc\s*=' "$conf" 2>/dev/null | awk '{print $3}')
+  AMNEZIAWG_JMIN=$(grep -E '^Jmin\s*=' "$conf" 2>/dev/null | awk '{print $3}')
+  AMNEZIAWG_JMAX=$(grep -E '^Jmax\s*=' "$conf" 2>/dev/null | awk '{print $3}')
+  AMNEZIAWG_S1=$(grep -E '^S1\s*=' "$conf" 2>/dev/null | awk '{print $3}')
+  AMNEZIAWG_S2=$(grep -E '^S2\s*=' "$conf" 2>/dev/null | awk '{print $3}')
+  AMNEZIAWG_H1=$(grep -E '^H1\s*=' "$conf" 2>/dev/null | awk '{print $3}')
+  AMNEZIAWG_H2=$(grep -E '^H2\s*=' "$conf" 2>/dev/null | awk '{print $3}')
+  AMNEZIAWG_H3=$(grep -E '^H3\s*=' "$conf" 2>/dev/null | awk '{print $3}')
+  AMNEZIAWG_H4=$(grep -E '^H4\s*=' "$conf" 2>/dev/null | awk '{print $3}')
+  [[ -n "$AMNEZIAWG_JC" && -n "$AMNEZIAWG_H1" ]]
 }
 
-ikev2_strip_server_secrets() {
+amneziawg_keygen() {
+  local cmd="$1"
+  if command -v "$cmd" &>/dev/null; then
+    "$cmd" genkey
+  else
+    wg genkey
+  fi
+}
+
+amneziawg_pubkey() {
+  local cmd="$1"
+  if command -v "$cmd" &>/dev/null; then
+    "$cmd" pubkey
+  else
+    wg pubkey
+  fi
+}
+
+amneziawg_gen_keys() {
   local dir="$1"
-  rm -f "$dir/ca.key" "$dir/server.key" "$dir/server.crt"
-  rm -f "$dir/swanctl/private/server.key" "$dir/swanctl/x509/server.crt" 2>/dev/null || true
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  if [[ -f "$dir/server.key" && -f "$dir/client.key" ]]; then
+    ok "AmneziaWG keys already exist in ${dir}"
+    amneziawg_load_obfs_from_conf "${dir}/awg-server.conf" 2>/dev/null || \
+      amneziawg_load_obfs_from_conf "${dir}/awg-client.conf" 2>/dev/null || \
+      amneziawg_gen_obfs_params
+    return 0
+  fi
+  ensure_amneziawg_deps
+  info "Generating AmneziaWG keys (awg genkey)..."
+  amneziawg_gen_obfs_params
+  amneziawg_keygen awg | tee "$dir/server.key" | amneziawg_pubkey awg > "$dir/server.pub"
+  amneziawg_keygen awg | tee "$dir/client.key" | amneziawg_pubkey awg > "$dir/client.pub"
+  chmod 600 "$dir"/*.key 2>/dev/null || true
+  chmod 644 "$dir"/*.pub 2>/dev/null || true
+  ok "AmneziaWG keys generated (save obfs params — embedded in awg conf)"
 }
 
-ikev2_fetch_from_server() {
+amneziawg_write_server_conf() {
+  local pki_dir="$1" port="$2" server_addr="$3" client_ip="$4" cidr="$5"
+  local server_priv
+  server_priv=$(tr -d '\n' < "$pki_dir/server.key")
+  cat > "${pki_dir}/awg-server.conf" << EOF
+[Interface]
+PrivateKey = ${server_priv}
+Address = ${server_addr}
+ListenPort = ${port}
+$(amneziawg_obfs_block)
+
+[Peer]
+PublicKey = $(tr -d '\n' < "$pki_dir/client.pub")
+AllowedIPs = $(wireguard_allowed_ips "$client_ip" "$cidr")
+EOF
+}
+
+amneziawg_write_client_conf() {
+  local pki_dir="$1" port="$2" endpoint_ip="$3" client_addr="$4" server_ip="$5" cidr="$6"
+  local client_priv
+  client_priv=$(tr -d '\n' < "$pki_dir/client.key")
+  cat > "${pki_dir}/awg-client.conf" << EOF
+[Interface]
+PrivateKey = ${client_priv}
+Address = ${client_addr}
+$(amneziawg_obfs_block)
+
+[Peer]
+PublicKey = $(tr -d '\n' < "$pki_dir/server.pub")
+AllowedIPs = $(wireguard_allowed_ips "$server_ip" "$cidr")
+Endpoint = ${endpoint_ip}:${port}
+PersistentKeepalive = 25
+EOF
+}
+
+amneziawg_strip_server_secrets() {
+  local dir="$1"
+  rm -f "$dir/server.key" "$dir/server.pub" "$dir/awg-server.conf"
+}
+
+amneziawg_fetch_from_server() {
   local name="$1" server_host="$2" pki_dir="$3" ssh_user="$4" ssh_port="$5"
   local remote="${INSTALL_DIR}/pki/${name}"
   ensure_ssh_deps
   mkdir -p "$pki_dir"
-  info "Fetching IKEv2 client credentials from ${server_host}..."
-  scp -P "$ssh_port" -o StrictHostKeyChecking=accept-new -r \
-    "${ssh_user}@${server_host}:${remote}/swanctl-client" \
-    "${pki_dir}/swanctl" 2>/dev/null || \
-  scp -P "$ssh_port" -o StrictHostKeyChecking=accept-new -r \
-    "${ssh_user}@${server_host}:${remote}/swanctl" \
+  info "Fetching AmneziaWG client credentials from ${server_host}..."
+  scp -P "$ssh_port" -o StrictHostKeyChecking=accept-new \
+    "${ssh_user}@${server_host}:${remote}/client.key" \
+    "${ssh_user}@${server_host}:${remote}/client.pub" \
+    "${ssh_user}@${server_host}:${remote}/server.pub" \
+    "${ssh_user}@${server_host}:${remote}/awg-client.conf" \
     "$pki_dir/" || die "SCP failed — check SSH access to ${server_host}"
-  ikev2_strip_server_secrets "$pki_dir"
-  ok "IKEv2 swanctl fetched from ${server_host}"
+  amneziawg_strip_server_secrets "$pki_dir"
+  ok "AmneziaWG credentials fetched from ${server_host}"
 }
 
-ikev2_acquire_client_pki() {
+amneziawg_acquire_client_pki() {
   local name="$1" server_host="$2" pki_dir="$3"
-  if [[ -d "${pki_dir}/swanctl/conf.d" && -f "${pki_dir}/swanctl/x509ca/ca.crt" ]]; then
-    ok "IKEv2 client swanctl present"
+  if [[ -f "${pki_dir}/client.key" && -f "${pki_dir}/server.pub" && -f "${pki_dir}/awg-client.conf" ]]; then
+    ok "AmneziaWG client credentials present"
     return 0
   fi
   blank
-  info "Client needs swanctl/ tree from the server (CA + client cert/key + conf)."
+  info "Client needs: client.key, server.pub, awg-client.conf from the server."
   if confirm "Fetch from server ${server_host} via SSH?"; then
     openvpn_prompt_ssh
-    ikev2_fetch_from_server "$name" "$server_host" "$pki_dir" \
+    amneziawg_fetch_from_server "$name" "$server_host" "$pki_dir" \
       "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
     return 0
   fi
-  die "Missing IKEv2 swanctl in ${pki_dir} — copy from server or use SSH fetch"
+  die "Missing AmneziaWG credentials in ${pki_dir} — copy from server or use SSH fetch"
 }
 
-ikev2_push_to_client() {
+amneziawg_push_to_client() {
   local name="$1" client_host="$2" pki_dir="$3" ssh_user="$4" ssh_port="$5"
   ensure_ssh_deps
   local remote="${INSTALL_DIR}/pki/${name}"
-  local src="${pki_dir}/swanctl-client"
-  [[ -d "$src" ]] || src="${pki_dir}/swanctl"
-  info "Pushing IKEv2 client swanctl to ${client_host}..."
+  info "Pushing AmneziaWG client credentials to ${client_host}..."
   ssh -p "$ssh_port" -o StrictHostKeyChecking=accept-new \
     "${ssh_user}@${client_host}" "mkdir -p '${remote}' && chmod 700 '${remote}'"
-  scp -P "$ssh_port" -o StrictHostKeyChecking=accept-new -r \
-    "${src}" "${ssh_user}@${client_host}:${remote}/swanctl" || die "SCP push failed"
-  ok "IKEv2 swanctl pushed to ${client_host}:${remote}/swanctl"
+  scp -P "$ssh_port" -o StrictHostKeyChecking=accept-new \
+    "${pki_dir}/client.key" \
+    "${pki_dir}/client.pub" \
+    "${pki_dir}/server.pub" \
+    "${pki_dir}/awg-client.conf" \
+    "${ssh_user}@${client_host}:${remote}/" || die "SCP push failed"
+  ok "AmneziaWG credentials pushed to ${client_host}:${remote}"
 }
 
-gen_ikev2() {
-  local name mode local_ip remote_ip cidr mtu dev pki_dir swanctl_dir cfg hb if_id port
+gen_amneziawg() {
+  local name mode local_ip remote_ip cidr port mtu dev pki_dir awg_conf cfg hb
+  local client_ip server_ip client_addr server_addr
   collect_base_inputs name mode local_ip remote_ip cidr
   blank
-  info "IKEv2 site-to-site — strongSwan kernel IPsec (multi-core ESP, single overlay IP)."
-  prompt mtu "Overlay MTU" "1400"
-  dev="ipsec0"
-  port=500
+  info "AmneziaWG site-to-site — obfuscated WireGuard (DPI-resistant, same overlay model as WG)."
+  prompt port "AmneziaWG UDP port" "51820"
+  prompt mtu "Overlay MTU" "1420"
+  dev="awg-virlink0"
 
-  ensure_ikev2_deps
+  ensure_amneziawg_deps
+  ensure_amneziawg_module
   pki_dir="${INSTALL_DIR}/pki/${name}"
   mkdir -p "$pki_dir"
 
   if [[ "$mode" == "server" ]]; then
-    ikev2_gen_pki "$pki_dir"
+    amneziawg_gen_keys "$pki_dir"
   else
-    ikev2_acquire_client_pki "$name" "$remote_ip" "$pki_dir"
+    amneziawg_acquire_client_pki "$name" "$remote_ip" "$pki_dir"
+    amneziawg_load_obfs_from_conf "${pki_dir}/awg-client.conf" 2>/dev/null || true
   fi
 
-  if_id="$(ikev2_default_if_id "$name")"
-  swanctl_dir="${pki_dir}/swanctl"
-
-  if [[ "$mode" == "server" ]]; then
-    ikev2_install_swanctl_layout "$pki_dir" server
-    ikev2_write_swanctl_conf server "$local_ip" "$remote_ip" "$cidr" "$if_id" "$swanctl_dir"
-    ikev2_build_client_swanctl "$pki_dir" "$local_ip" "$remote_ip" "$cidr" "$if_id"
-    ikev2_allow_firewall
-    ok "Wrote ${swanctl_dir}/conf.d/virlink.conf  if_id=${if_id}"
-  else
-    [[ -d "$swanctl_dir" ]] || die "Missing ${swanctl_dir}"
-    ikev2_install_swanctl_layout "$pki_dir" client
-    ikev2_write_swanctl_conf client "$local_ip" "$remote_ip" "$cidr" "$if_id" "$swanctl_dir"
-    ok "Wrote ${swanctl_dir}/conf.d/virlink.conf  if_id=${if_id}"
-    blank
-    warn "Start the IKEv2 SERVER on ${remote_ip} first."
-    warn "Firewall: allow UDP 500 and 4500 to server (cloud firewall too)."
-  fi
+  wireguard_overlay_addrs "$cidr" "$mode"
+  client_ip="$WIREGUARD_CLIENT_IP"
+  server_ip="$WIREGUARD_SERVER_IP"
+  client_addr="$WIREGUARD_CLIENT_ADDR"
+  server_addr="$WIREGUARD_SERVER_ADDR"
 
   hb=20
+
+  if [[ "$mode" == "server" ]]; then
+    amneziawg_write_server_conf "$pki_dir" "$port" "$server_addr" "$client_ip" "$cidr"
+    amneziawg_write_client_conf "$pki_dir" "$port" "$local_ip" "$client_addr" "$server_ip" "$cidr"
+    wireguard_allow_firewall_port "$port"
+    awg_conf="${pki_dir}/awg-server.conf"
+    ok "Wrote ${awg_conf}  (Jc=${AMNEZIAWG_JC} obfuscation)"
+  else
+    amneziawg_write_client_conf "$pki_dir" "$port" "$remote_ip" "$client_addr" "$server_ip" "$cidr"
+    awg_conf="${pki_dir}/awg-client.conf"
+    ok "Wrote ${awg_conf}  Endpoint=${remote_ip}:${port}"
+    blank
+    warn "Start the AmneziaWG SERVER on ${remote_ip} first."
+    warn "Obfuscation params (Jc/S/H) must match server awg-client.conf exactly."
+    warn "Firewall: allow UDP/${port} to server (cloud firewall too)."
+  fi
+
   cfg="${CONFIGS_DIR}/${name}.toml"
   cat > "$cfg" << EOF
-# virlink — ${name}  (IKEv2 / strongSwan site-to-site)
+# virlink — ${name}  (AmneziaWG site-to-site · obfuscated WireGuard)
 [tunnel]
-type      = "ikev2"
+type      = "amneziawg"
 mode      = "${mode}"
 local_ip  = "${local_ip}"
 remote_ip = "${remote_ip}"
@@ -3473,12 +3468,9 @@ port               = ${port}
 proto              = "udp"
 heartbeat_interval = ${hb}
 
-[ikev2]
-swanctl_dir = "${swanctl_dir}"
-dev         = "${dev}"
-conn        = "virlink"
-child       = "net"
-if_id       = ${if_id}
+[amneziawg]
+config = "${awg_conf}"
+dev    = "${dev}"
 
 [security]
 encryption = true
@@ -3488,22 +3480,33 @@ EOF
   LAST_CFG_PATH="$cfg"
 
   if [[ "$mode" == "server" ]]; then
+    local pki="${INSTALL_DIR}/pki/${name}"
+    virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "amneziawg" "$port" \
+      "${pki}/client.key" "${pki_dir}/client.key" 600 \
+      "${pki}/client.pub" "${pki_dir}/client.pub" 644 \
+      "${pki}/server.pub" "${pki_dir}/server.pub" 644 \
+      "${pki}/awg-client.conf" "${pki_dir}/awg-client.conf" 644
     blank
-    info "Privacy: CA/server private keys stay on this host only."
-    info "Client needs: ${pki_dir}/swanctl/ (client cert layout) — use push or manual copy."
-    if confirm "Push client swanctl to ${remote_ip} via SSH"; then
+    info "Privacy: server private key stays on this host only."
+    info "Client install: ${W}${MANUAL_CLIENT_CONF_DIR}/${remote_ip}-amneziawg-${port}.txt${NC}"
+    if confirm "Push credentials to client ${remote_ip} via SSH"; then
       openvpn_prompt_ssh
-      ikev2_push_to_client "$name" "$remote_ip" "$pki_dir" \
+      amneziawg_push_to_client "$name" "$remote_ip" "$pki_dir" \
         "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
+    else
+      info "Copy ${pki_dir}/ or paste manual client conf on client."
     fi
     blank
     warn "Start this server tunnel before the client: virlink-setup → Start tunnel → ${name}"
-    warn "Firewall: allow UDP 500/4500 from client ${remote_ip}"
+    warn "Firewall: allow UDP/${port} from client ${remote_ip}"
   fi
 
   blank
-  warn "Firewall: allow UDP 500 and 4500 between ${local_ip} and ${remote_ip}"
-  info "Test: ping peer overlay IP after IKE SA is up (swanctl --list-sas)"
+  warn "Firewall: allow UDP/${port} between ${local_ip} and ${remote_ip}"
+  if [[ "$mode" == "server" ]]; then
+    info "Client overlay: ${client_addr}  ·  Server overlay: ${server_addr}"
+  fi
+  info "Test: ping peer overlay IP after both sides are up"
 }
 
 gen_tcp() {

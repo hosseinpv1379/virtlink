@@ -117,13 +117,10 @@ type WireGuardCfg struct {
 	Dev    string `toml:"dev"`    // interface name (default wg-virlink0)
 }
 
-// Ikev2Cfg maps to [ikev2] — strongSwan swanctl directory + xfrm interface.
-type Ikev2Cfg struct {
-	SwanctlDir string `toml:"swanctl_dir"` // e.g. /opt/virlink/pki/name/swanctl
-	Dev        string `toml:"dev"`         // xfrm interface (default ipsec0)
-	Conn       string `toml:"conn"`        // swanctl connection name (default virlink)
-	Child      string `toml:"child"`       // child SA name (default net)
-	IfID       int    `toml:"if_id"`       // xfrm if_id (auto from tunnel name if 0)
+// AmneziaWGCfg maps to [amneziawg] — obfuscated WireGuard (awg + amneziawg kernel module).
+type AmneziaWGCfg struct {
+	Config string `toml:"config"` // path to awg-quick-style .conf file
+	Dev    string `toml:"dev"`    // interface name (default awg-virlink0)
 }
 
 // MangleCfg maps to [mangle] — optional wire IP spoof (manual config only).
@@ -151,7 +148,7 @@ type Config struct {
 	OpenVPN   OpenVPNCfg   `toml:"openvpn"`
 	Hysteria2 Hysteria2Cfg `toml:"hysteria2"`
 	WireGuard WireGuardCfg `toml:"wireguard"`
-	Ikev2     Ikev2Cfg     `toml:"ikev2"`
+	AmneziaWG AmneziaWGCfg `toml:"amneziawg"`
 
 	// Convenience aliases (set after parse, not from TOML)
 	Mode     string `toml:"-"`
@@ -253,11 +250,11 @@ func setDefaults(c *Config) {
 		case "bip":             t.MTU = 1480
 		case "hysteria2":       t.MTU = 1400
 		case "wireguard":       t.MTU = 1420
-		case "ikev2":           t.MTU = 1400
+		case "amneziawg":      t.MTU = 1420
 		default:                t.MTU = 1420
 		}
 	}
-	if tr.Proto == "" && (t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard" || t.Type == "ikev2") {
+	if tr.Proto == "" && (t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard" || t.Type == "amneziawg") {
 		tr.Proto = "udp"
 	}
 	if t.MTU == 0 && t.Type == "openvpn" {
@@ -279,7 +276,7 @@ func setDefaults(c *Config) {
 		case "openvpn":                  tr.Port = 1194
 		case "hysteria2":                tr.Port = 443
 		case "wireguard":                tr.Port = 51820
-		case "ikev2":                    tr.Port = 500
+		case "amneziawg":                tr.Port = 51820
 		case "udp":                      tr.Port = 5060
 		// gre, icmp, bip don't use ports (raw protocol tunnels)
 		default:                         tr.Port = 5556
@@ -297,14 +294,8 @@ func setDefaults(c *Config) {
 	if c.WireGuard.Dev == "" && t.Type == "wireguard" {
 		c.WireGuard.Dev = "wg-virlink0"
 	}
-	if c.Ikev2.Dev == "" && t.Type == "ikev2" {
-		c.Ikev2.Dev = "ipsec0"
-	}
-	if c.Ikev2.Conn == "" && t.Type == "ikev2" {
-		c.Ikev2.Conn = ikev2ConnDefault
-	}
-	if c.Ikev2.Child == "" && t.Type == "ikev2" {
-		c.Ikev2.Child = ikev2ChildDefault
+	if c.AmneziaWG.Dev == "" && t.Type == "amneziawg" {
+		c.AmneziaWG.Dev = "awg-virlink0"
 	}
 
 	l := &c.L2TP
@@ -322,7 +313,7 @@ func setDefaults(c *Config) {
 	if s.AuthKeyIn == ""  { s.AuthKeyIn = "0xb2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1" }
 
 	if c.Tuning.Mode == "" {
-		if t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard" || t.Type == "ikev2" {
+		if t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard" || t.Type == "amneziawg" {
 			c.Tuning.Mode = tuningFast
 		} else {
 			c.Tuning.Mode = tuningBalanced
@@ -346,7 +337,7 @@ func validate(c *Config) error {
 		"l2tpv3", "gre-fou-ipsec",
 		"udp-obfs",
 		// raw protocol tunnels
-		"gre", "tcp", "udp", "icmp", "bip", "openvpn", "hysteria2", "wireguard", "ikev2",
+		"gre", "tcp", "udp", "icmp", "bip", "openvpn", "hysteria2", "wireguard", "amneziawg",
 	}
 	ok := false
 	for _, v := range valid {
@@ -393,9 +384,9 @@ func validate(c *Config) error {
 			return fmt.Errorf("[wireguard] config path is required")
 		}
 	}
-	if c.Tunnel.Type == "ikev2" {
-		if c.Ikev2.SwanctlDir == "" {
-			return fmt.Errorf("[ikev2] swanctl_dir is required")
+	if c.Tunnel.Type == "amneziawg" {
+		if c.AmneziaWG.Config == "" {
+			return fmt.Errorf("[amneziawg] config path is required")
 		}
 	}
 	return nil
