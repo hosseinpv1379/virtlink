@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -26,13 +26,15 @@ LAST_CFG_PATH=""   # set by gen_* instead of echoing (avoids $() capture)
 PICKED_TUNNEL=""   # set by pick_tunnel (avoids printf -v scope bug with set -u)
 PICKED_TUNNEL_TYPE=""  # set by pick_tunnel_type (never capture pick UI via $())
 PRESELECTED_MODE=""  # set during create flow (client/server chosen upfront)
+SCRIPT_VERBOSE=0
+SCRIPT_DEBUG=0
 
 # Kernel vs userspace tunnel classification
 readonly -a KERNEL_TUNNEL_KEYS=(
   gre-fou ipip-fou bonded-gre-fou l2tpv3 gre-fou-ipsec gre
 )
 readonly -a USERSPACE_TUNNEL_KEYS=(
-  icmp udp bip tcp udp-obfs openvpn hysteria2 wireguard
+  icmp udp bip tcp udp-obfs openvpn hysteria2 wireguard amneziawg
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -54,6 +56,10 @@ warn()  { echo -e "  ${Y}⚠${NC} $*"; }
 err()   { echo -e "  ${R}✗${NC} $*" >&2; }
 die()   { err "$*"; exit 1; }
 blank() { echo; }
+
+vinfo() { [[ "$SCRIPT_VERBOSE" == 1 ]] && info "$@"; }
+vrun()  { [[ "$SCRIPT_VERBOSE" == 1 ]] && info "→ $*"; "$@"; }
+
 sep()   { echo -e "${DIM}══════════════════════════════════════════════════${NC}"; }
 sep_thin() { echo -e "${DIM}────────────────────────────────────────────────${NC}"; }
 
@@ -3205,6 +3211,7 @@ ensure_amneziawg_module() {
 ensure_amneziawg_deps() {
   if command -v awg &>/dev/null && [[ -d /sys/module/amneziawg || -f /sys/module/amneziawg/refcnt ]]; then
     ok "AmneziaWG ready (awg + kernel module)"
+    vinfo "awg=$(command -v awg)  module=$(ls /sys/module/amneziawg 2>/dev/null | head -1 || echo loaded)"
     return 0
   fi
   if command -v awg &>/dev/null; then
@@ -3215,21 +3222,21 @@ ensure_amneziawg_deps() {
   warn "AmneziaWG missing — installing (Ubuntu/Debian: PPA amnezia/ppa)..."
   case "$(_detect_pkg_mgr)" in
     apt)
-      _pkg_install software-properties-common gnupg2 linux-headers-"$(uname -r)" 2>/dev/null || \
-        _pkg_install software-properties-common gnupg2
-      add-apt-repository -y ppa:amnezia/ppa 2>/dev/null || true
-      apt-get update -qq 2>/dev/null || true
-      _pkg_install amneziawg amneziawg-tools 2>/dev/null || _pkg_install amneziawg
+      vrun _pkg_install software-properties-common gnupg2 linux-headers-"$(uname -r)" 2>/dev/null || \
+        vrun _pkg_install software-properties-common gnupg2
+      vrun add-apt-repository -y ppa:amnezia/ppa 2>/dev/null || true
+      vrun apt-get update -qq 2>/dev/null || true
+      vrun _pkg_install amneziawg amneziawg-tools 2>/dev/null || vrun _pkg_install amneziawg
       ;;
     dnf|yum|zypper)
-      _pkg_install amneziawg amneziawg-tools 2>/dev/null || _pkg_install amneziawg
+      vrun _pkg_install amneziawg amneziawg-tools 2>/dev/null || vrun _pkg_install amneziawg
       ;;
     *)
       die "Install AmneziaWG manually — see https://docs.amnezia.org/documentation/amnezia-wg/"
       ;;
   esac
   ensure_amneziawg_module
-  command -v awg &>/dev/null || die "awg not found after install — try: apt install amneziawg"
+  command -v awg &>/dev/null || die "awg not found after install — try: apt install amneziawg amneziawg-tools"
   ok "AmneziaWG installed ($(awg --version 2>/dev/null | head -1 || echo awg))"
 }
 
@@ -3238,14 +3245,12 @@ amneziawg_gen_obfs_params() {
   AMNEZIAWG_JMIN=8
   AMNEZIAWG_JMAX=80
   AMNEZIAWG_S1=15
-  AMNEZIAWG_S2=15
-  AMNEZIAWG_H1=$(( RANDOM * RANDOM % 2000000000 + 10000000 ))
-  AMNEZIAWG_H2=$(( RANDOM * RANDOM % 2000000000 + 10000000 ))
-  AMNEZIAWG_H3=$(( RANDOM * RANDOM % 2000000000 + 10000000 ))
-  AMNEZIAWG_H4=$(( RANDOM * RANDOM % 2000000000 + 10000000 ))
-  while [[ "$AMNEZIAWG_H2" == "$AMNEZIAWG_H1" ]]; do AMNEZIAWG_H2=$((RANDOM * 100000)); done
-  while [[ "$AMNEZIAWG_H3" == "$AMNEZIAWG_H1" || "$AMNEZIAWG_H3" == "$AMNEZIAWG_H2" ]]; do AMNEZIAWG_H3=$((RANDOM * 100000)); done
-  while [[ "$AMNEZIAWG_H4" == "$AMNEZIAWG_H1" || "$AMNEZIAWG_H4" == "$AMNEZIAWG_H2" || "$AMNEZIAWG_H4" == "$AMNEZIAWG_H3" ]]; do AMNEZIAWG_H4=$((RANDOM * 100000)); done
+  AMNEZIAWG_S2=72
+  # Non-overlapping H ranges (kernel rejects overlapping magic headers)
+  AMNEZIAWG_H1="123456-234567"
+  AMNEZIAWG_H2="345678-456789"
+  AMNEZIAWG_H3="567890-678901"
+  AMNEZIAWG_H4="789012-890123"
 }
 
 amneziawg_obfs_block() {
@@ -3959,6 +3964,33 @@ if _is_piped_install; then
   do_install
 fi
 
+while [[ $# -gt 0 && "$1" == -* ]]; do
+  case "$1" in
+    -v|--verbose) SCRIPT_VERBOSE=1; shift ;;
+    -x|--debug)   SCRIPT_DEBUG=1; set -x; shift ;;
+    -h|--help)
+      cat << EOF
+Usage: $0 [-v|--verbose] [-x|--debug] [command] [name]
+
+Commands:
+  menu (default)  interactive setup
+  start NAME      start tunnel systemd service
+  stop NAME       stop tunnel
+  restart NAME    restart tunnel
+  status NAME     show tunnel status
+  list            list configured tunnels
+  update          update virlink binary
+
+Flags:
+  -v, --verbose   extra install/setup logging
+  -x, --debug     bash trace (set -x)
+EOF
+      exit 0
+      ;;
+    *) break ;;
+  esac
+done
+
 case "${1:-menu}" in
   start)   require_root; ensure_dirs; tunnel_start  "${2:?tunnel name required}" ;;
   stop)    require_root; ensure_dirs; tunnel_stop   "${2:?tunnel name required}" ;;
@@ -3969,5 +4001,5 @@ case "${1:-menu}" in
   list)    list_tunnels ;;
   update)  require_root; check_update; do_update_all ;;
   menu)    main ;;
-  *)       echo "Usage: $0 [menu|start|stop|restart|status|list|update] [name]"; exit 1 ;;
+  *)       echo "Usage: $0 [-v|--verbose] [-x|--debug] [menu|start|stop|restart|status|list|update] [name]"; exit 1 ;;
 esac

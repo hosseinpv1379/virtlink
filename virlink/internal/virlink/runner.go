@@ -12,6 +12,7 @@ import (
 
 // run executes a command; returns a descriptive error on failure.
 func run(name string, args ...string) error {
+	logDebug("exec: " + name + " " + strings.Join(args, " "))
 	cmd := exec.Command(name, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

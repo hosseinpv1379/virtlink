@@ -100,7 +100,7 @@ func (t *AmneziaWGTunnel) Up() error {
 	}
 
 	step("creating AmneziaWG interface " + dev + "...")
-	if err := applyAmneziaWGConf(dev, conf, c.Tunnel.MTU); err != nil {
+	if err := applyAmneziaWGConf(dev, awg.Config, conf, c.Tunnel.MTU); err != nil {
 		t.doClean()
 		return err
 	}
@@ -146,57 +146,26 @@ func (t *AmneziaWGTunnel) Up() error {
 	return nil
 }
 
-func applyAmneziaWGConf(dev string, conf *wgConf, mtu int) error {
+func applyAmneziaWGConf(dev, confPath string, conf *wgConf, mtu int) error {
 	nlDown(dev)
 
 	if err := run("ip", "link", "add", dev, "type", "amneziawg"); err != nil {
 		return fmt.Errorf("ip link add: %w (try: modprobe amneziawg; install PPA amnezia/ppa)", err)
 	}
 
-	privKey := conf.iface.kv["privatekey"]
-	if err := wgSetKey(dev, "private-key", privKey, "awg"); err != nil {
+	kernelConf, cleanup, err := awgKernelConfFile(confPath, conf)
+	if err != nil {
 		nlDown(dev)
 		return err
 	}
+	defer cleanup()
 
-	for _, p := range []struct{ arg, key string }{
-		{"jc", "jc"}, {"jmin", "jmin"}, {"jmax", "jmax"},
-		{"s1", "s1"}, {"s2", "s2"},
-		{"h1", "h1"}, {"h2", "h2"}, {"h3", "h3"}, {"h4", "h4"},
-	} {
-		if v := conf.iface.kv[p.key]; v != "" {
-			if err := run("awg", "set", dev, p.arg, v); err != nil {
-				nlDown(dev)
-				return fmt.Errorf("awg %s: %w", p.arg, err)
-			}
-		}
-	}
-
-	if lp := conf.iface.kv["listenport"]; lp != "" {
-		if err := run("awg", "set", dev, "listen-port", lp); err != nil {
-			nlDown(dev)
-			return fmt.Errorf("awg listen-port: %w", err)
-		}
-		logOK("listen-port " + lp + " UDP")
-	}
-
-	pubKey := conf.peer.kv["publickey"]
-	args := []string{"set", dev, "peer", pubKey}
-	if ips := conf.peer.kv["allowedips"]; ips != "" {
-		args = append(args, "allowed-ips", ips)
-	}
-	if ep := conf.peer.kv["endpoint"]; ep != "" {
-		args = append(args, "endpoint", ep)
-		logOK("peer endpoint " + ep)
-	}
-	if ka := conf.peer.kv["persistentkeepalive"]; ka != "" {
-		args = append(args, "persistent-keepalive", ka)
-	}
-	if err := run("awg", args...); err != nil {
+	logAwgObfsParams(conf)
+	if err := run("awg", "setconf", dev, kernelConf); err != nil {
 		nlDown(dev)
-		return fmt.Errorf("awg peer: %w", err)
+		return fmt.Errorf("awg setconf: %w (check Jc/Jmin/Jmax/S/H in %s)", err, confPath)
 	}
-	logOK("awg configured (keys, peer, obfuscation params)")
+	logOK("awg setconf applied (keys, peer, obfuscation — atomic)")
 
 	if addr := conf.iface.kv["address"]; addr != "" {
 		for _, a := range strings.Split(addr, ",") {
@@ -212,6 +181,13 @@ func applyAmneziaWGConf(dev string, conf *wgConf, mtu int) error {
 		}
 	}
 
+	if lp := conf.iface.kv["listenport"]; lp != "" {
+		logOK("listen-port " + lp + " UDP")
+	}
+	if ep := conf.peer.kv["endpoint"]; ep != "" {
+		logOK("peer endpoint " + ep)
+	}
+
 	l, err := netlink.LinkByName(dev)
 	if err != nil {
 		nlDown(dev)
@@ -225,6 +201,94 @@ func applyAmneziaWGConf(dev string, conf *wgConf, mtu int) error {
 		return fmt.Errorf("link up %s: %w", dev, err)
 	}
 	return nil
+}
+
+// awgKernelConfFile builds a kernel-only awg config (no Address/DNS/PostUp).
+// Obfuscation params must be applied atomically — separate awg set jc/jmin calls
+// break validation (jc alone auto-bumps jmax when jmin=jmax=0).
+func awgKernelConfFile(confPath string, conf *wgConf) (path string, cleanup func(), err error) {
+	cleanup = func() {}
+	if _, lookErr := exec.LookPath("awg-quick"); lookErr == nil {
+		out, stripErr := runOut("awg-quick", "strip", confPath)
+		if stripErr == nil && strings.TrimSpace(out) != "" {
+			path, cleanup, err = writeTempAwgConf(out)
+			if err == nil {
+				logDebug("awg kernel conf via awg-quick strip → " + path)
+				return path, cleanup, nil
+			}
+		}
+		logDebug("awg-quick strip failed, using manual kernel conf builder")
+	}
+	var b strings.Builder
+	writeAwgKernelConf(&b, conf)
+	path, cleanup, err = writeTempAwgConf(b.String())
+	if err == nil {
+		logDebug("awg kernel conf (manual strip) → " + path)
+	}
+	return path, cleanup, err
+}
+
+func writeTempAwgConf(body string) (path string, cleanup func(), err error) {
+	cleanup = func() {}
+	f, err := os.CreateTemp("", "awg-setconf-*.conf")
+	if err != nil {
+		return "", cleanup, err
+	}
+	path = f.Name()
+	cleanup = func() { _ = os.Remove(path) }
+	if _, err := f.WriteString(body); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	_ = os.Chmod(path, 0600)
+	return path, cleanup, nil
+}
+
+func writeAwgKernelConf(w *strings.Builder, conf *wgConf) {
+	w.WriteString("[Interface]\n")
+	fmt.Fprintf(w, "PrivateKey = %s\n", conf.iface.kv["privatekey"])
+	if v := conf.iface.kv["listenport"]; v != "" {
+		fmt.Fprintf(w, "ListenPort = %s\n", v)
+	}
+	for _, p := range []struct{ label, key string }{
+		{"Jc", "jc"}, {"Jmin", "jmin"}, {"Jmax", "jmax"},
+		{"S1", "s1"}, {"S2", "s2"}, {"S3", "s3"}, {"S4", "s4"},
+		{"H1", "h1"}, {"H2", "h2"}, {"H3", "h3"}, {"H4", "h4"},
+	} {
+		if v := conf.iface.kv[p.key]; v != "" {
+			fmt.Fprintf(w, "%s = %s\n", p.label, v)
+		}
+	}
+	w.WriteString("\n[Peer]\n")
+	fmt.Fprintf(w, "PublicKey = %s\n", conf.peer.kv["publickey"])
+	if v := conf.peer.kv["allowedips"]; v != "" {
+		fmt.Fprintf(w, "AllowedIPs = %s\n", v)
+	}
+	if v := conf.peer.kv["endpoint"]; v != "" {
+		fmt.Fprintf(w, "Endpoint = %s\n", v)
+	}
+	if v := conf.peer.kv["persistentkeepalive"]; v != "" {
+		fmt.Fprintf(w, "PersistentKeepalive = %s\n", v)
+	}
+}
+
+func logAwgObfsParams(conf *wgConf) {
+	parts := []string{}
+	for _, p := range []struct{ label, key string }{
+		{"Jc", "jc"}, {"Jmin", "jmin"}, {"Jmax", "jmax"},
+		{"S1", "s1"}, {"S2", "s2"}, {"H1", "h1"}, {"H2", "h2"}, {"H3", "h3"}, {"H4", "h4"},
+	} {
+		if v := conf.iface.kv[p.key]; v != "" {
+			parts = append(parts, p.label+"="+v)
+		}
+	}
+	if len(parts) > 0 {
+		logInfo("awg obfuscation: " + strings.Join(parts, " "))
+	}
 }
 
 func (t *AmneziaWGTunnel) Down() error {

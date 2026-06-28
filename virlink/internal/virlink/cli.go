@@ -7,13 +7,15 @@ import (
 	"os"
 )
 
-const version = "2.13.1"
+const version = "2.13.2"
 
 func Main() {
-	cfgFile  := flag.String("c", "", "path to config.toml")
-	doDown   := flag.Bool("down", false, "tear down tunnel (one-shot)")
-	doStatus := flag.Bool("status", false, "show current tunnel status")
-	doVer    := flag.Bool("version", false, "print version")
+	cfgFile   := flag.String("c", "", "path to config.toml")
+	doDown    := flag.Bool("down", false, "tear down tunnel (one-shot)")
+	doStatus  := flag.Bool("status", false, "show current tunnel status")
+	doVer     := flag.Bool("version", false, "print version")
+	doVerbose := flag.Bool("v", false, "verbose debug logging (log every command)")
+	flag.BoolVar(doVerbose, "verbose", false, "verbose debug logging (log every command)")
 	flag.Usage = printUsage
 	flag.Parse()
 
@@ -51,6 +53,9 @@ func Main() {
 
 	case *doDown:
 		// one-shot teardown
+		if *doVerbose {
+			cfg.Logging.Level = "debug"
+		}
 		initLogger(&cfg.Logging)
 		logInfo("tearing down tunnel...")
 		if err := tun.Down(); err != nil {
@@ -60,6 +65,9 @@ func Main() {
 		logInfo("done")
 
 	default:
+		if *doVerbose {
+			cfg.Logging.Level = "debug"
+		}
 		// ── daemon mode ─────────────────────────────────────────────────────
 		// The tunnel lives as long as this process runs.
 		// Press Ctrl+C (or send SIGTERM) to cleanly remove the tunnel.
@@ -73,6 +81,7 @@ virlink v%s — kernel tunnel manager
 
 Usage:
   sudo ./virlink -c config.toml            run (tunnel up, blocks, Ctrl+C removes)
+  sudo ./virlink -v -c config.toml         run with debug logging (every command)
   sudo ./virlink -c config.toml --down     tear down tunnel
   sudo ./virlink -c config.toml --status   show tunnel status
        ./virlink --version
