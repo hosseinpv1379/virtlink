@@ -169,8 +169,15 @@ func (h *HealthMgr) runProbeServer(overlayIP string, port int) {
 
 // ── probe sender (sends probes to peer overlay IP) ────────────────────────────
 
-func (h *HealthMgr) runProbeSender(peerOverlay string, port int) {
-	addr := fmt.Sprintf("%s:%d", peerOverlay, port)
+func (h *HealthMgr) runProbeSender(localOverlay, peerOverlay string, port int) {
+	localIP := net.ParseIP(localOverlay)
+	if localIP = localIP.To4(); localIP == nil {
+		return
+	}
+	peerIP := net.ParseIP(peerOverlay)
+	if peerIP = peerIP.To4(); peerIP == nil {
+		return
+	}
 	// build probe packet: 4-byte magic + 8-byte timestamp
 	pkt := make([]byte, 12)
 	copy(pkt[:4], probeMagic[:])
@@ -179,7 +186,9 @@ func (h *HealthMgr) runProbeSender(peerOverlay string, port int) {
 	defer ticker.Stop()
 	for range ticker.C {
 		binary.BigEndian.PutUint64(pkt[4:], uint64(time.Now().UnixNano()))
-		conn, err := net.DialTimeout("udp4", addr, 2*time.Second)
+		conn, err := net.DialUDP("udp4",
+			&net.UDPAddr{IP: localIP, Port: 0},
+			&net.UDPAddr{IP: peerIP, Port: port})
 		if err != nil {
 			continue
 		}
@@ -310,7 +319,7 @@ func (h *HealthMgr) runHTTPServer(overlayIP string, port int, tun Tunnel, bm *Be
 func (h *HealthMgr) Start(overlayIP, peerIP string, port int, tun Tunnel) {
 	bm := NewBenchMgr(port, peerIP, overlayIP)
 	go h.runProbeServer(overlayIP, port)
-	go h.runProbeSender(peerIP, port)
+	go h.runProbeSender(overlayIP, peerIP, port)
 	go bm.runServer()
 	go h.runHTTPServer(overlayIP, port, tun, bm)
 }
