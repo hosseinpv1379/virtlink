@@ -569,51 +569,10 @@ ensure_openvpn_dco() {
     _pkg_install "$pkg" 2>/dev/null && break
   done
   openvpn_dco_module_present || {
-    warn "DCO unavailable — OpenVPN stays single-thread user-space (use parallel workers in setup)"
+    warn "DCO unavailable — OpenVPN stays single-thread user-space (~1 core per flow)"
     return 1
   }
   ok "OpenVPN DCO module loaded"
-}
-
-openvpn_worker_overlay_ips() {
-  local cidr="$1" mode="$2" worker="${3:-0}"
-  local ip="${cidr%%/*}" a b c d
-  IFS=. read -r a b c d <<< "$ip"
-  d=$((d + worker * 4))
-  if [[ "$mode" == "client" ]]; then
-    OPENVPN_CLIENT_IP="${a}.${b}.${c}.$((d + 1))"
-    OPENVPN_SERVER_IP="${a}.${b}.${c}.$((d + 2))"
-  else
-    OPENVPN_SERVER_IP="${a}.${b}.${c}.$((d + 2))"
-    OPENVPN_CLIENT_IP="${a}.${b}.${c}.$((d + 1))"
-  fi
-}
-
-openvpn_worker_dev() {
-  local base="$1" worker="${2:-0}"
-  if [[ "$worker" == "0" ]]; then
-    echo "$base"
-    return
-  fi
-  if [[ "$base" == *0 ]]; then
-    echo "${base%0}${worker}"
-  else
-    echo "${base}${worker}"
-  fi
-}
-
-openvpn_worker_conf_path() {
-  local base="$1" worker="${2:-0}"
-  if [[ "$worker" == "0" ]]; then
-    echo "$base"
-    return
-  fi
-  local dir file ext stem
-  dir="$(dirname "$base")"
-  file="$(basename "$base")"
-  ext=".${file##*.}"
-  stem="${file%${ext}}"
-  echo "${dir}/${stem}-${worker}${ext}"
 }
 
 _wireguard_pkg_name() {
@@ -749,6 +708,7 @@ tunnel_start() {
   [[ -f "$cfg" ]] || die "Config not found: $cfg"
   if [[ "$(_cfg_tunnel_type "$cfg")" == "openvpn" ]]; then
     ensure_openvpn_deps
+    ensure_openvpn_dco || true
   fi
   if [[ "$(_cfg_tunnel_type "$cfg")" == "hysteria2" ]]; then
     ensure_hysteria2_deps
@@ -2271,7 +2231,7 @@ openvpn_require_client_pki() {
 gen_openvpn() {
   local name mode local_ip remote_ip cidr port proto mtu dev pki_dir ovpn_conf cfg perf_raw perf
   local client_ip server_ip tun_mtu mssfix default_mtu hb
-  local use_dco=0 workers=1 w wport wdev wclient wserver wconf dco_toml dco_raw workers_raw ncpu
+  local use_dco=0 dco_toml dco_raw
   collect_base_inputs name mode local_ip remote_ip cidr
   blank
   info "Transport: UDP = max bandwidth · TCP = firewall-friendly (slower)"
@@ -2303,40 +2263,18 @@ gen_openvpn() {
   fi
 
   blank
-  info "Multi-core: DCO (kernel offload, OpenVPN 2.6+) or parallel links when DCO unavailable."
+  info "Multi-core bandwidth on one overlay IP requires DCO (OpenVPN 2.6+ + ovpn-dco kernel module)."
   if openvpn_version_at_least 2 6 && ensure_openvpn_dco; then
     pick dco_raw "Data Channel Offload (DCO)" \
-      "yes — multi-core in kernel (recommended)" \
-      "no — user-space crypto only"
+      "yes — multi-core on single peer IP (recommended)" \
+      "no — user-space crypto only (~1 core per flow)"
     if [[ "$(label_key "$dco_raw")" == "yes" ]]; then
       use_dco=1
-      workers=1
-      ok "DCO enabled — one tunnel, crypto spread across CPU cores"
+      ok "DCO enabled — one tunnel, one overlay IP, crypto spread across CPU cores"
     fi
   else
     warn "DCO not available (need OpenVPN 2.6+ and ovpn-dco kernel module)"
-  fi
-
-  if [[ "$use_dco" -eq 0 ]]; then
-    ncpu="$(nproc 2>/dev/null || echo 2)"
-    (( ncpu > 4 )) && ncpu=4
-    pick workers_raw "Parallel OpenVPN links (multi-path)" \
-      "1 — single link" \
-      "2 — dual path" \
-      "4 — quad path" \
-      "auto — match CPU count (${ncpu})"
-    case "$(label_key "$workers_raw")" in
-      2) workers=2 ;;
-      4) workers=4 ;;
-      auto) workers="$ncpu" ;;
-      *) workers=1 ;;
-    esac
-    (( workers < 1 )) && workers=1
-    (( workers > 4 )) && workers=4
-    if [[ "$workers" -gt 1 ]]; then
-      info "Parallel links: ${workers}  ports ${port}-$((port + workers - 1))  (ECMP load-sharing)"
-      warn "Firewall: open ${proto} ports ${port}-$((port + workers - 1)) on server"
-    fi
+    warn "Without DCO, use iperf3 -P for parallel flows — not the same as multi-core on one IP"
   fi
 
   dco_toml="false"
@@ -2352,36 +2290,18 @@ gen_openvpn() {
     *)        hb=20 ;;
   esac
 
-  for ((w=0; w<workers; w++)); do
-    openvpn_worker_overlay_ips "$cidr" "$mode" "$w"
-    wclient="$OPENVPN_CLIENT_IP"
-    wserver="$OPENVPN_SERVER_IP"
-    wport=$((port + w))
-    wdev="$(openvpn_worker_dev "$dev" "$w")"
-    if [[ "$mode" == "server" ]]; then
-      wconf="$(openvpn_worker_conf_path "${pki_dir}/server.conf" "$w")"
-      openvpn_write_server_conf "$pki_dir" "$wport" "$proto" "$wclient" "$wserver" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$wconf" "$use_dco"
-      wconf="$(openvpn_worker_conf_path "${pki_dir}/client.conf" "$w")"
-      openvpn_write_client_conf "$pki_dir" "$wport" "$proto" "$local_ip" "$wclient" "$wserver" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$wconf" "$use_dco"
-      ok "Wrote worker ${w}: ${wconf}  ${wdev}  ${wserver}↔${wclient}  :${wport}"
-    else
-      wconf="$(openvpn_worker_conf_path "${pki_dir}/client.conf" "$w")"
-      openvpn_write_client_conf "$pki_dir" "$wport" "$proto" "$remote_ip" "$wclient" "$wserver" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$wconf" "$use_dco"
-      ok "Wrote ${wconf}  ${wdev}  :${wport}"
-    fi
-  done
-
-  ovpn_conf="${pki_dir}/server.conf"
-  [[ "$mode" == "client" ]] && ovpn_conf="${pki_dir}/client.conf"
-
-  if [[ "$mode" == "client" ]]; then
+  if [[ "$mode" == "server" ]]; then
+    ovpn_conf="${pki_dir}/server.conf"
+    openvpn_write_server_conf "$pki_dir" "$port" "$proto" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix" "$ovpn_conf" "$use_dco"
+    openvpn_write_client_conf "$pki_dir" "$port" "$proto" "$local_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix" "${pki_dir}/client.conf" "$use_dco"
+    ok "Wrote ${ovpn_conf} (${perf}, ${proto}, dco=${dco_toml})"
+  else
+    ovpn_conf="${pki_dir}/client.conf"
+    openvpn_write_client_conf "$pki_dir" "$port" "$proto" "$remote_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix" "$ovpn_conf" "$use_dco"
+    ok "Wrote ${ovpn_conf} (${perf}, ${proto}, dco=${dco_toml})"
     blank
     warn "Start the OpenVPN SERVER tunnel first (peer ${remote_ip})."
-    if [[ "$workers" -gt 1 ]]; then
-      warn "Firewall: allow ${proto} ports ${port}-$((port + workers - 1)) to server"
-    else
-      warn "Firewall: allow ${proto}/${port} from this host → server (Hetzner cloud firewall too)."
-    fi
+    warn "Firewall: allow ${proto}/${port} from this host → server (Hetzner cloud firewall too)."
     info "If tunnel fails: tail -30 /var/log/virlink/${name}-openvpn.log"
   fi
 
@@ -2403,10 +2323,9 @@ proto              = "${proto}"
 heartbeat_interval = ${hb}
 
 [openvpn]
-config  = "${ovpn_conf}"
-dev     = "${dev}"
-workers = ${workers}
-dco     = ${dco_toml}
+config = "${ovpn_conf}"
+dev    = "${dev}"
+dco    = ${dco_toml}
 
 [security]
 encryption = true

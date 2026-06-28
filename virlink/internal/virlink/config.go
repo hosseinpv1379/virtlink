@@ -101,7 +101,7 @@ type HealthCfg struct {
 type OpenVPNCfg struct {
 	Config  string `toml:"config"`  // path to openvpn .conf (worker 0; others use -N suffix)
 	Dev     string `toml:"dev"`     // TUN name (must match dev in .conf, default ovpn-tun0)
-	Workers int    `toml:"workers"` // parallel links 1–4 when DCO off (default 1)
+	Workers int    `toml:"workers"` // deprecated — ignored; use dco for multi-core on one overlay IP
 	DCO     *bool  `toml:"dco"`     // nil=auto, true=force enable-dco, false=disable
 }
 
@@ -278,14 +278,6 @@ func setDefaults(c *Config) {
 	}
 	if c.OpenVPN.Dev == "" && t.Type == "openvpn" {
 		c.OpenVPN.Dev = "ovpn-tun0"
-	}
-	if t.Type == "openvpn" {
-		if c.OpenVPN.Workers <= 0 && c.Tuning.Workers > 0 {
-			c.OpenVPN.Workers = c.Tuning.Workers
-		}
-		if c.OpenVPN.Workers > openvpnMaxWorkers {
-			c.OpenVPN.Workers = openvpnMaxWorkers
-		}
 	}
 	if c.Hysteria2.Dev == "" && t.Type == "hysteria2" {
 		c.Hysteria2.Dev = "hy2-tun0"

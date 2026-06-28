@@ -1,8 +1,7 @@
 // tun_openvpn.go — OpenVPN tunnel via the openvpn core (external daemon).
 //
-// Multi-core throughput:
-//   • DCO (Data Channel Offload, OpenVPN 2.6+): one process, crypto in kernel across CPUs.
-//   • workers > 1 (no DCO): parallel OpenVPN links on consecutive ports / /30 blocks.
+// Multi-core bandwidth on a single overlay IP requires DCO (OpenVPN 2.6+ + ovpn-dco module).
+// Without DCO, crypto runs in one user-space thread — iperf3 -P helps but each flow is capped.
 package virlink
 
 import (
@@ -21,25 +20,15 @@ import (
 
 const openvpnSubnet = "10.20.50.0/24"
 
-type openvpnProc struct {
-	cmd  *exec.Cmd
-	dev  string
-	peer string
-}
-
 type OpenvpnTunnel struct {
-	cfg       *Config
-	procs     []openvpnProc
-	lockFd    *os.File
-	pidPath   string
-	useDCO    bool
-	workers   int
+	cfg     *Config
+	cmd     *exec.Cmd
+	lockFd  *os.File
+	pidPath string
+	useDCO  bool
 }
 
 func (t *OpenvpnTunnel) DevName() string {
-	if len(t.procs) > 0 {
-		return t.procs[0].dev
-	}
 	if t.cfg.OpenVPN.Dev != "" {
 		return t.cfg.OpenVPN.Dev
 	}
@@ -55,21 +44,32 @@ func (t *OpenvpnTunnel) Up() error {
 	if ov.Config == "" {
 		return fmt.Errorf("[openvpn] config path is required")
 	}
+	if _, err := os.Stat(ov.Config); err != nil {
+		return fmt.Errorf("[openvpn] config %q: %w", ov.Config, err)
+	}
 	if _, err := exec.LookPath("openvpn"); err != nil {
 		return fmt.Errorf("openvpn not found — install: apt install openvpn")
 	}
 
+	if c.OpenVPN.Workers > 1 {
+		logWarn(fmt.Sprintf("openvpn workers=%d ignored — extra links use separate overlay IPs and do not raise bandwidth to one peer; install ovpn-dco for multi-core on a single IP", c.OpenVPN.Workers))
+	}
+
 	t.useDCO = openvpnUseDCO(c)
-	t.workers = openvpnWorkers(c)
-	dev0 := openvpnWorkerDev(c, 0)
+	dev := t.DevName()
+	addr := t.OverlayIP()
+	peer := t.PeerIP()
+	port := c.Transport.Port
+	proto := c.Transport.Proto
+	if proto == "" {
+		proto = "udp"
+	}
 
 	header("openvpn / " + c.Mode)
 	if t.useDCO {
-		logInfo("DCO enabled — kernel multi-core data channel (OpenVPN 2.6+)")
-	} else if t.workers > 1 {
-		logInfo(fmt.Sprintf("parallel links: %d  (multi-path, no DCO)", t.workers))
+		logInfo("DCO enabled — single overlay IP, kernel multi-core data channel")
 	} else {
-		logInfo("single OpenVPN process (user-space crypto — install ovpn-dco for multi-core)")
+		logWarn("DCO off — user-space crypto (~1 core per flow); install OpenVPN 2.6+ and ovpn-dco for max bandwidth to one peer IP")
 	}
 
 	applyPerfFromConfig(c)
@@ -77,7 +77,7 @@ func (t *OpenvpnTunnel) Up() error {
 	t.doClean()
 
 	var err error
-	t.lockFd, err = acquireTunnelLock(dev0)
+	t.lockFd, err = acquireTunnelLock(dev)
 	if err != nil {
 		return err
 	}
@@ -87,148 +87,75 @@ func (t *OpenvpnTunnel) Up() error {
 	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
 	_ = os.MkdirAll(filepath.Dir(t.pidPath), 0o755)
 
-	for w := 0; w < t.workers; w++ {
-		conf := openvpnWorkerConfPath(ov.Config, w)
-		if _, err := os.Stat(conf); err != nil {
-			return fmt.Errorf("[openvpn] config %q: %w", conf, err)
-		}
-		dev := openvpnWorkerDev(c, w)
-		_, peerPlain := openvpnWorkerAddrs(c, w)
-		step(fmt.Sprintf("starting openvpn worker %d/%d (%s)...", w+1, t.workers, filepath.Base(conf)))
-
-		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			return fmt.Errorf("openvpn log: %w", err)
-		}
-
-		args := []string{
-			"--cd", filepath.Dir(conf),
-			"--config", filepath.Base(conf),
-		}
-		if w == 0 {
-			args = append(args, "--writepid", t.pidPath)
-		}
-		if t.useDCO {
-			args = append(args, "--enable-dco")
-		} else {
-			args = append(args, "--disable-dco")
-		}
-
-		cmd := exec.Command("openvpn", args...)
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
-		if err := cmd.Start(); err != nil {
-			logFile.Close()
-			t.stopProcesses()
-			return fmt.Errorf("openvpn start worker %d: %w", w, err)
-		}
-		go func() { _ = logFile.Close() }()
-
-		step("waiting for TUN " + dev + "...")
-		if err := waitForOpenVPN(dev, logPath, cmd, 120*time.Second); err != nil {
-			t.stopProcesses()
-			return err
-		}
-
-		l, err := netlink.LinkByName(dev)
-		if err != nil {
-			t.stopProcesses()
-			return fmt.Errorf("link %s: %w", dev, err)
-		}
-		if c.Tunnel.MTU > 0 {
-			_ = netlink.LinkSetMTU(l, c.Tunnel.MTU)
-		}
-
-		t.procs = append(t.procs, openvpnProc{cmd: cmd, dev: dev, peer: peerPlain})
+	step(fmt.Sprintf("starting openvpn (%s)...", filepath.Base(ov.Config)))
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("openvpn log: %w", err)
 	}
 
-	if t.workers > 1 && !t.useDCO {
-		step("ECMP overlay routes (multi-path)...")
-		if err := t.installWorkerECMP(); err != nil {
-			logWarn("ecmp: " + err.Error())
-		}
+	args := []string{
+		"--cd", filepath.Dir(ov.Config),
+		"--config", filepath.Base(ov.Config),
+		"--writepid", t.pidPath,
+	}
+	if t.useDCO {
+		args = append(args, "--enable-dco")
+	} else {
+		args = append(args, "--disable-dco")
+	}
+
+	t.cmd = exec.Command("openvpn", args...)
+	t.cmd.Stdout = logFile
+	t.cmd.Stderr = logFile
+	if err := t.cmd.Start(); err != nil {
+		logFile.Close()
+		return fmt.Errorf("openvpn start: %w", err)
+	}
+	go func() { _ = logFile.Close() }()
+
+	step("waiting for TUN device " + dev + "...")
+	if err := waitForOpenVPN(dev, logPath, t.cmd, 120*time.Second); err != nil {
+		t.stopProcess()
+		return err
+	}
+
+	l, err := netlink.LinkByName(dev)
+	if err != nil {
+		t.stopProcess()
+		return fmt.Errorf("link %s: %w", dev, err)
+	}
+	if c.Tunnel.MTU > 0 {
+		_ = netlink.LinkSetMTU(l, c.Tunnel.MTU)
 	}
 
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
-	devs := make([]string, len(t.procs))
-	for i, p := range t.procs {
-		devs[i] = p.dev
-	}
-	applyTunnelTuning(c, devs...)
-	for _, d := range devs {
-		addMSS(d)
-	}
+	applyTunnelTuning(c, dev)
+	addMSS(dev)
 
 	if t.useDCO {
 		t.logDCOStatus(logPath)
+		if !openvpnDCOActive(logPath) {
+			logWarn("DCO was requested but is not active in the log — throughput may be single-threaded")
+		}
 	}
 
-	addr := t.OverlayIP()
-	peer := t.PeerIP()
+	if t.cmd.Process != nil {
+		logOK(fmt.Sprintf("openvpn running  pid=%d  dev=%s  dco=%v", t.cmd.Process.Pid, dev, openvpnDCOActive(logPath)))
+	}
+	logOK(fmt.Sprintf("overlay %s  peer %s", addr, peer))
+
 	extra := []string{
-		fmt.Sprintf("transport : OpenVPN %s", c.Transport.Proto),
+		fmt.Sprintf("transport : OpenVPN %s :%d", proto, port),
 		"config    : " + ov.Config,
 		"log       : " + logPath,
 		"test      : ping -c3 " + peer,
 	}
-	if t.workers > 1 && !t.useDCO {
-		var peers []string
-		for _, p := range t.procs {
-			peers = append(peers, p.peer)
-		}
-		extra = append(extra,
-			fmt.Sprintf("workers   : %d parallel links", t.workers),
-			"peers     : "+strings.Join(peers, "  "),
-			"bench     : iperf3 -P"+fmt.Sprint(t.workers)+" or run iperf to each peer IP",
-		)
+	if t.useDCO && openvpnDCOActive(logPath) {
+		extra = append(extra, "bench     : iperf3 -t30 (single flow uses multiple cores via DCO)")
+	} else {
+		extra = append(extra, "bench     : iperf3 -P4 for parallel flows, or enable DCO for one-IP multi-core")
 	}
-	if len(t.procs) > 0 && t.procs[0].cmd.Process != nil {
-		logOK(fmt.Sprintf("openvpn running  workers=%d  pid=%d  dev=%s", t.workers, t.procs[0].cmd.Process.Pid, t.DevName()))
-	}
-	logOK(fmt.Sprintf("overlay %s  peer %s", addr, peer))
-	done(t.DevName(), addr, peer, extra...)
-	return nil
-}
-
-func (t *OpenvpnTunnel) installWorkerECMP() error {
-	if len(t.procs) < 2 {
-		return nil
-	}
-	// ECMP toward the aggregate overlay prefix so flows hash across links.
-	subnet := t.cfg.Tunnel.CIDR
-	if subnet == "" {
-		subnet = openvpnSubnet
-	}
-	_, ipNet, err := net.ParseCIDR(subnet)
-	if err != nil {
-		return err
-	}
-	ones, _ := ipNet.Mask.Size()
-	if ones > 28 {
-		ones = 28
-	}
-	mask := net.CIDRMask(ones, 32)
-	dst := &net.IPNet{IP: ipNet.IP.To4().Mask(mask), Mask: mask}
-
-	devs := make([]string, len(t.procs))
-	for i, p := range t.procs {
-		devs[i] = p.dev
-	}
-	_ = netlink.RouteDel(&netlink.Route{Dst: dst})
-	route := &netlink.Route{Dst: dst}
-	for _, name := range devs {
-		l, err := netlink.LinkByName(name)
-		if err != nil {
-			return err
-		}
-		route.MultiPath = append(route.MultiPath, &netlink.NexthopInfo{
-			LinkIndex: l.Attrs().Index,
-		})
-	}
-	if err := netlink.RouteAdd(route); err != nil {
-		return err
-	}
-	logOK(fmt.Sprintf("ECMP %s via %s", dst, strings.Join(devs, " + ")))
+	done(dev, addr, peer, extra...)
 	return nil
 }
 
@@ -256,51 +183,35 @@ func (t *OpenvpnTunnel) Down() error {
 }
 
 func (t *OpenvpnTunnel) doClean() {
-	t.stopProcesses()
+	t.stopProcess()
 	if t.lockFd != nil {
 		releaseTunnelLock(t.lockFd)
 		t.lockFd = nil
 	}
 	restoreTunnelTuning()
-	if len(t.procs) > 0 {
-		devs := make([]string, len(t.procs))
-		for i, p := range t.procs {
-			devs[i] = p.dev
-		}
-		for _, d := range devs {
-			delMSS(d)
-			nlDown(d)
-		}
-	}
-	t.procs = nil
+	delMSS(t.DevName())
+	nlDown(t.DevName())
 	if t.pidPath != "" {
 		_ = os.Remove(t.pidPath)
 		t.pidPath = ""
 	}
 }
 
-func (t *OpenvpnTunnel) stopProcesses() {
-	for _, p := range t.procs {
-		if p.cmd != nil && p.cmd.Process != nil {
-			_ = p.cmd.Process.Signal(os.Interrupt)
-		}
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for _, p := range t.procs {
-		if p.cmd == nil || p.cmd.Process == nil {
-			continue
-		}
+func (t *OpenvpnTunnel) stopProcess() {
+	if t.cmd != nil && t.cmd.Process != nil {
+		_ = t.cmd.Process.Signal(os.Interrupt)
 		done := make(chan struct{})
-		go func(cmd *exec.Cmd) {
-			_ = cmd.Wait()
+		go func() {
+			_ = t.cmd.Wait()
 			close(done)
-		}(p.cmd)
+		}()
 		select {
 		case <-done:
-		case <-time.After(time.Until(deadline)):
-			_ = p.cmd.Process.Kill()
+		case <-time.After(5 * time.Second):
+			_ = t.cmd.Process.Kill()
 		}
 	}
+	t.cmd = nil
 	if t.pidPath != "" {
 		if b, err := os.ReadFile(t.pidPath); err == nil {
 			var pid int
@@ -312,16 +223,15 @@ func (t *OpenvpnTunnel) stopProcesses() {
 }
 
 func (t *OpenvpnTunnel) Status() {
-	for _, p := range t.procs {
-		if l, err := netlink.LinkByName(p.dev); err == nil {
-			fmt.Printf("  %s: flags=%v  peer=%s\n", l.Attrs().Name, l.Attrs().Flags, p.peer)
-		}
-		if p.cmd != nil && p.cmd.Process != nil {
-			fmt.Printf("  openvpn pid: %d  dev=%s\n", p.cmd.Process.Pid, p.dev)
-		}
+	dev := t.DevName()
+	if l, err := netlink.LinkByName(dev); err == nil {
+		fmt.Printf("  %s: flags=%v\n", l.Attrs().Name, l.Attrs().Flags)
+	}
+	if t.cmd != nil && t.cmd.Process != nil {
+		fmt.Printf("  openvpn pid: %d\n", t.cmd.Process.Pid)
 	}
 	fmt.Printf("  config: %s\n", t.cfg.OpenVPN.Config)
-	fmt.Printf("  workers: %d  dco: %v\n", t.workers, t.useDCO)
+	fmt.Printf("  dco: %v\n", t.useDCO)
 }
 
 func waitForLink(name string, timeout time.Duration) error {
@@ -346,7 +256,7 @@ func waitForOpenVPN(dev, logPath string, cmd *exec.Cmd, timeout time.Duration) e
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	hint := "start OpenVPN server first; match port/proto/PKI; open firewall; for multi-core install ovpn-dco"
+	hint := "start OpenVPN server first; match port/proto/PKI; open firewall; for multi-core bandwidth install ovpn-dco (DCO)"
 	if logPath != "" {
 		return fmt.Errorf("timeout waiting for %s (%s):\n%s\nlog: %s",
 			dev, hint, openvpnLogTail(logPath, 25), logPath)
