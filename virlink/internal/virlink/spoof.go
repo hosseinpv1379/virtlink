@@ -99,11 +99,15 @@ func wireTCPDoneExtra(cfg *Config) string {
 		return ""
 	}
 	if cfg.Mode == "server" {
-		return fmt.Sprintf("wire      : listen %s  expect client wire src=%s",
-			cfg.Mangle.SrcIP, cfg.Mangle.DstIP)
+		port := cfg.Transport.Port
+		if port == 0 {
+			port = 8443
+		}
+		return fmt.Sprintf("wire      : listen :%d  expect client wire src=%s",
+			port, cfg.Mangle.DstIP)
 	}
-	return fmt.Sprintf("wire      : bind src=%s  dial %s  route via %s",
-		cfg.Mangle.SrcIP, cfg.Mangle.DstIP, cfg.RemoteIP)
+	return fmt.Sprintf("wire      : bind src=%s  dial dst=%s",
+		cfg.Mangle.SrcIP, cfg.RemoteIP)
 }
 
 var wireTxErrWarned atomic.Bool

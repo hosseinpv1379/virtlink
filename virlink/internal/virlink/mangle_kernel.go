@@ -63,7 +63,7 @@ func tcpTunnelWireUp(cfg *Config) error {
 		return err
 	}
 	initWireMonitor(cfg, wirePathTCPSock)
-	logOK("wire spoof enabled (TCP kernel socket: FREEBIND + wire route)")
+	logOK("wire spoof enabled (TCP kernel socket: FREEBIND bind src, dial real remote)")
 	logDebug(fmt.Sprintf("wire spoof srcip=%s peer_wire=%s", cfg.Mangle.SrcIP, cfg.Mangle.DstIP))
 	return nil
 }

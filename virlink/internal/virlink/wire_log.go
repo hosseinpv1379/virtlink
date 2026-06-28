@@ -86,11 +86,14 @@ func initWireMonitor(cfg *Config, path wirePathKind) {
 	switch path {
 	case wirePathTCPSock:
 		if cfg.Mode == "server" {
-			txDesc = fmt.Sprintf("listen %s  expect client wire src=%s",
-				cfg.Mangle.SrcIP, cfg.Mangle.DstIP)
+			port := cfg.Transport.Port
+			if port == 0 {
+				port = 8443
+			}
+			txDesc = fmt.Sprintf("listen :%d  expect client wire src=%s", port, cfg.Mangle.DstIP)
 		} else {
-			txDesc = fmt.Sprintf("bind src=%s  dial wire dst=%s  route via %s",
-				cfg.Mangle.SrcIP, cfg.Mangle.DstIP, cfg.RemoteIP)
+			txDesc = fmt.Sprintf("bind src=%s  dial dst=%s (real remote)",
+				cfg.Mangle.SrcIP, cfg.RemoteIP)
 		}
 	default:
 		txDesc = fmt.Sprintf("src=%s dst=%s (real remote %s)",
