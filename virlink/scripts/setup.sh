@@ -6,10 +6,13 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.2.0"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
+
+OPENVPN_BUNDLE_PORT="${OPENVPN_BUNDLE_PORT:-8765}"
+OPENVPN_BUNDLE_TTL="${OPENVPN_BUNDLE_TTL:-900}"
 
 INSTALL_DIR="/opt/virlink"
 VIRLINK_BIN="${INSTALL_DIR}/virlink"
@@ -1407,56 +1410,294 @@ openvpn_tls_key_directive() {
 
 openvpn_fetch_pki_from_server() {
   local name="$1" server_host="$2" pki_dir="$3"
-  local ssh_user="${4:-root}" ssh_port="${5:-22}"
+  local ssh_user="${4:-root}" ssh_port="${5:-22}" auth_mode="${6:-key}"
   local remote_pki="${INSTALL_DIR}/pki/${name}"
   local remote_export="${remote_pki}/export"
-  local ssh_base=(ssh -p "$ssh_port" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new)
-  local scp_base=(scp -P "$ssh_port" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new)
+  local -a ssh_opts=(-p "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
+  local -a scp_opts=(-P "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
+  local ssh_err
+
+  [[ "$auth_mode" == "key" ]] && ssh_opts+=(-o BatchMode=yes) && scp_opts+=(-o BatchMode=yes)
 
   ensure_ssh_deps
   mkdir -p "$pki_dir"
   chmod 700 "$pki_dir"
 
   blank
-  info "Fetching client credentials from ${ssh_user}@${server_host} (SSH, client bundle only)..."
-  if ! "${ssh_base[@]}" "${ssh_user}@${server_host}" "test -d '${remote_pki}'"; then
-    die "No PKI on server at ${remote_pki} — run OpenVPN setup on the server first"
+  if [[ "$auth_mode" == "password" ]]; then
+    info "SSH/SCP from ${ssh_user}@${server_host} — enter server password when prompted..."
+  else
+    info "Fetching client credentials from ${ssh_user}@${server_host} (SSH key)..."
   fi
 
-  if "${ssh_base[@]}" "${ssh_user}@${server_host}" "test -d '${remote_export}'"; then
-    "${scp_base[@]}" -r "${ssh_user}@${server_host}:${remote_export}/." "${pki_dir}/" \
-      || die "SCP failed — check SSH keys: ssh ${ssh_user}@${server_host}"
+  ssh_err=$(mktemp /tmp/virlink-ssh.XXXXXX)
+  if ! ssh "${ssh_opts[@]}" "${ssh_user}@${server_host}" "test -d '${remote_pki}'" 2>"$ssh_err"; then
+    if grep -qiE 'permission denied|publickey' "$ssh_err"; then
+      rm -f "$ssh_err"
+      die "SSH login failed (no key / wrong password). Use ${C}easy HTTP download${NC} instead — no SSH needed."
+    fi
+    if grep -qiE 'connection refused|timed out|no route' "$ssh_err"; then
+      rm -f "$ssh_err"
+      die "Cannot reach ${server_host}:${ssh_port} — check IP, firewall, and sshd."
+    fi
+    rm -f "$ssh_err"
+    die "No PKI on server at ${remote_pki} — run OpenVPN setup on the server first."
+  fi
+  rm -f "$ssh_err"
+
+  if ssh "${ssh_opts[@]}" "${ssh_user}@${server_host}" "test -d '${remote_export}'"; then
+    scp "${scp_opts[@]}" -r "${ssh_user}@${server_host}:${remote_export}/." "${pki_dir}/" \
+      || die "SCP failed"
   else
     local f tls_key="tc.key"
-    "${ssh_base[@]}" "${ssh_user}@${server_host}" "test -f '${remote_pki}/tc.key'" \
+    ssh "${ssh_opts[@]}" "${ssh_user}@${server_host}" "test -f '${remote_pki}/tc.key'" \
       || tls_key="ta.key"
     for f in ca.crt client.crt client.key "$tls_key"; do
-      "${scp_base[@]}" "${ssh_user}@${server_host}:${remote_pki}/${f}" "${pki_dir}/${f}" \
-        || die "Failed to fetch ${f} — re-run server setup to refresh export bundle"
+      scp "${scp_opts[@]}" "${ssh_user}@${server_host}:${remote_pki}/${f}" "${pki_dir}/${f}" \
+        || die "Failed to fetch ${f}"
     done
   fi
 
   openvpn_strip_server_secrets "$pki_dir"
-  ok "PKI fetched from ${server_host}"
+  ok "PKI fetched from ${server_host} via SSH"
+}
+
+openvpn_stop_bundle_server() {
+  local name="$1"
+  local pidfile="/var/run/virlink/bundle-${name}.pid"
+  local metadir="/var/run/virlink/bundle-${name}.meta"
+  [[ -f "$pidfile" ]] || return 0
+  local pid
+  pid=$(cat "$pidfile" 2>/dev/null || true)
+  [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+  rm -f "$pidfile"
+  if [[ -f "${metadir}/serve.dir" ]]; then
+    rm -rf "$(cat "${metadir}/serve.dir" 2>/dev/null)" 2>/dev/null || true
+  fi
+  if [[ -f "${metadir}/bundle.tgz" ]]; then
+    rm -f "$(cat "${metadir}/bundle.tgz" 2>/dev/null)" 2>/dev/null || true
+  fi
+  rm -rf "$metadir"
+}
+
+openvpn_start_bundle_server() {
+  local name="$1" pki_dir="$2" port="${3:-$OPENVPN_BUNDLE_PORT}"
+  local export_dir="${pki_dir}/export"
+  local token serve_root bundle meta="/var/run/virlink/bundle-${name}.meta"
+  local py_cmd=() pid
+
+  openvpn_export_client_bundle "$pki_dir" || die "Cannot create client export bundle"
+  openvpn_stop_bundle_server "$name"
+  mkdir -p /var/run/virlink "$meta"
+
+  token=$(openssl rand -hex 4 2>/dev/null || tr -dc 'a-f0-9' </dev/urandom | head -c 8)
+  serve_root=$(mktemp -d "/tmp/virlink-serve-${name}.XXXXXX")
+  bundle="${serve_root}/bundle.tar.gz"
+  mkdir -p "${serve_root}/${token}"
+  tar -czf "$bundle" -C "$export_dir" .
+  cp "$bundle" "${serve_root}/${token}/bundle.tar.gz"
+
+  if command -v python3 &>/dev/null; then
+    py_cmd=(python3 -m http.server "$port" --bind 0.0.0.0)
+  elif command -v python &>/dev/null; then
+    py_cmd=(python -m SimpleHTTPServer "$port")
+  else
+    rm -rf "$serve_root"
+    die "python3 not found — use SSH or manual copy instead"
+  fi
+
+  (cd "$serve_root" && "${py_cmd[@]}" >/dev/null 2>&1) &
+  pid=$!
+  sleep 0.5
+  kill -0 "$pid" 2>/dev/null || { rm -rf "$serve_root"; die "HTTP server failed to start on port ${port}"; }
+
+  echo "$pid" > "/var/run/virlink/bundle-${name}.pid"
+  echo "$serve_root" > "${meta}/serve.dir"
+  echo "$bundle" > "${meta}/bundle.tgz"
+  echo "$token" > "${meta}/token"
+  echo "$port" > "${meta}/port"
+
+  (
+    sleep "$OPENVPN_BUNDLE_TTL"
+    openvpn_stop_bundle_server "$name"
+  ) &
+
+  OPENVPN_BUNDLE_TOKEN="$token"
+  OPENVPN_BUNDLE_PORT="$port"
+}
+
+openvpn_show_bundle_instructions() {
+  local server_ip="$1" name="$2"
+  local port="${OPENVPN_BUNDLE_PORT:-8765}"
+  local token="${OPENVPN_BUNDLE_TOKEN:-????????}"
+  blank
+  echo -e "  ${BOLD}${G}Easy copy — no SSH keys needed${NC}"
+  sep_thin
+  echo -e "  On the ${BOLD}client${NC}, run virlink-setup → Create tunnel → openvpn → client"
+  echo -e "  Choose: ${C}easy — HTTP download${NC}"
+  echo
+  echo -e "  ${DIM}Server IP${NC}   ${W}${server_ip}${NC}"
+  echo -e "  ${DIM}Port${NC}        ${W}${port}${NC}  ${DIM}(allow TCP on firewall)${NC}"
+  echo -e "  ${DIM}Token${NC}       ${W}${token}${NC}"
+  echo -e "  ${DIM}Expires${NC}     ${W}$(( OPENVPN_BUNDLE_TTL / 60 )) minutes${NC}"
+  echo
+  echo -e "  ${DIM}Or on client (one line):${NC}"
+  echo -e "  ${W}curl -fsSL http://${server_ip}:${port}/${token}/bundle.tar.gz | sudo tar -xzf - -C ${INSTALL_DIR}/pki/${name}/${NC}"
+  sep_thin
+}
+
+openvpn_fetch_pki_via_http() {
+  local name="$1" server_host="$2" pki_dir="$3"
+  local port token _p _t
+
+  require_cmd curl
+  require_cmd tar
+  mkdir -p "$pki_dir"
+  chmod 700 "$pki_dir"
+
+  blank
+  info "Easy download — copy Port + Token from the server screen."
+  prompt _p "Server download port" "$OPENVPN_BUNDLE_PORT"
+  prompt _t "Download token (8 characters from server)" ""
+  port="$_p"
+  token="$_t"
+  [[ -n "$token" ]] || die "Token is required — start download on server first."
+
+  info "Downloading from http://${server_host}:${port}/${token}/bundle.tar.gz ..."
+  if ! curl -fsSL --connect-timeout 20 --max-time 120 \
+      "http://${server_host}:${port}/${token}/bundle.tar.gz" \
+      | tar -xzf - -C "$pki_dir"; then
+    die "Download failed — check token/port, server download still running, and firewall TCP/${port}"
+  fi
+
+  openvpn_strip_server_secrets "$pki_dir"
+  ok "PKI downloaded from server (HTTP)"
+}
+
+openvpn_show_manual_copy_help() {
+  local name="$1" server_host="$2" pki_dir="$3"
+  blank
+  echo -e "  ${BOLD}Manual copy${NC}"
+  sep_thin
+  echo -e "  On ${BOLD}server${NC}, files are in:"
+  echo -e "    ${W}${INSTALL_DIR}/pki/${name}/export/${NC}"
+  echo -e "  Copy ${W}ca.crt client.crt client.key tc.key${NC} to client:"
+  echo -e "    ${W}${pki_dir}/${NC}"
+  echo
+  echo -e "  ${DIM}Example (enter password when asked):${NC}"
+  echo -e "    scp -r root@${server_host}:${INSTALL_DIR}/pki/${name}/export/* ${pki_dir}/"
+  sep_thin
+  press_enter
+}
+
+openvpn_acquire_client_pki() {
+  local name="$1" server_host="$2" pki_dir="$3"
+  local method_raw method
+
+  if [[ -f "${pki_dir}/ca.crt" ]]; then
+    openvpn_require_client_pki "$pki_dir"
+    return 0
+  fi
+
+  blank
+  warn "Client PKI not found locally."
+  info "Choose how to get credentials from the server (client certs only — no server private keys)."
+
+  pick method_raw "Get credentials from server" \
+    "easy — HTTP download (recommended, no SSH keys)" \
+    "ssh-password — SSH/SCP (type server password when asked)" \
+    "ssh-key — SSH/SCP (automatic, needs ssh-copy-id first)" \
+    "manual — files already copied / copy by hand"
+  method="$(label_key "$method_raw")"
+
+  case "$method" in
+    easy)
+      openvpn_fetch_pki_via_http "$name" "$server_host" "$pki_dir"
+      ;;
+    ssh-password)
+      openvpn_prompt_ssh
+      openvpn_fetch_pki_from_server "$name" "$server_host" "$pki_dir" \
+        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT" password
+      ;;
+    ssh-key)
+      openvpn_prompt_ssh
+      openvpn_fetch_pki_from_server "$name" "$server_host" "$pki_dir" \
+        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT" key
+      ;;
+    manual)
+      openvpn_show_manual_copy_help "$name" "$server_host" "$pki_dir"
+      ;;
+    *)
+      die "Unknown transfer method: $method"
+      ;;
+  esac
+  openvpn_require_client_pki "$pki_dir"
+}
+
+openvpn_server_send_credentials() {
+  local name="$1" client_host="$2" pki_dir="$3" server_ip="$4"
+  local method_raw method
+
+  blank
+  pick method_raw "Send credentials to client" \
+    "easy — start HTTP download (recommended, no SSH keys)" \
+    "ssh-password — push via SSH (type client password when asked)" \
+    "ssh-key — push via SSH (automatic, needs ssh-copy-id)" \
+    "skip — show instructions only"
+  method="$(label_key "$method_raw")"
+
+  case "$method" in
+    easy)
+      info "Starting temporary download server (port ${OPENVPN_BUNDLE_PORT})..."
+      openvpn_start_bundle_server "$name" "$pki_dir"
+      ok "Download server running"
+      openvpn_show_bundle_instructions "$server_ip" "$name"
+      warn "Allow TCP ${OPENVPN_BUNDLE_PORT} from client IP on this server's firewall"
+      ;;
+    ssh-password)
+      openvpn_prompt_ssh
+      openvpn_push_client_bundle "$name" "$client_host" "$pki_dir" \
+        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT" password
+      ;;
+    ssh-key)
+      openvpn_prompt_ssh
+      openvpn_push_client_bundle "$name" "$client_host" "$pki_dir" \
+        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT" key
+      ;;
+    skip|*)
+      openvpn_export_client_bundle "$pki_dir" || true
+      info "Client bundle: ${pki_dir}/export/"
+      info "On client: virlink-setup → openvpn → choose ${C}easy HTTP download${NC}"
+      info "Or start easy download here by re-running and picking that option."
+      ;;
+  esac
 }
 
 openvpn_push_client_bundle() {
   local name="$1" client_host="$2" pki_dir="$3"
-  local ssh_user="${4:-root}" ssh_port="${5:-22}"
+  local ssh_user="${4:-root}" ssh_port="${5:-22}" auth_mode="${6:-key}"
   local export_dir="${pki_dir}/export"
   local remote_dir="${INSTALL_DIR}/pki/${name}"
+  local -a ssh_opts=(-p "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
+  local -a scp_opts=(-P "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
+
+  [[ "$auth_mode" == "key" ]] && ssh_opts+=(-o BatchMode=yes) && scp_opts+=(-o BatchMode=yes)
 
   ensure_ssh_deps
   openvpn_export_client_bundle "$pki_dir" || die "Export bundle missing — regenerate PKI on server"
 
   blank
-  info "Pushing client credentials to ${ssh_user}@${client_host} (export bundle only)..."
-  ssh -p "$ssh_port" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new \
-    "${ssh_user}@${client_host}" "mkdir -p '${remote_dir}' && chmod 700 '${remote_dir}'" \
-    || die "SSH to client failed — check keys: ssh ${ssh_user}@${client_host}"
+  if [[ "$auth_mode" == "password" ]]; then
+    info "Pushing to ${ssh_user}@${client_host} — enter client password when prompted..."
+  else
+    info "Pushing client credentials to ${ssh_user}@${client_host}..."
+  fi
 
-  scp -P "$ssh_port" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new \
-    -r "${export_dir}/." "${ssh_user}@${client_host}:${remote_dir}/" \
+  ssh "${ssh_opts[@]}" "${ssh_user}@${client_host}" \
+    "mkdir -p '${remote_dir}' && chmod 700 '${remote_dir}'" \
+    || die "SSH to client failed"
+
+  scp "${scp_opts[@]}" -r "${export_dir}/." "${ssh_user}@${client_host}:${remote_dir}/" \
     || die "SCP to client failed"
 
   ok "Client credentials pushed to ${client_host}:${remote_dir}"
@@ -1588,15 +1829,7 @@ gen_openvpn() {
   if [[ "$mode" == "server" ]]; then
     openvpn_gen_pki "$pki_dir"
   else
-    if [[ ! -f "${pki_dir}/ca.crt" ]]; then
-      blank
-      warn "Client PKI not found locally."
-      info "Privacy: only client certs + tls-crypt are fetched (never server/CA private keys)."
-      openvpn_prompt_ssh
-      openvpn_fetch_pki_from_server "$name" "$remote_ip" "$pki_dir" \
-        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
-    fi
-    openvpn_require_client_pki "$pki_dir"
+    openvpn_acquire_client_pki "$name" "$remote_ip" "$pki_dir"
   fi
 
   openvpn_overlay_ips "$cidr" "$mode"
@@ -1615,14 +1848,7 @@ gen_openvpn() {
     ok "Wrote ${ovpn_conf} (${perf}, ${proto})"
     blank
     info "Privacy: CA/server private keys remain on this host only."
-    info "Client bundle: ${pki_dir}/export/"
-    if confirm "Push client credentials to peer (${remote_ip}) via SSH?"; then
-      openvpn_prompt_ssh
-      openvpn_push_client_bundle "$name" "$remote_ip" "$pki_dir" \
-        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
-    else
-      info "On client: re-run setup — PKI auto-fetches from this server via SSH."
-    fi
+    openvpn_server_send_credentials "$name" "$remote_ip" "$pki_dir" "$local_ip"
   else
     ovpn_conf="${pki_dir}/client.conf"
     openvpn_write_client_conf "$pki_dir" "$port" "$proto" "$remote_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"

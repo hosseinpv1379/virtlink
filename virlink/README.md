@@ -72,11 +72,35 @@ virlink does **not** reimplement OpenVPN. It wraps the system **`openvpn`** bina
 
 Other tunnel types (GRE, icmp, udp-obfs) are better for raw speed or DPI evasion without TLS overhead. OpenVPN is the right choice when you need **standard encrypted site-to-site** with minimal manual PKI work.
 
+### Copy credentials to the client (pick one)
+
+| Method | Best for | SSH keys needed? |
+|--------|----------|------------------|
+| **easy — HTTP download** | Beginners (recommended) | No |
+| **ssh-password** | When SSH works with password | No (prompts password) |
+| **ssh-key** | Automation / advanced | Yes (`ssh-copy-id`) |
+| **manual** | USB / panel file manager | No |
+
+**Easy mode (no SSH keys):**
+
+1. **Server** — after creating the tunnel, choose **easy — start HTTP download**
+2. Note the **Port** (default `8765`) and **Token** shown on screen
+3. Open firewall: `TCP/8765` from client → server
+4. **Client** — create tunnel → choose **easy — HTTP download** → enter port + token
+
+One-liner on client (token from server screen):
+
+```bash
+curl -fsSL http://SERVER_IP:8765/TOKEN/bundle.tar.gz | sudo tar -xzf - -C /opt/virlink/pki/TUNNELNAME/
+```
+
+Download link expires after **15 minutes** (server starts a temporary HTTP server).
+
 ### Prerequisites
 
 - Linux amd64, **root**
 - **`openvpn`** and **`openssl`** — installed automatically by `virlink-setup` on install, update, and when creating/starting OpenVPN tunnels (apt/dnf/yum/apk/zypper; EPEL on RHEL)
-- For automated PKI sync: **passwordless SSH** from client → server (`ssh-copy-id root@SERVER_IP`)
+- For automated PKI sync: **passwordless SSH** optional — use **easy HTTP download** instead
 
 ### Step-by-step (interactive)
 
@@ -188,7 +212,7 @@ Wire IP spoof (`[mangle]`) is **not supported** for OpenVPN tunnels.
 | Problem | Fix |
 |---------|-----|
 | `'openvpn' not found` | Re-run setup — deps install automatically as root |
-| PKI fetch fails | Run server setup first; ensure `ssh root@SERVER` works without a password |
+| PKI fetch fails | Use **easy HTTP download** on both sides; or **ssh-password**; allow TCP **8765** on server firewall |
 | Tunnel up but no ping | Open firewall: `proto/port` between public IPs; check overlay IPs |
 | Old PKI (`ta.key` / `dh.pem`) | Re-run server setup to regenerate export, or migrate configs manually |
 
