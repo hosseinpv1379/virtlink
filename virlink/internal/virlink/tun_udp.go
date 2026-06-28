@@ -31,7 +31,7 @@ type UdpTunnel struct {
 	localIP   [4]byte
 }
 
-func (t *UdpTunnel) DevName() string   { return "udp-tun0" }
+func (t *UdpTunnel) DevName() string   { return tunnelDevName(t.cfg, "udp-tun0") }
 func (t *UdpTunnel) OverlayIP() string { return overlayAddr(t.cfg, udpRawSubnet) }
 func (t *UdpTunnel) PeerIP() string    { return peerAddr(t.cfg, udpRawSubnet) }
 

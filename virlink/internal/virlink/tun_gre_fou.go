@@ -15,7 +15,7 @@ const greFouSubnet = "10.20.1.0/30"
 //   GRE interface → netlink.Gretun (native)
 type GreFouTunnel struct{ cfg *Config }
 
-func (t *GreFouTunnel) DevName() string    { return "gre-fou0" }
+func (t *GreFouTunnel) DevName() string    { return tunnelDevName(t.cfg, "gre-fou0") }
 func (t *GreFouTunnel) dev() string        { return t.DevName() }
 func (t *GreFouTunnel) OverlayIP() string  { return overlayAddr(t.cfg, greFouSubnet) }
 func (t *GreFouTunnel) PeerIP() string     { return peerAddr(t.cfg, greFouSubnet) }

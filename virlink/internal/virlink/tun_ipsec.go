@@ -13,7 +13,7 @@ const ipsecSubnet = "10.20.8.0/30"
 // IPsec xfrm states/policies: `ip xfrm` subprocess (XFRM netlink is complex)
 type IpsecTunnel struct{ cfg *Config }
 
-func (t *IpsecTunnel) DevName() string    { return "gre-ipsec0" }
+func (t *IpsecTunnel) DevName() string    { return tunnelDevName(t.cfg, "gre-ipsec0") }
 func (t *IpsecTunnel) dev() string        { return t.DevName() }
 func (t *IpsecTunnel) OverlayIP() string  { return overlayAddr(t.cfg, ipsecSubnet) }
 func (t *IpsecTunnel) PeerIP() string     { return peerAddr(t.cfg, ipsecSubnet) }

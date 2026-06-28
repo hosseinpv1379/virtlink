@@ -37,7 +37,7 @@ type TcpMuxTunnel struct {
 	hashSeed uint32
 }
 
-func (t *TcpMuxTunnel) DevName() string   { return "tcpmux-tun0" }
+func (t *TcpMuxTunnel) DevName() string   { return tunnelDevName(t.cfg, "tcpmux-tun0") }
 func (t *TcpMuxTunnel) OverlayIP() string { return overlayAddr(t.cfg, tcpMuxSubnet) }
 func (t *TcpMuxTunnel) PeerIP() string    { return peerAddr(t.cfg, tcpMuxSubnet) }
 

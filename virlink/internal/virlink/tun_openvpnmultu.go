@@ -94,7 +94,7 @@ func (t *OpenvpnMultuTunnel) Up() error {
 	for i := 0; i < n; i++ {
 		w := &t.workers[i]
 		w.index = i
-		w.dev = fmt.Sprintf("ovpnm-w%d", i)
+		w.dev = openvpnMultuWorkerDev(c, i)
 		w.conf = openvpnMultuWorkerConfPath(c, i)
 		w.logPath = openvpnMultuWorkerLogPath(c, i)
 		w.pidPath = openvpnMultuWorkerPIDPath(c, i)
@@ -174,7 +174,7 @@ func openvpnMultuPreclean(c *Config) {
 		nlRouteDelAll(peer)
 	}
 	for i := 0; i < n; i++ {
-		dev := fmt.Sprintf("ovpnm-w%d", i)
+		dev := openvpnMultuWorkerDev(c, i)
 		openvpnKillStalePID(openvpnMultuWorkerPIDPath(c, i))
 		delMSS(dev)
 		nlDown(dev)
@@ -219,6 +219,7 @@ func (t *OpenvpnMultuTunnel) startWorker(w *openvpnMultuWorker) error {
 	args := []string{
 		"--cd", filepath.Dir(w.conf),
 		"--config", filepath.Base(w.conf),
+		"--dev", w.dev,
 		"--writepid", w.pidPath,
 		"--disable-dco",
 	}

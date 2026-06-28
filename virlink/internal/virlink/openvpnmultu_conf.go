@@ -48,7 +48,7 @@ func openvpnMultuMaterializeWorkers(c *Config) (string, error) {
 		linkClient, linkServer := openvpnMultuWorkerLinkIPs(i, c.Mode)
 		confPath := openvpnMultuWorkerConfPath(c, i)
 		port := basePort + i
-		dev := fmt.Sprintf("ovpnm-w%d", i)
+		dev := openvpnMultuWorkerDev(c, i)
 
 		var body string
 		var err error

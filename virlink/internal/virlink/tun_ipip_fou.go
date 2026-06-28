@@ -12,7 +12,7 @@ const ipipFouSubnet = "10.20.2.0/30"
 // Lowest overhead tunnel type — IPv4 only, no encryption.
 type IpipFouTunnel struct{ cfg *Config }
 
-func (t *IpipFouTunnel) DevName() string   { return "ipip-fou0" }
+func (t *IpipFouTunnel) DevName() string   { return tunnelDevName(t.cfg, "ipip-fou0") }
 func (t *IpipFouTunnel) dev() string       { return t.DevName() }
 func (t *IpipFouTunnel) OverlayIP() string { return overlayAddr(t.cfg, ipipFouSubnet) }
 func (t *IpipFouTunnel) PeerIP() string    { return peerAddr(t.cfg, ipipFouSubnet) }

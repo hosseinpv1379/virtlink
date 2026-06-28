@@ -26,7 +26,7 @@ type TcpTunnel struct {
 	stop   stoppedFlag
 }
 
-func (t *TcpTunnel) DevName() string   { return "tcp-tun0" }
+func (t *TcpTunnel) DevName() string   { return tunnelDevName(t.cfg, "tcp-tun0") }
 func (t *TcpTunnel) OverlayIP() string { return overlayAddr(t.cfg, tcpSubnet) }
 func (t *TcpTunnel) PeerIP() string    { return peerAddr(t.cfg, tcpSubnet) }
 

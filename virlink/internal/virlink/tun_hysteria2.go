@@ -39,7 +39,7 @@ func (t *Hysteria2Tunnel) DevName() string {
 	if t.cfg.Hysteria2.Dev != "" {
 		return t.cfg.Hysteria2.Dev
 	}
-	return "hy2-tun0"
+	return tunnelDevName(t.cfg, "hy2-tun0")
 }
 
 func (t *Hysteria2Tunnel) OverlayIP() string { return overlayAddr(t.cfg, hysteria2Subnet) }

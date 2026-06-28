@@ -21,7 +21,7 @@ const greSubnet = "10.20.40.0/24"
 // Traffic is encapsulated directly in GRE, not inside UDP.
 type GreTunnel struct{ cfg *Config }
 
-func (t *GreTunnel) DevName() string   { return "gre0" }
+func (t *GreTunnel) DevName() string   { return tunnelDevName(t.cfg, "gre0") }
 func (t *GreTunnel) OverlayIP() string { return overlayAddr(t.cfg, greSubnet) }
 func (t *GreTunnel) PeerIP() string    { return peerAddr(t.cfg, greSubnet) }
 

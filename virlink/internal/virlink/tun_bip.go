@@ -30,7 +30,7 @@ type BipTunnel struct {
 	localIP [4]byte
 }
 
-func (t *BipTunnel) DevName() string   { return "bip-tun0" }
+func (t *BipTunnel) DevName() string   { return tunnelDevName(t.cfg, "bip-tun0") }
 func (t *BipTunnel) OverlayIP() string { return overlayAddr(t.cfg, bipSubnet) }
 func (t *BipTunnel) PeerIP() string    { return peerAddr(t.cfg, bipSubnet) }
 

@@ -32,7 +32,7 @@ func (t *OpenvpnTunnel) DevName() string {
 	if t.cfg.OpenVPN.Dev != "" {
 		return t.cfg.OpenVPN.Dev
 	}
-	return "ovpn-tun0"
+	return tunnelDevName(t.cfg, "ovpn-tun0")
 }
 
 func (t *OpenvpnTunnel) OverlayIP() string { return overlayAddr(t.cfg, openvpnSubnet) }
@@ -96,6 +96,7 @@ func (t *OpenvpnTunnel) Up() error {
 	args := []string{
 		"--cd", filepath.Dir(ov.Config),
 		"--config", filepath.Base(ov.Config),
+		"--dev", dev,
 		"--writepid", t.pidPath,
 	}
 	if t.useDCO {

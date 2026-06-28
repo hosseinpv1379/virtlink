@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -19,7 +21,7 @@ type TunnelCfg struct {
 	RemoteIP string `toml:"remote_ip"` // peer's public IP
 	CIDR     string `toml:"cidr"`      // overlay subnet, e.g. "10.20.10.0/24"
 	                                   //   client → .1/<prefix>, server → .2/<prefix>
-	Name     string `toml:"name"`      // optional custom interface name
+	Name     string `toml:"name"`      // tunnel id; also default Linux interface name (IFNAME)
 	MTU      int    `toml:"mtu"`       // overlay MTU (auto if 0)
 }
 
@@ -209,6 +211,12 @@ func loadConfig(path string) (*Config, error) {
 	if _, err := toml.Decode(string(data), &cfg); err != nil {
 		return nil, fmt.Errorf("parse toml: %w", err)
 	}
+	if cfg.Tunnel.Name == "" {
+		base := filepath.Base(path)
+		if strings.HasSuffix(base, ".toml") {
+			cfg.Tunnel.Name = strings.TrimSuffix(base, ".toml")
+		}
+	}
 	setDefaults(&cfg)
 	if err := validate(&cfg); err != nil {
 		return nil, err
@@ -300,16 +308,16 @@ func setDefaults(c *Config) {
 		tr.Port2 = tr.Port + 1
 	}
 	if c.OpenVPN.Dev == "" && t.Type == "openvpn" {
-		c.OpenVPN.Dev = "ovpn-tun0"
+		c.OpenVPN.Dev = tunnelDevName(c, "ovpn-tun0")
 	}
 	if c.Hysteria2.Dev == "" && t.Type == "hysteria2" {
-		c.Hysteria2.Dev = "hy2-tun0"
+		c.Hysteria2.Dev = tunnelDevName(c, "hy2-tun0")
 	}
 	if c.WireGuard.Dev == "" && t.Type == "wireguard" {
-		c.WireGuard.Dev = "wg-virlink0"
+		c.WireGuard.Dev = tunnelDevName(c, "wg-virlink0")
 	}
 	if c.AmneziaWG.Dev == "" && t.Type == "amneziawg" {
-		c.AmneziaWG.Dev = "awg-virlink0"
+		c.AmneziaWG.Dev = tunnelDevName(c, "awg-virlink0")
 	}
 
 	l := &c.L2TP

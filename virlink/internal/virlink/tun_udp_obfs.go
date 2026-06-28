@@ -70,7 +70,7 @@ type UdpObfsTunnel struct {
 	lastPeer atomic.Value
 }
 
-func (t *UdpObfsTunnel) DevName() string   { return "udpobfs0" }
+func (t *UdpObfsTunnel) DevName() string   { return tunnelDevName(t.cfg, "udpobfs0") }
 func (t *UdpObfsTunnel) OverlayIP() string { return overlayAddr(t.cfg, obfsSubnet) }
 func (t *UdpObfsTunnel) PeerIP() string    { return peerAddr(t.cfg, obfsSubnet) }
 

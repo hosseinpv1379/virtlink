@@ -26,7 +26,7 @@ func (t *AmneziaWGTunnel) DevName() string {
 	if t.cfg.AmneziaWG.Dev != "" {
 		return t.cfg.AmneziaWG.Dev
 	}
-	return "awg-virlink0"
+	return tunnelDevName(t.cfg, "awg-virlink0")
 }
 
 func (t *AmneziaWGTunnel) OverlayIP() string {

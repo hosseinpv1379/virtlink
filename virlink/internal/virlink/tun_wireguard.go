@@ -39,7 +39,7 @@ func (t *WireGuardTunnel) DevName() string {
 	if t.cfg.WireGuard.Dev != "" {
 		return t.cfg.WireGuard.Dev
 	}
-	return "wg-virlink0"
+	return tunnelDevName(t.cfg, "wg-virlink0")
 }
 
 func (t *WireGuardTunnel) OverlayIP() string {

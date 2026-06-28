@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.6.7"
+SCRIPT_VERSION="1.6.8"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@mioopython"
 AUTHOR="Hossein"
@@ -116,6 +116,18 @@ label_key() {
   s="${s//$'\n'/}"
   s="${s%%[[:space:]]*}"
   echo "$s"
+}
+
+# Linux IFNAME: [A-Za-z0-9_-], max 15 chars — matches virlink devname.go.
+sanitize_iface_name() {
+  local n="$1" out="" i c
+  for ((i=0; i<${#n}; i++)); do
+    c="${n:i:1}"
+    [[ "$c" =~ [a-zA-Z0-9_-] ]] && out+="$c"
+  done
+  [[ -z "$out" ]] && out="virlink0"
+  [[ ${#out} -gt 15 ]] && out="${out:0:15}"
+  echo "$out"
 }
 
 press_enter() {
@@ -2562,7 +2574,7 @@ gen_openvpn() {
     "resource — lower CPU / power use" \
     "latency — minimal delay"
   perf="$(label_key "$perf_raw")"
-  dev="ovpn-tun0"
+  dev="$(sanitize_iface_name "$name")"
 
   ensure_openvpn_deps
   pki_dir="${INSTALL_DIR}/pki/${name}"
@@ -3295,7 +3307,7 @@ gen_hysteria2() {
     obfs="$(openssl rand -hex 8)"
     info "Obfuscation password: ${obfs}"
   fi
-  dev="hy2-tun0"
+  dev="$(sanitize_iface_name "$name")"
 
   ensure_hysteria2_deps
   pki_dir="${INSTALL_DIR}/pki/${name}"
@@ -3532,7 +3544,7 @@ gen_wireguard() {
   info "WireGuard site-to-site — kernel crypto, UDP transport."
   prompt port "WireGuard UDP port" "51820"
   prompt mtu "Overlay MTU" "1420"
-  dev="wg-virlink0"
+  dev="$(sanitize_iface_name "$name")"
 
   ensure_wireguard_deps
   ensure_wireguard_module
@@ -3893,7 +3905,7 @@ gen_amneziawg() {
   info "AmneziaWG site-to-site — obfuscated WireGuard (DPI-resistant, same overlay model as WG)."
   prompt port "AmneziaWG UDP port" "51820"
   prompt mtu "Overlay MTU" "1420"
-  dev="awg-virlink0"
+  dev="$(sanitize_iface_name "$name")"
 
   ensure_amneziawg_deps
   ensure_amneziawg_module

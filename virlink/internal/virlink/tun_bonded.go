@@ -20,8 +20,8 @@ const bondedSubnet = "10.20.4.0/30"
 // FOU listener: `ip fou` subprocess (requires GENL "fou" family).
 type BondedTunnel struct{ cfg *Config }
 
-func (t *BondedTunnel) dev0() string       { return "gre-mpath0" }
-func (t *BondedTunnel) dev1() string       { return "gre-mpath1" }
+func (t *BondedTunnel) dev0() string       { return tunnelDevNameWithSuffix(t.cfg, "gre-mpath0", "-0") }
+func (t *BondedTunnel) dev1() string       { return tunnelDevNameWithSuffix(t.cfg, "gre-mpath1", "-1") }
 func (t *BondedTunnel) DevName() string    { return t.dev0() }
 func (t *BondedTunnel) OverlayIP() string  { return overlayAddr(t.cfg, bondedSubnet) }
 func (t *BondedTunnel) PeerIP() string     { return peerAddr(t.cfg, bondedSubnet) }

@@ -14,7 +14,7 @@ const l2tpSubnet = "10.20.5.0/30"
 // IP address + MSS rules: native netlink.
 type L2tpv3Tunnel struct{ cfg *Config }
 
-func (t *L2tpv3Tunnel) DevName() string    { return "l2tp-tun0" }
+func (t *L2tpv3Tunnel) DevName() string    { return tunnelDevName(t.cfg, "l2tp-tun0") }
 func (t *L2tpv3Tunnel) dev() string        { return t.DevName() }
 func (t *L2tpv3Tunnel) OverlayIP() string  { return overlayAddr(t.cfg, l2tpSubnet) }
 func (t *L2tpv3Tunnel) PeerIP() string     { return peerAddr(t.cfg, l2tpSubnet) }

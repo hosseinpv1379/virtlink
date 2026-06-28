@@ -38,7 +38,7 @@ type IcmpTunnel struct {
 	localIP [4]byte
 }
 
-func (t *IcmpTunnel) DevName() string   { return "icmp-tun0" }
+func (t *IcmpTunnel) DevName() string   { return tunnelDevName(t.cfg, "icmp-tun0") }
 func (t *IcmpTunnel) OverlayIP() string { return overlayAddr(t.cfg, icmpSubnet) }
 func (t *IcmpTunnel) PeerIP() string    { return peerAddr(t.cfg, icmpSubnet) }
 
