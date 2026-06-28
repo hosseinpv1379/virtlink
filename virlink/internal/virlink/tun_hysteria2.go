@@ -92,7 +92,7 @@ func (t *Hysteria2Tunnel) Up() error {
 	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
 	_ = os.MkdirAll(filepath.Dir(t.pidPath), 0o755)
 
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("hysteria2 log: %w", err)
 	}
@@ -274,15 +274,15 @@ func waitForHysteria2(dev, logPath string, cmd *exec.Cmd, mode string, timeout t
 }
 
 func hysteria2LogFailed(path string) bool {
-	b, err := os.ReadFile(path)
-	if err != nil {
+	tail := hysteria2LogTail(path, 40)
+	if tail == "" || strings.HasPrefix(tail, "(log") {
 		return false
 	}
-	s := strings.ToLower(string(b))
+	s := strings.ToLower(tail)
 	for _, needle := range []string{
 		"fatal", "authentication failed", "failed to authenticate",
-		"connection refused", "i/o timeout", "certificate verify failed",
-		"failed to run tun", "no such file",
+		"certificate verify failed", "failed to run tun", "no such file",
+		"failed to load", "failed to parse", "failed to listen",
 	} {
 		if strings.Contains(s, needle) {
 			return true
