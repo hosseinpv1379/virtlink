@@ -98,7 +98,7 @@ func wireTCPDoneExtra(cfg *Config) string {
 	if !wireSpoofEnabled(cfg) {
 		return ""
 	}
-	return fmt.Sprintf("wire      : TX src=%s dst=%s  RX wire src %s→stack sees %s  (nft mangle)",
+	return fmt.Sprintf("wire      : IRAN/KHAREJ relay  TX src=%s dst=%s  RX wire %s→%s",
 		cfg.Mangle.SrcIP, cfg.RemoteIP, cfg.Mangle.DstIP, cfg.RemoteIP)
 }
 

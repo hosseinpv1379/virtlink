@@ -1,12 +1,13 @@
-// mangle_kernel.go — wire IP spoof for kernel tunnels via nftables.
+// mangle_kernel.go — stateless wire IP relay via nftables.
 //
-// Kernel GRE/IPIP/L2TP/etc. build outer IP headers in-kernel; [mangle] rewrites
-// them on output/input hooks. Rules are installed on tunnel up and removed on down.
+// Roles: client = near side (IRAN), server = far side (KHAREJ) in typical deploy.
+// [mangle] srcip = our wire identity (SRC_IRAN / SRC_KHAREJ on the wire).
+// [mangle] dstip = peer wire identity we accept on RX (WIRE_KHAREJ / WIRE_IRAN).
+// remote_ip   = real routable peer (REAL_KHAREJ / REAL_IRAN) for stack + routing.
 //
-// Wire semantics (same as userspace IPPROTO_RAW / TCP tunnel):
-//   TX: outer src = [mangle] srcip, outer dst = real remote_ip (hping3 -a style)
-//   RX: peer outer src = peer's srcip (= our dstip) → rewrite to real remote_ip
-//       so GRE/TCP stack accepts the packet before demux.
+// Relay (same for kernel GRE and TCP):
+//   TX output:  daddr real peer → saddr our wire src
+//   RX input:   saddr peer wire → saddr real peer (stack sees real IP)
 package virlink
 
 import (
@@ -63,9 +64,8 @@ func tcpTunnelWireUp(cfg *Config) error {
 		return err
 	}
 	initWireMonitor(cfg, wirePathTCP)
-	logOK("wire spoof enabled (TCP: FREEBIND + nft in/out mangle)")
-	logDebug(fmt.Sprintf("wire TX src=%s dst=%s  wire peer src=%s→real %s",
-		cfg.Mangle.SrcIP, cfg.RemoteIP, cfg.Mangle.DstIP, cfg.RemoteIP))
+	logOK("wire relay enabled (TCP nft: IRAN↔KHAREJ two-way mangle)")
+	logWireRelayRoles(cfg)
 	return nil
 }
 
@@ -111,14 +111,12 @@ table inet %s {
 		return fmt.Errorf("kernel mangle nft: %w", err)
 	}
 	initWireMonitor(cfg, wirePathKernel)
-	logOK("wire spoof enabled (kernel nftables mangle)")
-	logDebug(fmt.Sprintf("wire spoof srcip=%s peer_wire_src=%s mss=%d", src, peerWireSrc, mangleMSS))
+	logOK("wire relay enabled (kernel nft mangle)")
+	logWireRelayRoles(cfg)
 	return nil
 }
 
-// applyTCPWireMangle installs bidirectional TCP wire spoof via nftables:
-//   TX output: outer src = [mangle] srcip, dst = real remote_ip
-//   RX prerouting: peer wire src ([mangle] dstip) → real remote_ip for the TCP stack
+// applyTCPWireMangle — stateless TCP wire relay (IRAN client / KHAREJ server).
 func applyTCPWireMangle(cfg *Config) error {
 	kernelMangleMu.Lock()
 	defer kernelMangleMu.Unlock()
@@ -133,39 +131,46 @@ func applyTCPWireMangle(cfg *Config) error {
 }
 
 func tcpWireMangleScript(cfg *Config) string {
-	src := cfg.Mangle.SrcIP
-	peerWire := cfg.Mangle.DstIP
-	local := cfg.LocalIP
-	remote := cfg.RemoteIP
+	wireSrc := cfg.Mangle.SrcIP   // SRC_IRAN or SRC_KHAREJ
+	peerWire := cfg.Mangle.DstIP  // WIRE_KHAREJ or WIRE_IRAN
+	localReal := cfg.LocalIP
+	peerReal := cfg.RemoteIP
 	port := cfg.Transport.Port
 	if port == 0 {
 		port = 8443
 	}
 
+	role := "KHAREJ"
+	if cfg.Mode == "client" {
+		role = "IRAN"
+	}
+
 	var prerouting, output string
 	if cfg.Mode == "client" {
-		// SYN-ACK arrives outer src=peer wire; rewrite to real remote before socket.
-		prerouting = fmt.Sprintf(`ip daddr %s ip saddr %s tcp sport %d notrack ip saddr set %s counter name vlk_wire_in_peer
+		// IRAN: RX wire KHAREJ src → REAL_KHAREJ; TX REAL_KHAREJ dst → SRC_IRAN
+		prerouting = fmt.Sprintf(`# IRAN RX: WIRE_KHAREJ → REAL_KHAREJ
+		ip daddr %s ip saddr %s tcp sport %d notrack ip saddr set %s counter name vlk_wire_in_peer
 		ip daddr %s ip saddr %s tcp sport %d notrack ip saddr set %s counter name vlk_wire_in_peer`,
-			src, peerWire, port, remote,
-			local, peerWire, port, remote)
-		output = fmt.Sprintf(`ip daddr %s tcp dport %d notrack ip saddr set %s counter name vlk_wire_out`,
-			remote, port, src)
+			wireSrc, peerWire, port, peerReal,
+			localReal, peerWire, port, peerReal)
+		output = fmt.Sprintf(`# IRAN TX: daddr REAL_KHAREJ → src SRC_IRAN
+		ip daddr %s tcp dport %d notrack ip saddr set %s counter name vlk_wire_out`,
+			peerReal, port, wireSrc)
 	} else {
-		// Reply to client wire dst or real peer; outer src = our wire srcip.
-		prerouting = ""
-		output = fmt.Sprintf(`ip daddr %s tcp sport %d notrack ip saddr set %s counter name vlk_wire_out
+		// KHAREJ: RX WIRE_IRAN → REAL_IRAN; TX daddr IRAN → SRC_KHAREJ
+		prerouting = fmt.Sprintf(`# KHAREJ RX: WIRE_IRAN → REAL_IRAN
+		ip daddr %s ip saddr %s tcp dport %d notrack ip saddr set %s counter name vlk_wire_in_peer`,
+			localReal, peerWire, port, peerReal)
+		output = fmt.Sprintf(`# KHAREJ TX: daddr WIRE_IRAN → src SRC_KHAREJ
+		ip daddr %s tcp sport %d notrack ip saddr set %s counter name vlk_wire_out
+		# KHAREJ TX: daddr REAL_IRAN (after prerouting) → src SRC_KHAREJ
 		ip daddr %s tcp sport %d notrack ip saddr set %s counter name vlk_wire_out`,
-			peerWire, port, src,
-			remote, port, src)
+			peerWire, port, wireSrc,
+			peerReal, port, wireSrc)
 	}
 
-	preroutingChain := prerouting
-	if preroutingChain == "" {
-		preroutingChain = "# server: accept client wire src on listen socket"
-	}
-
-	return fmt.Sprintf(`table ip %s {
+	return fmt.Sprintf(`# virlink wire relay (%s) wire_src=%s peer_wire=%s real_peer=%s port=%d
+table ip %s {
 	counter vlk_wire_in_peer {}
 	counter vlk_wire_out {}
 	chain prerouting {
@@ -183,7 +188,22 @@ table inet %s {
 		tcp flags syn tcp option maxseg size set %d
 	}
 }
-`, nftMangleTable, nftSpoofPrio, preroutingChain, nftSpoofPrio, output, nftFwdTable, mangleMSS)
+`, role, wireSrc, peerWire, peerReal, port,
+		nftMangleTable, nftSpoofPrio, prerouting, nftSpoofPrio, output, nftFwdTable, mangleMSS)
+}
+
+func logWireRelayRoles(cfg *Config) {
+	wireSrc := cfg.Mangle.SrcIP
+	peerWire := cfg.Mangle.DstIP
+	peerReal := cfg.RemoteIP
+	if cfg.Mode == "client" {
+		logInfo(fmt.Sprintf("[wire] IRAN  TX src %s → dst %s  |  RX wire %s → stack %s",
+			wireSrc, peerReal, peerWire, peerReal))
+	} else {
+		logInfo(fmt.Sprintf("[wire] KHAREJ TX src %s → dst %s  |  RX wire %s → stack %s",
+			wireSrc, peerWire, peerWire, peerReal))
+	}
+	logDebug(fmt.Sprintf("[wire] relay MSS=%d  nft table ip %s", mangleMSS, nftMangleTable))
 }
 
 func restoreTCPWireMangle() {

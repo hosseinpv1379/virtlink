@@ -54,4 +54,5 @@ Spoof / rp_filter (هر دو سرور — قبل از تست)
   sysctl -w net.ipv4.conf.<iface>.rp_filter=0
 
   فایروال: UDP پورت‌های بالا + proto 47 (GRE) + 1 (ICMP) + 58 (BIP)
-  بین IPهای واقعی 95.38.195.35 ↔ 64.118.156.193 باز باشد.
+  TCP 8443: روی KHAREJ از WIRE_IRAN (185.41.1.52) باز باشد — نه فقط REAL_IRAN
+  جزئیات relay: configs/sepehr-sabz/NFT-RELAY.txt

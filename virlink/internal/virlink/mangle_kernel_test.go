@@ -92,10 +92,10 @@ func TestTCPWireMangleServerScript(t *testing.T) {
 	cfg.RemoteIP = cfg.Tunnel.RemoteIP
 
 	script := tcpWireMangleScript(cfg)
-	if strings.Contains(script, "tcp dport 8443 notrack ip saddr set 95.38.195.35") {
-		t.Fatal("server should not rewrite inbound SYN src in prerouting")
+	if !strings.Contains(script, "tcp dport 8443 notrack ip saddr set 95.38.195.35") {
+		t.Fatalf("KHAREJ prerouting must rewrite WIRE_IRAN to REAL_IRAN:\n%s", script)
 	}
 	if !strings.Contains(script, "ip daddr 185.41.1.52 tcp sport 8443") || !strings.Contains(script, "ip saddr set 37.152.181.38") {
-		t.Fatalf("server output must spoof wire src on replies:\n%s", script)
+		t.Fatalf("KHAREJ output must spoof SRC_KHAREJ on replies:\n%s", script)
 	}
 }
