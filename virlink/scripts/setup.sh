@@ -6,9 +6,10 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.6.2"
+SCRIPT_VERSION="1.6.3"
 GITHUB_REPO="hosseinpv1379/virtlink"
-TELEGRAM_CHANNEL="@Gozar_XRay"
+TELEGRAM_CHANNEL="@mioopython"
+AUTHOR="Hossein"
 TAGLINE="High-performance kernel & userspace tunneling"
 
 OPENVPN_BUNDLE_PORT="${OPENVPN_BUNDLE_PORT:-8765}"
@@ -203,12 +204,14 @@ fetch_geo_info() {
 show_banner() {
   clear
   echo -e "${BOLD}${C}"
-  echo "▗▄▄▖ ▗▖ ▗▖▗▖  ▗▖▗▙▄▖ ▗▖     ▗▖ ▗▖▗▖ ▗▖"
-  echo "▐▌ ▐▌▐▌ ▐▌▐▛ ▐▌▐▌ ▐▌▐▌     ▐▌ ▐▌▐▌ ▐▌"
-  echo "▐▛▀▚▖▐▛▀▜▌▐▌ ▐▌▐▌ ▐▌▐▌     ▐▌ ▐▌▐▛▀▜▌"
-  echo "▐▙▄▞▘▐▌ ▐▌▐▙▄▞▘▝▚▄▞▘▐▙▄▄▖    ▝▚▄▞▘▐▌ ▐▌"
+  echo '  __     ___ _____  _____ _      _    _ _____ '
+  echo '  \ \   / /|_   _||_   _| |    | |  | |  __ \'
+  echo '   \ \ / /   | |    | | | |    | |  | | |  | |'
+  echo '    \ V /    | |    | | | |    | |  | | |  | |'
+  echo '     \_/     |_|    |_| |_|    \_/\_/|_|  |_|'
   echo -e "${NC}"
   echo -e "  ${W}${BOLD}virlink${NC} ${DIM}— ${TAGLINE}${NC}"
+  echo -e "  ${DIM}by ${AUTHOR}${NC}  ·  ${C}Telegram ${TELEGRAM_CHANNEL}${NC}"
   echo
 
   local core_ver ip geo_loc geo_dc core_state
@@ -226,7 +229,7 @@ show_banner() {
 
   echo -e "  ${DIM}Script Version:${NC}   v${SCRIPT_VERSION}"
   echo -e "  ${DIM}Core Version:${NC}     ${core_ver}"
-  echo -e "  ${DIM}Telegram Channel:${NC} ${TELEGRAM_CHANNEL}"
+  echo -e "  ${DIM}Telegram:${NC}         ${TELEGRAM_CHANNEL}  ${DIM}(${AUTHOR})${NC}"
   sep
   echo -e "  ${DIM}IP Address:${NC}       ${W}${ip}${NC}"
   echo -e "  ${DIM}Location:${NC}         ${geo_loc}"
