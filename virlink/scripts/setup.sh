@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -2343,12 +2343,24 @@ hysteria2_acquire_client() {
         "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
       ;;
     manual)
-      echo -e "  Copy from server:"
-      echo -e "    ${W}${INSTALL_DIR}/pki/${name}/export/${NC}"
-      echo -e "  To client:"
-      echo -e "    ${W}${pki_dir}/${NC}"
-      press_enter
-      [[ -f "${pki_dir}/client.yaml" ]] || die "client.yaml missing in ${pki_dir}"
+      mkdir -p "$pki_dir"
+      chmod 700 "$pki_dir"
+      blank
+      info "Copy these 3 files from the server: client.yaml  server.crt  password"
+      tty_line -e "  ${W}mkdir -p ${pki_dir}${NC}"
+      tty_line -e "  ${W}scp root@${server_host}:${INSTALL_DIR}/pki/${name}/export/* ${pki_dir}/${NC}"
+      blank
+      while [[ ! -f "${pki_dir}/client.yaml" || ! -f "${pki_dir}/server.crt" || ! -f "${pki_dir}/password" ]]; do
+        warn "Missing in ${pki_dir}:"
+        for f in client.yaml server.crt password; do
+          [[ -f "${pki_dir}/${f}" ]] && echo -e "    ${G}✓${NC} ${f}" || echo -e "    ${R}✗${NC} ${f}"
+        done
+        blank
+        if ! confirm "Files copied — check again"; then
+          die "Need client.yaml + server.crt + password in ${pki_dir}"
+        fi
+      done
+      ok "Credentials found in ${pki_dir}"
       ;;
     *) die "Unknown method: $method" ;;
   esac
