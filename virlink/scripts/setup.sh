@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.6"
+SCRIPT_VERSION="1.2.7"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -1329,6 +1329,45 @@ port     = 6543
 EOF
 }
 
+openvpn_cert_needs_openssl3_upgrade() {
+  local crt="$1"
+  openssl x509 -in "$crt" -noout -ext extendedKeyUsage &>/dev/null || return 0
+  return 1
+}
+
+openvpn_sign_server_cert() {
+  local dir="$1"
+  openssl req -new -key "$dir/server.key" -out "$dir/server.csr" -subj "/CN=vl-srv" 2>/dev/null
+  openssl x509 -req -days 3650 -in "$dir/server.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
+    -CAcreateserial -out "$dir/server.crt" \
+    -addext "basicConstraints=CA:FALSE" \
+    -addext "keyUsage=digitalSignature,keyEncipherment" \
+    -addext "extendedKeyUsage=serverAuth" 2>/dev/null
+}
+
+openvpn_sign_client_cert() {
+  local dir="$1"
+  openssl req -new -key "$dir/client.key" -out "$dir/client.csr" -subj "/CN=vl-cli" 2>/dev/null
+  openssl x509 -req -days 3650 -in "$dir/client.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
+    -CAcreateserial -out "$dir/client.crt" \
+    -addext "basicConstraints=CA:FALSE" \
+    -addext "keyUsage=digitalSignature,keyEncipherment" \
+    -addext "extendedKeyUsage=clientAuth" 2>/dev/null
+}
+
+openvpn_upgrade_pki_openssl3() {
+  local dir="$1"
+  [[ -f "$dir/server.key" && -f "$dir/client.key" ]] || return 1
+  if ! openvpn_cert_needs_openssl3_upgrade "$dir/server.crt"; then
+    return 0
+  fi
+  info "Upgrading PKI for OpenSSL 3 (adding certificate key usage extensions)..."
+  openvpn_sign_server_cert "$dir"
+  openvpn_sign_client_cert "$dir"
+  rm -f "$dir/server.csr" "$dir/client.csr"
+  ok "Certificates re-signed (serverAuth / clientAuth)"
+}
+
 openvpn_gen_pki() {
   local dir="$1"
   mkdir -p "$dir"
@@ -1336,31 +1375,26 @@ openvpn_gen_pki() {
 
   if [[ -f "$dir/ca.crt" ]]; then
     ok "PKI already exists in ${dir}"
-    # Drop legacy tls-auth key when tls-crypt is present (prevents TLS mismatch).
     if [[ -f "$dir/tc.key" && -f "$dir/ta.key" ]]; then
       rm -f "$dir/ta.key"
       warn "Removed legacy ta.key (using tls-crypt tc.key only)"
     fi
+    openvpn_upgrade_pki_openssl3 "$dir"
     openvpn_export_client_bundle "$dir" 2>/dev/null || true
     return 0
   fi
 
-  info "Generating OpenVPN PKI (ECDSA P-256, tls-crypt, no DH file)..."
+  info "Generating OpenVPN PKI (ECDSA P-256, tls-crypt, OpenSSL 3 extensions)..."
   openssl ecparam -genkey -name prime256v1 -out "$dir/ca.key" 2>/dev/null
   openssl req -new -x509 -days 3650 -key "$dir/ca.key" -out "$dir/ca.crt" \
-    -subj "/CN=vl-ca" 2>/dev/null
+    -subj "/CN=vl-ca" \
+    -addext "basicConstraints=critical,CA:TRUE,keyCertSign" 2>/dev/null
 
   openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" 2>/dev/null
-  openssl req -new -key "$dir/server.key" -out "$dir/server.csr" \
-    -subj "/CN=vl-srv" 2>/dev/null
-  openssl x509 -req -days 3650 -in "$dir/server.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
-    -CAcreateserial -out "$dir/server.crt" 2>/dev/null
+  openvpn_sign_server_cert "$dir"
 
   openssl ecparam -genkey -name prime256v1 -out "$dir/client.key" 2>/dev/null
-  openssl req -new -key "$dir/client.key" -out "$dir/client.csr" \
-    -subj "/CN=vl-cli" 2>/dev/null
-  openssl x509 -req -days 3650 -in "$dir/client.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
-    -CAcreateserial -out "$dir/client.crt" 2>/dev/null
+  openvpn_sign_client_cert "$dir"
 
   if openvpn --genkey tls-crypt "$dir/tc.key" 2>/dev/null; then
     :
@@ -1845,7 +1879,7 @@ openvpn_write_crypto_block() {
   if [[ -f "${dir}/tc.key" ]]; then
     cat << EOF
 dh none
-ecdh-curve prime256v1
+tls-groups X25519:prime256v1
 ${tls_line}
 tls-version-min 1.2
 EOF
