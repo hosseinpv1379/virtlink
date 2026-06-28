@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-const version = "2.10.16"
+const version = "2.10.17"
 
 func Main() {
 	cfgFile  := flag.String("c", "", "path to config.toml")

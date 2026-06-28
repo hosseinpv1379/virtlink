@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.13"
+SCRIPT_VERSION="1.2.14"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -1962,13 +1962,26 @@ EOF
   fi
 }
 
+# OpenVPN 2.6+ requires tcp-server / tcp-client (plain "tcp" is ambiguous).
+openvpn_openvpn_proto() {
+  local base="$1" role="$2"
+  case "$base" in
+    tcp)
+      [[ "$role" == "server" ]] && echo "tcp-server" || echo "tcp-client"
+      ;;
+    udp) echo "udp" ;;
+    *)   echo "$base" ;;
+  esac
+}
+
 openvpn_write_server_conf() {
   local dir="$1" port="$2" proto="$3" client_ip="$4" server_ip="$5" mtu="$6" dev="$7" perf="$8"
-  local tun_mtu="$9" mssfix="${10}"
+  local tun_mtu="$9" mssfix="${10}" ovpn_proto
+  ovpn_proto="$(openvpn_openvpn_proto "$proto" server)"
   cat > "${dir}/server.conf" << EOF
 # virlink OpenVPN — server (site-to-site, ${perf} profile, ${proto})
 port ${port}
-proto ${proto}
+proto ${ovpn_proto}
 dev ${dev}
 dev-type tun
 user nobody
@@ -1992,12 +2005,13 @@ EOF
 
 openvpn_write_client_conf() {
   local dir="$1" port="$2" proto="$3" remote_ip="$4" client_ip="$5" server_ip="$6" mtu="$7" dev="$8" perf="$9"
-  local tun_mtu="${10}" mssfix="${11}"
+  local tun_mtu="${10}" mssfix="${11}" ovpn_proto
+  ovpn_proto="$(openvpn_openvpn_proto "$proto" client)"
   cat > "${dir}/client.conf" << EOF
 # virlink OpenVPN — client (site-to-site p2p, ${perf} profile, ${proto})
 dev ${dev}
 dev-type tun
-proto ${proto}
+proto ${ovpn_proto}
 remote ${remote_ip} ${port}
 nobind
 tls-client
