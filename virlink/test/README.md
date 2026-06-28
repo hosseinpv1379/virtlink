@@ -269,7 +269,7 @@ Pass `--json report.json` to save a machine-readable report:
 > Source repo is private — requires collaborator access.
 
 ```bash
-git clone git@github.com:hosseinpv1379/virtlink.git --branch source
+git clone git@github.com:hosseinpv1379/virtlink.git --branch main
 cd virtlink/virlink/test
 go build -o virlink-test .
 

@@ -33,3 +33,27 @@ gh release create "$VERSION" \
   scripts/setup.sh#setup.sh
 
 echo "✓ https://github.com/${GITHUB_REPO}/releases/tag/${VERSION}"
+
+sync_setup_to_main() {
+  local git_root setup_src wt
+  git_root="$(git -C "$ROOT" rev-parse --show-toplevel)"
+  setup_src="$ROOT/scripts/setup.sh"
+  wt="$(mktemp -d "${TMPDIR:-/tmp}/virtlink-main.XXXXXX")"
+
+  echo "→ Syncing setup.sh to main branch (public install repo, no source)..."
+  git -C "$git_root" fetch origin main
+  git -C "$git_root" worktree add -B main "$wt" origin/main
+  cp "$setup_src" "$wt/setup.sh"
+  chmod +x "$wt/setup.sh"
+  if git -C "$wt" diff --quiet setup.sh; then
+    echo "  main/setup.sh already up to date"
+  else
+    git -C "$wt" add setup.sh
+    git -C "$wt" commit -m "sync setup.sh from release ${VERSION}"
+    git -C "$wt" push origin main
+    echo "  ✓ main/setup.sh updated"
+  fi
+  git -C "$git_root" worktree remove "$wt" --force
+}
+
+sync_setup_to_main

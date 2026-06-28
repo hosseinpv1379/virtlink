@@ -256,13 +256,15 @@ See `internal/virlink/doc.go` for the full source file map.
 
 ## Releasing
 
-Releases go to the **public install repo** (`virtlink-install`), not this source repo.
-Every release must include **both** assets so the install one-liner works:
+Releases go to the **public GitHub repo** (`hosseinpv1379/virtlink`) — **binary + setup.sh only**.
+Source code stays **local**; never push a `source` branch to GitHub.
+
+Every release must include **both** assets:
 
 | Asset | URL |
 |-------|-----|
-| `setup.sh` | `https://github.com/hosseinpv1379/virtlink-install/releases/latest/download/setup.sh` |
-| `virlink` | `https://github.com/hosseinpv1379/virtlink-install/releases/latest/download/virlink` |
+| `setup.sh` | `https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh` |
+| `virlink` | `https://github.com/hosseinpv1379/virtlink/releases/latest/download/virlink` |
 
 From the `virlink/` directory (after bumping version in `internal/virlink/cli.go`):
 
@@ -270,11 +272,13 @@ From the `virlink/` directory (after bumping version in `internal/virlink/cli.go
 ./scripts/release.sh vX.Y.Z "Release notes"
 ```
 
+This creates the GitHub release and syncs `setup.sh` to the public `main` branch (no Go source).
+
 Verify:
 
 ```bash
-curl -fsSL -I https://github.com/hosseinpv1379/virtlink-install/releases/latest/download/setup.sh
-curl -fsSL -I https://github.com/hosseinpv1379/virtlink-install/releases/latest/download/virlink
+curl -fsSL -I https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh
+curl -fsSL -I https://github.com/hosseinpv1379/virtlink/releases/latest/download/virlink
 ```
 
 ---
