@@ -111,6 +111,48 @@ func nlRouteAdd(dst, dev string) error {
 	})
 }
 
+// nlRouteECMPWithSrc installs an ECMP /32 route to dst with fixed source (overlay on lo).
+func nlRouteECMPWithSrc(dst, src string, devs ...string) error {
+	dstIP := net.ParseIP(dst)
+	srcIP := net.ParseIP(src)
+	if dstIP == nil || srcIP == nil {
+		return fmt.Errorf("invalid dst=%q src=%q", dst, src)
+	}
+	dstIP = dstIP.To4()
+	srcIP = srcIP.To4()
+	if dstIP == nil || srcIP == nil {
+		return fmt.Errorf("overlay routes require IPv4")
+	}
+	dstNet := &net.IPNet{IP: dstIP, Mask: net.CIDRMask(32, 32)}
+
+	nlRouteDelAll(dst)
+
+	if len(devs) == 1 {
+		l, err := netlink.LinkByName(devs[0])
+		if err != nil {
+			return fmt.Errorf("nexthop %s: %w", devs[0], err)
+		}
+		return netlink.RouteReplace(&netlink.Route{
+			LinkIndex: l.Attrs().Index,
+			Dst:       dstNet,
+			Src:       srcIP,
+		})
+	}
+
+	route := &netlink.Route{Dst: dstNet, Src: srcIP}
+	for _, name := range devs {
+		l, err := netlink.LinkByName(name)
+		if err != nil {
+			return fmt.Errorf("ecmp nexthop %s: %w", name, err)
+		}
+		route.MultiPath = append(route.MultiPath, &netlink.NexthopInfo{
+			LinkIndex: l.Attrs().Index,
+			Hops:      0,
+		})
+	}
+	return netlink.RouteReplace(route)
+}
+
 // nlRouteECMP installs an ECMP /32 host route via multiple devices.
 // Traffic is distributed per-flow across all nexthops.
 func nlRouteECMP(dst string, devs ...string) error {

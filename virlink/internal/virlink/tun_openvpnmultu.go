@@ -37,6 +37,7 @@ type OpenvpnMultuTunnel struct {
 	runtimeDir string
 	lockFd     *os.File
 	loAddr     string
+	routeStop  chan struct{}
 }
 
 func (t *OpenvpnMultuTunnel) DevName() string {
@@ -154,6 +155,9 @@ func (t *OpenvpnMultuTunnel) Up() error {
 	}
 
 	ports := openvpnMultuPortRange(c)
+	t.routeStop = make(chan struct{})
+	go t.maintainOverlayRoutes()
+
 	done(t.DevName(), overlay, peer,
 		fmt.Sprintf("workers   : %d parallel openvpn (no DCO)", n),
 		fmt.Sprintf("transport : OpenVPN %s ports %s", c.Transport.Proto, ports),
@@ -287,11 +291,15 @@ func (t *OpenvpnMultuTunnel) Down() error {
 }
 
 func (t *OpenvpnMultuTunnel) doClean() {
+	if t.routeStop != nil {
+		close(t.routeStop)
+		t.routeStop = nil
+	}
 	if t.cfg != nil {
 		openvpnMultuPreclean(t.cfg)
 	}
 	peer := t.PeerIP()
-	nlRouteDel(peer)
+	nlRouteDelAll(peer)
 
 	if t.loAddr != "" {
 		if lo, err := netlink.LinkByName("lo"); err == nil {

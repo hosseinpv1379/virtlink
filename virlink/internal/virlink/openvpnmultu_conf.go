@@ -33,11 +33,6 @@ func openvpnMultuMaterializeWorkers(c *Config) (string, error) {
 	}
 
 	tunMTU, mssfix := openvpnMultuTunMTU(c)
-	peerOverlay := peerAddr(c, openvpnMultuSubnet)
-	localPlain := plainIP(overlayAddr(c, openvpnMultuSubnet))
-	if err := openvpnMultuWriteRouteScripts(runtimeDir, c, localPlain, peerOverlay); err != nil {
-		return "", err
-	}
 	perf := openvpnMultuPerfMode(c)
 	proto := c.Transport.Proto
 	if proto == "" {
@@ -66,7 +61,6 @@ func openvpnMultuMaterializeWorkers(c *Config) (string, error) {
 			_ = os.RemoveAll(runtimeDir)
 			return "", fmt.Errorf("[openvpnmultu] worker %d: %w", i, err)
 		}
-		body += openvpnMultuOverlayRouteBlock(runtimeDir)
 		if err := os.WriteFile(confPath, []byte(body), 0o644); err != nil {
 			_ = os.RemoveAll(runtimeDir)
 			return "", fmt.Errorf("[openvpnmultu] write %s: %w", confPath, err)
