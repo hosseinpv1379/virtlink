@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.3.2"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -2240,6 +2240,8 @@ bandwidth:
   down: 1 gbps
 EOF
   if [[ -n "$obfs" ]]; then
+    echo "$obfs" > "${dir}/obfs.password"
+    chmod 600 "${dir}/obfs.password"
     cat >> "${dir}/server.yaml" << EOF
 
 obfs:
@@ -2258,10 +2260,13 @@ hysteria2_write_client_yaml() {
 # virlink Hysteria2 — client (site-to-site TUN)
 server: ${remote_ip}:${port}
 
-auth: ${pass}
+auth:
+  type: password
+  password: ${pass}
 
 tls:
   ca: server.crt
+  sni: www.bing.com
 
 bandwidth:
   up: 200 mbps
@@ -2294,6 +2299,7 @@ hysteria2_export_client_bundle() {
   cp -f "${dir}/server.crt" "${export_dir}/server.crt"
   cp -f "${dir}/password" "${export_dir}/password"
   cp -f "${dir}/client.yaml" "${export_dir}/client.yaml"
+  [[ -f "${dir}/obfs.password" ]] && cp -f "${dir}/obfs.password" "${export_dir}/obfs.password"
   chmod 600 "${export_dir}/password"
   ok "Client export: ${export_dir}"
 }
@@ -2409,6 +2415,8 @@ gen_hysteria2() {
   else
     hysteria2_acquire_client "$name" "$remote_ip" "$pki_dir"
     [[ -f "${pki_dir}/password" ]] || cp -f "${pki_dir}/export/password" "${pki_dir}/password" 2>/dev/null || true
+    [[ -f "${pki_dir}/obfs.password" ]] || cp -f "${pki_dir}/export/obfs.password" "${pki_dir}/obfs.password" 2>/dev/null || true
+    [[ -f "${pki_dir}/obfs.password" ]] && obfs="$(tr -d '\n' < "${pki_dir}/obfs.password")"
   fi
 
   hysteria2_overlay_ips "$cidr" "$mode"
@@ -2433,10 +2441,10 @@ gen_hysteria2() {
     hysteria2_show_fingerprint "$pki_dir"
     warn "Start SERVER first. Firewall: allow UDP/${port} (QUIC) to this host."
   else
-    [[ -f "${pki_dir}/client.yaml" ]] || die "Missing client.yaml"
-    cp -f "${pki_dir}/server.crt" "${pki_dir}/server.crt" 2>/dev/null || true
+    [[ -f "${pki_dir}/password" ]] || die "Missing password in ${pki_dir}"
+    hysteria2_write_client_yaml "$pki_dir" "$port" "$remote_ip" "$client_ip" "$cidr" "$mtu" "$dev" "$obfs"
     hy_conf="${pki_dir}/client.yaml"
-    ok "Using ${hy_conf}"
+    ok "Wrote ${hy_conf}"
     warn "Start the Hysteria2 SERVER on ${remote_ip} first."
     warn "Firewall: allow outbound UDP/${port} to server (Hetzner cloud firewall too)."
   fi

@@ -213,28 +213,46 @@ func waitForHysteria2(dev, logPath string, cmd *exec.Cmd, mode string, timeout t
 	for time.Now().Before(deadline) {
 		if cmd != nil && !hysteria2ProcessAlive(cmd) {
 			return fmt.Errorf("hysteria exited before %s came up:\n%s",
-				dev, hysteria2LogTail(logPath, 25))
+				dev, hysteria2LogTail(logPath, 30))
 		}
-		if !linkUp(dev) {
-			time.Sleep(250 * time.Millisecond)
-			continue
+		if logPath != "" && hysteria2LogFailed(logPath) {
+			return fmt.Errorf("hysteria failed (see %s):\n%s", logPath, hysteria2LogTail(logPath, 30))
 		}
 		if mode == "server" {
-			if logPath == "" || hysteria2LogContains(logPath, "server mode") ||
-				hysteria2LogContains(logPath, "listening") {
+			if logPath != "" && hysteria2LogContains(logPath, "server mode") && linkUp(dev) {
 				return nil
 			}
-		} else if logPath == "" || hysteria2LogContains(logPath, "TUN listening") {
+		} else if linkUp(dev) && logPath != "" &&
+			(hysteria2LogContains(logPath, "TUN listening") ||
+				hysteria2LogContains(logPath, "connected to server")) {
 			return nil
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	hint := "start hysteria2 server first; match port/auth/TLS; open firewall UDP (QUIC) to server"
+	hint := "check " + logPath + " — server running? UDP port open on Hetzner? auth/TLS/obfs match?"
 	if logPath != "" {
-		return fmt.Errorf("timeout waiting for %s (%s):\n%s\nlog: %s",
-			dev, hint, hysteria2LogTail(logPath, 25), logPath)
+		return fmt.Errorf("timeout waiting for %s (%s):\n%s",
+			dev, hint, hysteria2LogTail(logPath, 30))
 	}
 	return fmt.Errorf("timeout waiting for interface %s", dev)
+}
+
+func hysteria2LogFailed(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	s := strings.ToLower(string(b))
+	for _, needle := range []string{
+		"fatal", "authentication failed", "failed to authenticate",
+		"connection refused", "i/o timeout", "certificate verify failed",
+		"failed to run tun", "no such file",
+	} {
+		if strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func hysteria2ProcessAlive(cmd *exec.Cmd) bool {
