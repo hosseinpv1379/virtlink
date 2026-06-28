@@ -1,7 +1,6 @@
 package virlink
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 )
@@ -24,18 +23,18 @@ func TestKernelMangleScriptSemantics(t *testing.T) {
 
 	src, peerWireSrc := cfg.Mangle.SrcIP, cfg.Mangle.DstIP
 	local, remote := cfg.LocalIP, cfg.RemoteIP
-	script := strings.TrimSpace(fmt.Sprintf(`table ip %s {
+	script := strings.TrimSpace(`table ip ` + nftMangleTable + ` {
 	counter vlk_wire_in_peer {}
 	counter vlk_wire_out {}
 	chain input {
-		type filter hook input priority %d; policy accept;
-		ip daddr %s ip saddr %s ip saddr set %s counter name vlk_wire_in_peer
+		type filter hook input priority -300; policy accept;
+		ip daddr ` + local + ` ip saddr ` + peerWireSrc + ` ip saddr set ` + remote + ` counter name vlk_wire_in_peer
 	}
 	chain output {
-		type filter hook output priority %d; policy accept;
-		ip daddr %s ip saddr set %s counter name vlk_wire_out
+		type filter hook output priority -300; policy accept;
+		ip daddr ` + remote + ` ip saddr set ` + src + ` counter name vlk_wire_out
 	}
-}`, nftMangleTable, nftSpoofPrio, local, peerWireSrc, remote, nftSpoofPrio, remote, src))
+}`)
 
 	if !strings.Contains(script, "counter vlk_wire_in_peer {}") {
 		t.Fatal("expected declared nft counter objects")
@@ -66,8 +65,11 @@ func TestTCPWireMangleClientScript(t *testing.T) {
 	cfg.RemoteIP = cfg.Tunnel.RemoteIP
 
 	script := tcpWireMangleScript(cfg)
+	if !strings.Contains(script, "chain input") || strings.Contains(script, "chain prerouting") {
+		t.Fatalf("TCP client must use input hook like GRE, not prerouting:\n%s", script)
+	}
 	if !strings.Contains(script, "ip saddr 37.152.181.38") || !strings.Contains(script, "ip saddr set 64.118.156.193") {
-		t.Fatalf("client prerouting must rewrite peer wire src to real remote:\n%s", script)
+		t.Fatalf("client input must rewrite WIRE_KHAREJ to REAL_KHAREJ:\n%s", script)
 	}
 	if !strings.Contains(script, "ip daddr 64.118.156.193 tcp dport 8443") || !strings.Contains(script, "ip saddr set 185.41.1.52") {
 		t.Fatalf("client output must spoof wire src on TX:\n%s", script)
@@ -92,8 +94,12 @@ func TestTCPWireMangleServerScript(t *testing.T) {
 	cfg.RemoteIP = cfg.Tunnel.RemoteIP
 
 	script := tcpWireMangleScript(cfg)
-	if !strings.Contains(script, "tcp dport 8443 notrack ip saddr set 95.38.195.35") {
-		t.Fatalf("KHAREJ prerouting must rewrite WIRE_IRAN to REAL_IRAN:\n%s", script)
+	if !strings.Contains(script, "chain input") {
+		t.Fatalf("TCP server must use input hook:\n%s", script)
+	}
+	if !strings.Contains(script, "tcp dport 8443 notrack ip saddr set 95.38.195.35") &&
+		!strings.Contains(script, "tcp dport 8443 ip saddr set 95.38.195.35") {
+		t.Fatalf("KHAREJ input must rewrite WIRE_IRAN to REAL_IRAN:\n%s", script)
 	}
 	if !strings.Contains(script, "ip daddr 185.41.1.52 tcp sport 8443") || !strings.Contains(script, "ip saddr set 37.152.181.38") {
 		t.Fatalf("KHAREJ output must spoof SRC_KHAREJ on replies:\n%s", script)

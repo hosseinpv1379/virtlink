@@ -10,8 +10,8 @@
 نام‌گذاری [mangle] در config
 ----------------------------
   IRAN (client/tcp.toml):
-    srcip = SRC_IRAN   = 185.41.1.52   (هویت wire ما روی خط)
-    dstip = WIRE_KHAREJ = 37.152.181.38 (src wire طرف خارج — آنچه در RX می‌بینیم)
+    srcip = SRC_IRAN   = 185.41.1.52
+    dstip = WIRE_KHAREJ = 37.152.181.38
     remote_ip = REAL_KHAREJ = 64.118.156.193
 
   KHAREJ (server/tcp.toml):
@@ -19,50 +19,36 @@
     dstip = WIRE_IRAN   = 185.41.1.52
     remote_ip = REAL_IRAN = 95.38.195.35
 
-فلسفه: two-way stateless IP rewrite
-------------------------------------
-  روی wire (tcpdump): src/dst = هویت‌های spoof
-  داخل TCP stack:     src/dst = IP واقعی peer — تا connect/accept درست کار کند
+فلسفه (مثل GRE — input/output hooks)
+--------------------------------------
+  stack از IP واقعی connect/listen می‌کند
+  nft روی wire هدر را عوض می‌کند:
 
-  IRAN  → KHAREJ : TX outer src = SRC_IRAN
-  KHAREJ → IRAN : TX outer src = SRC_KHAREJ
+  IRAN  TX output:  daddr REAL_KHAREJ → saddr SRC_IRAN
+  IRAN  RX input:   saddr WIRE_KHAREJ → REAL_KHAREJ (stack)
 
-  KHAREJ → IRAN (RX روی IRAN): outer src WIRE_KHAREJ → stack می‌بیند REAL_KHAREJ
-  IRAN → KHAREJ (RX روی KHAREJ): outer src WIRE_IRAN  → stack می‌بیند REAL_IRAN
-
-virlink خودکار نصب می‌کند (جدول virlink_mangle + virlink_fwd)
----------------------------------------------------------------
-
-  table inet virlink_fwd / forward:
-    tcp flags syn → MSS = 1320  (کلamping برای MTU تونل)
-
-  table ip virlink_mangle — IRAN (client):
-    prerouting (RX):
-      saddr WIRE_KHAREJ  → set REAL_KHAREJ   (پاسخ wire → stack)
-    output (TX):
-      daddr REAL_KHAREJ  → saddr SRC_IRAN    (درخواست stack → wire)
-
-  table ip virlink_mangle — KHAREJ (server):
-    prerouting (RX):
-      saddr WIRE_IRAN, dport 8443 → set REAL_IRAN  (SYN wire → stack)
-    output (TX):
-      daddr WIRE_IRAN|REAL_IRAN, sport 8443 → saddr SRC_KHAREJ
+  KHAREJ TX output: daddr WIRE_IRAN → saddr SRC_KHAREJ
+  KHAREJ RX input:  saddr WIRE_IRAN → REAL_IRAN (stack)
 
 مثال TCP SYN
 ------------
-  IRAN connect REAL_KHAREJ:8443 + FREEBIND SRC_IRAN
-  wire:  185.41.1.52 → 64.118.156.193
-  KHAREJ listen 64.118.156.193:8443 — prerouting: src 185.41.1.52 → 95.38.195.35
-  SYN-ACK wire: 37.152.181.38 → 185.41.1.52
-  IRAN prerouting: src 37.152.181.38 → 64.118.156.193 → socket match ✓
+  IRAN stack: connect 95.38.195.35 → 64.118.156.193:8443
+  wire TX:    185.41.1.52 → 64.118.156.193  (nft output)
 
-فایروال
--------
-  TCP 8443 را از WIRE_IRAN (185.41.1.52) روی KHAREJ باز کنید، نه فقط REAL_IRAN.
+  KHAREJ wire RX: 185.41.1.52 → 64.118.156.193:8443
+  KHAREJ stack: accept از REAL_IRAN (nft input)
 
-  sysctl rp_filter=0 روی هر دو سرور.
+  KHAREJ wire TX: 37.152.181.38 → 95.38.195.35  (nft output)
+  IRAN wire RX:   37.152.181.38 → 95.38.195.35
+  IRAN stack:     socket می‌بیند REAL_KHAREJ (nft input)
+
+فایروال KHAREJ
+----------------
+  TCP 8443 از WIRE_IRAN (185.41.1.52) — نه فقط REAL_IRAN
 
 بررسی
 -----
   nft list table ip virlink_mangle
-  nft list table inet virlink_fwd
+  startup log: [wire] nft relay loaded  counters in=… out=…
+
+  tcpdump KHAREJ: syn از 185.41.1.52 باید بیاید
