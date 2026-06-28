@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.6.3"
+SCRIPT_VERSION="1.6.4"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@mioopython"
 AUTHOR="Hossein"
@@ -35,7 +35,7 @@ readonly -a KERNEL_TUNNEL_KEYS=(
   gre-fou ipip-fou bonded-gre-fou l2tpv3 gre-fou-ipsec gre
 )
 readonly -a USERSPACE_TUNNEL_KEYS=(
-  icmp udp bip tcp tcpmux udp-obfs openvpn hysteria2 wireguard amneziawg
+  icmp udp bip tcp tcpmux udp-obfs openvpn openvpnmultu hysteria2 wireguard amneziawg
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -462,6 +462,7 @@ _detect_pkg_mgr() {
 _cmd_pkg_name() {
   case "$1" in
     openvpn) echo openvpn ;;
+    openvpnmultu) echo openvpnmultu ;;
     openssl) echo openssl ;;
     curl)    echo curl ;;
     tar)     echo tar ;;
@@ -736,9 +737,9 @@ tunnel_start() {
   local cfg="${CONFIGS_DIR}/${name}.toml"
   local svc
   [[ -f "$cfg" ]] || { err "Config not found: $cfg"; return 1; }
-  if [[ "$(_cfg_tunnel_type "$cfg")" == "openvpn" ]]; then
+  if [[ "$(_cfg_tunnel_type "$cfg")" == "openvpn" || "$(_cfg_tunnel_type "$cfg")" == "openvpnmultu" ]]; then
     ensure_openvpn_deps
-    ensure_openvpn_dco || true
+    [[ "$(_cfg_tunnel_type "$cfg")" == "openvpn" ]] && ensure_openvpn_dco || true
   fi
   if [[ "$(_cfg_tunnel_type "$cfg")" == "hysteria2" ]]; then
     ensure_hysteria2_deps
@@ -1101,6 +1102,7 @@ bip            — BIP tunnel (proto 58)             DPI bypass
 tcp            — User-space TCP tunnel             auto-reconnect
 tcpmux         — TCP flow-hash multiplex           parallel flows · hash routing
 openvpn        — OpenVPN core (encrypted link)     UDP/TCP · high throughput
+openvpnmultu   — OpenVPN multi-worker ECMP         N× openvpn · flow LB
 hysteria2      — Hysteria2 QUIC tunnel             fast · censorship-resistant
 wireguard      — WireGuard (kernel crypto)         UDP · fast site-to-site
 amneziawg      — AmneziaWG obfuscated WireGuard    UDP · DPI-resistant (Iran)
@@ -1140,6 +1142,7 @@ dispatch_tunnel_generator() {
     tcp)            gen_tcp      ;;
     tcpmux)         gen_tcpmux   ;;
     openvpn)        gen_openvpn  ;;
+    openvpnmultu)   gen_openvpnmultu ;;
     hysteria2)     gen_hysteria2 ;;
     wireguard)     gen_wireguard ;;
     amneziawg)     gen_amneziawg ;;
@@ -1274,7 +1277,7 @@ profile          = true
 profile_interval = 30
 EOF
       ;;
-    openvpn)
+    openvpn|openvpnmultu)
       write_openvpn_tuning "$file" "fast"
       return
       ;;
@@ -1667,7 +1670,7 @@ EOF
 }
 
 write_openvpn_tuning() {
-  local file="$1" perf="${2:-fast}"
+  local file="$1" perf="${2:-fast}" multipath="${3:-false}"
   local mode="fast" txql=10000 hb=20 poll=50
   case "$perf" in
     resource) mode="resource"; txql=5000; hb=60; poll=100 ;;
@@ -1678,6 +1681,7 @@ write_openvpn_tuning() {
 [tuning]
 enabled      = true
 mode         = "${mode}"
+multipath    = ${multipath}
 tx_queue_len = ${txql}
 poll_ms      = ${poll}
 
@@ -2555,6 +2559,177 @@ EOF
     info "Client overlay IP: ${client_ip}  ·  Server overlay IP: ${server_ip}"
   fi
   info "OpenVPN: tun-mtu ${tun_mtu}  mssfix ${mssfix}  profile ${perf}"
+}
+
+# ── OpenVPN multi-worker (openvpnmultu) ───────────────────────────────────────
+
+openvpnmultu_worker_link_ips() {
+  local idx="$1" mode="$2"
+  local base=$((idx * 4 + 1))
+  if [[ "$mode" == "client" ]]; then
+    OPENVPNMULTU_LINK_CLIENT="10.20.55.${base}"
+    OPENVPNMULTU_LINK_SERVER="10.20.55.$((base + 1))"
+  else
+    OPENVPNMULTU_LINK_SERVER="10.20.55.${base}"
+    OPENVPNMULTU_LINK_CLIENT="10.20.55.$((base + 1))"
+  fi
+}
+
+openvpnmultu_append_overlay_route() {
+  local conf="$1" peer_overlay="$2"
+  cat >> "$conf" << EOF
+# virlink openvpnmultu — route overlay peer via this worker link
+route ${peer_overlay} 255.255.255.255 vpn_gateway
+EOF
+}
+
+gen_openvpnmultu() {
+  local name mode local_ip remote_ip cidr port proto mtu pki_dir cfg perf_raw perf workers
+  local client_ip server_ip tun_mtu mssfix default_mtu hb peer_overlay
+  local i wport wdev link_c link_s wconf cconf
+
+  collect_base_inputs name mode local_ip remote_ip cidr
+  blank
+  info "OpenVPN multi-worker — N parallel openvpn processes + ECMP load-balancer (no DCO)."
+  info "Use when ovpn-dco is unavailable; each worker uses one CPU core for crypto."
+  pick proto "OpenVPN transport" \
+    "udp — max bandwidth (recommended)" \
+    "tcp — works through strict firewalls"
+  proto="$(label_key "$proto")"
+  openvpn_mtu_for_proto "$proto"
+  default_mtu="$OPENVPN_DEFAULT_MTU"
+  tun_mtu="$OPENVPN_TUN_MTU"
+  mssfix="$OPENVPN_MSSFIX"
+  prompt port "Base OpenVPN port (worker i uses port+i)" "1194"
+  prompt mtu "TUN MTU (overlay)" "$default_mtu"
+  prompt workers "Number of parallel OpenVPN workers (2-8)" "4"
+  workers="${workers//[^0-9]/}"
+  [[ -z "$workers" ]] && workers=4
+  (( workers < 2 )) && workers=2
+  (( workers > 8 )) && workers=8
+  pick perf_raw "Performance profile" \
+    "fast — max bandwidth (recommended)" \
+    "resource — lower CPU / power use" \
+    "latency — minimal delay"
+  perf="$(label_key "$perf_raw")"
+
+  ensure_openvpn_deps
+  pki_dir="${INSTALL_DIR}/pki/${name}"
+  mkdir -p "$pki_dir"
+
+  if [[ "$mode" == "server" ]]; then
+    openvpn_gen_pki "$pki_dir"
+  else
+    openvpn_acquire_client_pki "$name" "$remote_ip" "$pki_dir"
+  fi
+
+  openvpn_overlay_ips "$cidr" "$mode"
+  client_ip="$OPENVPN_CLIENT_IP"
+  server_ip="$OPENVPN_SERVER_IP"
+  if [[ "$mode" == "client" ]]; then
+    peer_overlay="$server_ip"
+  else
+    peer_overlay="$client_ip"
+  fi
+
+  case "$perf" in
+    resource) hb=60 ;;
+    latency)  hb=10 ;;
+    *)        hb=20 ;;
+  esac
+
+  blank
+  info "Generating ${workers} worker configs (internal links 10.20.55.0/24, overlay ${cidr})..."
+  for ((i=0; i<workers; i++)); do
+    openvpnmultu_worker_link_ips "$i" "$mode"
+    link_c="$OPENVPNMULTU_LINK_CLIENT"
+    link_s="$OPENVPNMULTU_LINK_SERVER"
+    wport=$((port + i))
+    wdev="ovpnm-w${i}"
+    if [[ "$mode" == "server" ]]; then
+      wconf="${pki_dir}/server-worker-${i}.conf"
+      cconf="${pki_dir}/worker-${i}.conf"
+      openvpn_write_server_conf "$pki_dir" "$wport" "$proto" \
+        "$link_c" "$link_s" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$wconf" 0
+      openvpnmultu_append_overlay_route "$wconf" "$peer_overlay"
+      openvpn_write_client_conf "$pki_dir" "$wport" "$proto" "$local_ip" \
+        "$link_c" "$link_s" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$cconf" 0
+      openvpnmultu_append_overlay_route "$cconf" "$peer_overlay"
+      ok "worker ${i}: ${wconf}  port ${wport}  dev ${wdev}"
+    else
+      wconf="${pki_dir}/worker-${i}.conf"
+      openvpn_write_client_conf "$pki_dir" "$wport" "$proto" "$remote_ip" \
+        "$link_c" "$link_s" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$wconf" 0
+      openvpnmultu_append_overlay_route "$wconf" "$peer_overlay"
+      ok "worker ${i}: ${wconf}  port ${wport}  dev ${wdev}"
+    fi
+  done
+
+  if [[ "$mode" == "server" ]]; then
+    openvpn_export_client_bundle "$pki_dir" 2>/dev/null || true
+    mkdir -p "${pki_dir}/export"
+    for ((i=0; i<workers; i++)); do
+      cp -f "${pki_dir}/worker-${i}.conf" "${pki_dir}/export/worker-${i}.conf"
+    done
+  fi
+
+  cfg="${CONFIGS_DIR}/${name}.toml"
+  cat > "$cfg" << EOF
+# virlink — ${name}  (OpenVPN multi-worker ECMP · ${workers} workers · ${perf} · ${proto})
+[tunnel]
+type      = "openvpnmultu"
+mode      = "${mode}"
+local_ip  = "${local_ip}"
+remote_ip = "${remote_ip}"
+cidr      = "${cidr}"
+mtu       = ${mtu}
+name      = "${name}"
+
+[transport]
+port               = ${port}
+proto              = "${proto}"
+heartbeat_interval = ${hb}
+
+[openvpnmultu]
+pki_dir  = "${pki_dir}"
+workers  = ${workers}
+
+[security]
+encryption = true
+EOF
+  write_openvpn_tuning "$cfg" "$perf" true
+  add_forward_section "$cfg" "$mode"
+  LAST_CFG_PATH="$cfg"
+
+  if [[ "$mode" == "server" ]]; then
+    local pki="${INSTALL_DIR}/pki/${name}" tls_key="tc.key"
+    [[ -f "${pki_dir}/tc.key" ]] || tls_key="ta.key"
+    virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "openvpnmultu" "$port" \
+      "${pki}/ca.crt" "${pki_dir}/ca.crt" 644 \
+      "${pki}/client.crt" "${pki_dir}/client.crt" 644 \
+      "${pki}/client.key" "${pki_dir}/client.key" 600 \
+      "${pki}/${tls_key}" "${pki_dir}/${tls_key}" 600
+    for ((i=0; i<workers; i++)); do
+      virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "openvpnmultu" "$((port + i))" \
+        "${pki}/worker-${i}.conf" "${pki_dir}/worker-${i}.conf" 644
+    done
+    blank
+    info "Privacy: CA/server private keys remain on this host only."
+    openvpn_server_send_credentials "$name" "$remote_ip" "$pki_dir" "$local_ip"
+    openvpn_show_pki_fingerprint "$pki_dir"
+    blank
+    warn "Start this server tunnel before the client."
+    warn "Firewall: allow ${proto} ports ${port}–$((port + workers - 1)) from client ${remote_ip}"
+  else
+    blank
+    warn "Start the OpenVPN MULTU SERVER on ${remote_ip} first."
+    warn "Firewall: allow ${proto} ports ${port}–$((port + workers - 1)) to server."
+    info "Logs: /var/log/virlink/${name}-w*-openvpn.log"
+  fi
+
+  blank
+  info "Overlay: client ${client_ip}  ·  server ${server_ip}  (ECMP to peer via ${workers} workers)"
+  info "Bench: iperf3 -P${workers} -c ${peer_overlay}"
 }
 
 # ── Client install scripts (/root/manual-client-conf/) ────────────────────────
