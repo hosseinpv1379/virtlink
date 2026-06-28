@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.4"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -2194,20 +2194,56 @@ hysteria2_overlay_ips() {
   openvpn_overlay_ips "$@"
 }
 
+hysteria2_gen_tls_cert() {
+  local dir="$1"
+  if openssl req -new -x509 -days 3650 -key "$dir/server.key" -out "$dir/server.crt" \
+      -subj "/CN=www.bing.com" \
+      -addext "subjectAltName=DNS:www.bing.com" 2>/dev/null; then
+    return 0
+  fi
+  cat > "${dir}/openssl-hy2.cnf" << 'EOF'
+[ req ]
+default_bits = 256
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3
+
+[ dn ]
+CN = www.bing.com
+
+[ v3 ]
+subjectAltName = DNS:www.bing.com
+EOF
+  openssl req -new -x509 -days 3650 -key "$dir/server.key" -out "$dir/server.crt" \
+    -config "${dir}/openssl-hy2.cnf" \
+    || die "OpenSSL: cannot create server certificate"
+}
+
+hysteria2_upgrade_tls_cert() {
+  local dir="$1"
+  [[ -f "$dir/server.key" ]] || return 0
+  if openssl x509 -in "$dir/server.crt" -noout -text 2>/dev/null | grep -q 'DNS:www.bing.com'; then
+    return 0
+  fi
+  info "Upgrading Hysteria2 TLS cert (SAN www.bing.com for client SNI)..."
+  hysteria2_gen_tls_cert "$dir"
+  ok "Server certificate reissued with SAN www.bing.com"
+}
+
 hysteria2_gen_credentials() {
   local dir="$1"
   mkdir -p "$dir/export"
   chmod 700 "$dir"
   if [[ -f "$dir/password" && -f "$dir/server.crt" ]]; then
     ok "Hysteria2 credentials already exist in ${dir}"
+    hysteria2_upgrade_tls_cert "$dir"
     return 0
   fi
   info "Generating Hysteria2 TLS cert + password..."
   openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" \
     || die "OpenSSL: cannot generate server key"
-  openssl req -new -x509 -days 3650 -key "$dir/server.key" -out "$dir/server.crt" \
-    -subj "/CN=hy2-local" \
-    || die "OpenSSL: cannot create server certificate"
+  hysteria2_gen_tls_cert "$dir"
   openssl rand -hex 16 > "$dir/password"
   chmod 600 "$dir/server.key" "$dir/password"
   chmod 644 "$dir/server.crt"
@@ -2224,6 +2260,7 @@ listen: :${port}
 tls:
   cert: server.crt
   key: server.key
+  sniGuard: disable
 
 auth:
   type: password
