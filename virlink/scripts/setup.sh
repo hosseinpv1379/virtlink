@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.0.7"
+SCRIPT_VERSION="1.0.9"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -28,7 +28,7 @@ readonly -a KERNEL_TUNNEL_KEYS=(
   gre-fou ipip-fou bonded-gre-fou l2tpv3 gre-fou-ipsec gre
 )
 readonly -a USERSPACE_TUNNEL_KEYS=(
-  icmp udp bip tcp udp-obfs
+  icmp udp bip tcp udp-obfs openvpn
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -677,6 +677,7 @@ icmp           — ICMP Echo tunnel (proto 1)        DPI bypass
 udp            — User-space UDP tunnel             plain UDP
 bip            — BIP tunnel (proto 58)             DPI bypass
 tcp            — User-space TCP tunnel             auto-reconnect
+openvpn        — OpenVPN core (encrypted link)     UDP/TCP · high throughput
 udp-obfs       — Obfuscated UDP (AES-256-GCM)      DPI bypass (Iran)
 EOF
 }
@@ -711,6 +712,7 @@ dispatch_tunnel_generator() {
     gre-fou-ipsec)  gen_ipsec    ;;
     gre)            gen_gre      ;;
     tcp)            gen_tcp      ;;
+    openvpn)        gen_openvpn  ;;
     udp)            gen_udp      ;;
     icmp)           gen_icmp     ;;
     bip)            gen_bip      ;;
@@ -817,6 +819,10 @@ level            = "info"
 profile          = true
 profile_interval = 30
 EOF
+      ;;
+    openvpn)
+      write_openvpn_tuning "$file" "fast"
+      return
       ;;
     *)
       write_tuning "$file"
@@ -1098,6 +1104,295 @@ EOF
   write_tuning "$cfg"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+}
+
+# ── OpenVPN PKI + config helpers ─────────────────────────────────────────────
+
+openvpn_overlay_ips() {
+  local cidr="$1" mode="$2"
+  local net="${cidr%/*}"
+  local base="${net%.*}"
+  OPENVPN_CLIENT_IP="${base}.1"
+  OPENVPN_SERVER_IP="${base}.2"
+}
+
+# MTU / MSS tuned for OpenVPN crypto + transport overhead (UDP ≈ max bandwidth).
+openvpn_mtu_for_proto() {
+  local proto="$1"
+  if [[ "$proto" == "tcp" ]]; then
+    OPENVPN_DEFAULT_MTU=1400
+    OPENVPN_TUN_MTU=1400
+    OPENVPN_MSSFIX=1360
+  else
+    OPENVPN_DEFAULT_MTU=1472
+    OPENVPN_TUN_MTU=1472
+    OPENVPN_MSSFIX=1432
+  fi
+}
+
+# Shared OpenVPN directives — fast (bandwidth), resource (CPU/power), latency.
+openvpn_perf_block() {
+  local perf="$1" proto="$2" tun_mtu="$3" mssfix="$4"
+  cat << EOF
+allow-compression no
+topology p2p
+fast-io
+sndbuf 0
+rcvbuf 0
+tun-mtu ${tun_mtu}
+mssfix ${mssfix}
+auth none
+data-ciphers AES-128-GCM:CHACHA20-POLY1305
+data-ciphers-fallback AES-128-GCM
+cipher AES-128-GCM
+ncp-ciphers AES-128-GCM:CHACHA20-POLY1305
+EOF
+  case "$perf" in
+    resource)
+      cat << EOF
+# virlink profile: resource — lower CPU wakeups / power
+reneg-sec 86400
+keepalive 60 180
+verb 0
+EOF
+      ;;
+    latency)
+      cat << EOF
+# virlink profile: latency — minimal delay
+reneg-sec 3600
+keepalive 10 60
+verb 1
+EOF
+      [[ "$proto" == "tcp" ]] && echo "tcp-nodelay"
+      ;;
+    fast|*)
+      cat << EOF
+# virlink profile: fast — max bandwidth (default)
+reneg-sec 0
+keepalive 20 90
+verb 1
+EOF
+      [[ "$proto" == "tcp" ]] && echo "tcp-nodelay"
+      ;;
+  esac
+}
+
+write_openvpn_tuning() {
+  local file="$1" perf="${2:-fast}"
+  local mode="fast" txql=10000 hb=20 poll=50
+  case "$perf" in
+    resource) mode="resource"; txql=5000; hb=60; poll=100 ;;
+    latency)  mode="latency";  txql=8000; hb=10; poll=20 ;;
+  esac
+  cat >> "$file" << EOF
+
+[tuning]
+enabled      = true
+mode         = "${mode}"
+tx_queue_len = ${txql}
+poll_ms      = ${poll}
+
+[logging]
+level = "info"
+
+[health]
+disabled = false
+port     = 6543
+EOF
+}
+
+openvpn_gen_pki() {
+  local dir="$1"
+  require_bin openssl
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+
+  if [[ -f "$dir/ca.crt" ]]; then
+    ok "PKI already exists in ${dir}"
+    return 0
+  fi
+
+  info "Generating OpenVPN PKI in ${dir}..."
+  openssl genrsa -out "$dir/ca.key" 2048 2>/dev/null
+  openssl req -new -x509 -days 3650 -key "$dir/ca.key" -out "$dir/ca.crt" \
+    -subj "/CN=virlink-openvpn-ca" 2>/dev/null
+
+  openssl genrsa -out "$dir/server.key" 2048 2>/dev/null
+  openssl req -new -key "$dir/server.key" -out "$dir/server.csr" \
+    -subj "/CN=virlink-server" 2>/dev/null
+  openssl x509 -req -days 3650 -in "$dir/server.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
+    -CAcreateserial -out "$dir/server.crt" 2>/dev/null
+
+  openssl genrsa -out "$dir/client.key" 2048 2>/dev/null
+  openssl req -new -key "$dir/client.key" -out "$dir/client.csr" \
+    -subj "/CN=virlink-client" 2>/dev/null
+  openssl x509 -req -days 3650 -in "$dir/client.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
+    -CAcreateserial -out "$dir/client.crt" 2>/dev/null
+
+  openssl dhparam -out "$dir/dh.pem" 2048 2>/dev/null
+
+  if command -v openvpn >/dev/null 2>&1; then
+    openvpn --genkey secret "$dir/ta.key"
+  else
+    openssl rand -out "$dir/ta.key" 256
+  fi
+
+  rm -f "$dir/server.csr" "$dir/client.csr"
+  chmod 600 "$dir"/*.key "$dir/dh.pem" 2>/dev/null || true
+  ok "PKI generated (ca, server, client, dh, tls-auth)"
+}
+
+openvpn_write_server_conf() {
+  local dir="$1" port="$2" proto="$3" client_ip="$4" server_ip="$5" mtu="$6" dev="$7" perf="$8"
+  local tun_mtu="$9" mssfix="${10}"
+  cat > "${dir}/server.conf" << EOF
+# virlink OpenVPN — server (site-to-site, ${perf} profile, ${proto})
+port ${port}
+proto ${proto}
+dev ${dev}
+dev-type tun
+user nobody
+group nogroup
+persist-key
+persist-tun
+ca ca.crt
+cert server.crt
+key server.key
+dh dh.pem
+tls-auth ta.key 0
+mode server
+tls-server
+ifconfig ${server_ip} ${client_ip}
+EOF
+  openvpn_perf_block "$perf" "$proto" "$tun_mtu" "$mssfix" >> "${dir}/server.conf"
+  if [[ "$proto" == "udp" ]]; then
+    echo "explicit-exit-notify 1" >> "${dir}/server.conf"
+  fi
+}
+
+openvpn_write_client_conf() {
+  local dir="$1" port="$2" proto="$3" remote_ip="$4" client_ip="$5" server_ip="$6" mtu="$7" dev="$8" perf="$9"
+  local tun_mtu="${10}" mssfix="${11}"
+  cat > "${dir}/client.conf" << EOF
+# virlink OpenVPN — client (site-to-site, ${perf} profile, ${proto})
+client
+dev ${dev}
+dev-type tun
+proto ${proto}
+remote ${remote_ip} ${port}
+nobind
+persist-key
+persist-tun
+ca ca.crt
+cert client.crt
+key client.key
+tls-auth ta.key 1
+remote-cert-tls server
+ifconfig ${client_ip} ${server_ip}
+EOF
+  openvpn_perf_block "$perf" "$proto" "$tun_mtu" "$mssfix" >> "${dir}/client.conf"
+}
+
+openvpn_require_client_pki() {
+  local dir="$1"
+  local f
+  for f in ca.crt client.crt client.key ta.key; do
+    [[ -f "${dir}/${f}" ]] || die "Missing ${dir}/${f} — copy PKI from server or run setup on server first"
+  done
+}
+
+gen_openvpn() {
+  local name mode local_ip remote_ip cidr port proto mtu dev pki_dir ovpn_conf cfg perf_raw perf
+  local client_ip server_ip tun_mtu mssfix default_mtu hb
+  collect_base_inputs name mode local_ip remote_ip cidr
+  blank
+  info "Transport: UDP = max bandwidth · TCP = firewall-friendly (slower)"
+  pick proto "OpenVPN transport" \
+    "udp — max bandwidth (recommended)" \
+    "tcp — works through strict firewalls"
+  proto="$(label_key "$proto")"
+  openvpn_mtu_for_proto "$proto"
+  default_mtu="$OPENVPN_DEFAULT_MTU"
+  tun_mtu="$OPENVPN_TUN_MTU"
+  mssfix="$OPENVPN_MSSFIX"
+  prompt port "OpenVPN port" "1194"
+  prompt mtu "TUN MTU (overlay)" "$default_mtu"
+  pick perf_raw "Performance profile" \
+    "fast — max bandwidth (recommended)" \
+    "resource — lower CPU / power use" \
+    "latency — minimal delay"
+  perf="$(label_key "$perf_raw")"
+  dev="ovpn-tun0"
+
+  require_bin openvpn
+  pki_dir="${INSTALL_DIR}/pki/${name}"
+  mkdir -p "$pki_dir"
+
+  if [[ "$mode" == "server" ]]; then
+    openvpn_gen_pki "$pki_dir"
+  else
+    if [[ ! -f "${pki_dir}/ca.crt" ]]; then
+      warn "Client needs PKI files from the server."
+      info "On server: scp -r root@SERVER:${INSTALL_DIR}/pki/${name} ${pki_dir%/*}/"
+      die "PKI not found in ${pki_dir}"
+    fi
+    openvpn_require_client_pki "$pki_dir"
+  fi
+
+  openvpn_overlay_ips "$cidr" "$mode"
+  client_ip="$OPENVPN_CLIENT_IP"
+  server_ip="$OPENVPN_SERVER_IP"
+
+  case "$perf" in
+    resource) hb=60 ;;
+    latency)  hb=10 ;;
+    *)        hb=20 ;;
+  esac
+
+  if [[ "$mode" == "server" ]]; then
+    ovpn_conf="${pki_dir}/server.conf"
+    openvpn_write_server_conf "$pki_dir" "$port" "$proto" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"
+    ok "Wrote ${ovpn_conf} (${perf}, ${proto})"
+    info "Copy to client: scp -r ${pki_dir} root@CLIENT:${INSTALL_DIR}/pki/"
+  else
+    ovpn_conf="${pki_dir}/client.conf"
+    openvpn_write_client_conf "$pki_dir" "$port" "$proto" "$remote_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"
+    ok "Wrote ${ovpn_conf} (${perf}, ${proto})"
+  fi
+
+  cfg="${CONFIGS_DIR}/${name}.toml"
+  cat > "$cfg" << EOF
+# virlink — ${name}  (OpenVPN site-to-site · ${perf} · ${proto})
+[tunnel]
+type      = "openvpn"
+mode      = "${mode}"
+local_ip  = "${local_ip}"
+remote_ip = "${remote_ip}"
+cidr      = "${cidr}"
+mtu       = ${mtu}
+name      = "${name}"
+
+[transport]
+port               = ${port}
+proto              = "${proto}"
+heartbeat_interval = ${hb}
+
+[openvpn]
+config = "${ovpn_conf}"
+dev    = "${dev}"
+
+[security]
+encryption = true
+EOF
+  write_openvpn_tuning "$cfg" "$perf"
+  add_forward_section "$cfg" "$mode"
+  LAST_CFG_PATH="$cfg"
+  blank
+  warn "Firewall: allow ${proto}/${port} between ${local_ip} and ${remote_ip}"
+  if [[ "$mode" == "server" ]]; then
+    info "Client overlay IP: ${client_ip}  ·  Server overlay IP: ${server_ip}"
+  fi
+  info "OpenVPN: tun-mtu ${tun_mtu}  mssfix ${mssfix}  profile ${perf}"
 }
 
 gen_tcp() {

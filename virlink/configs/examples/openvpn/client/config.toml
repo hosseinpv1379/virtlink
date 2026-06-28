@@ -1,0 +1,45 @@
+# ── virlink · OpenVPN · CLIENT (UDP · fast profile) ──────────────────────────
+# Copy /opt/virlink/pki/site1/ from the server before starting on the client.
+# Use proto = "tcp" and mtu = 1400 for firewall-restricted paths.
+#
+# Usage:   sudo virlink -c config.toml
+# Overlay: client → 10.99.0.1/24  ·  server peer → 10.99.0.2
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tunnel]
+type      = "openvpn"
+mode      = "client"
+local_ip  = "198.51.100.20"
+remote_ip = "203.0.113.10"
+cidr      = "10.99.0.0/24"
+mtu       = 1472
+name      = "site1"
+
+[transport]
+port               = 1194
+proto              = "udp"
+heartbeat_interval = 20
+
+[openvpn]
+config = "/opt/virlink/pki/site1/client.conf"
+dev    = "ovpn-tun0"
+
+[security]
+encryption = true
+
+[tuning]
+enabled      = true
+mode         = "fast"
+tx_queue_len = 10000
+poll_ms      = 50
+
+[logging]
+level = "info"
+
+[health]
+disabled = false
+port     = 6543
+
+[forward]
+enabled = false
+rules = []

@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-const version = "2.9.6"
+const version = "2.10.0"
 
 func Main() {
 	cfgFile  := flag.String("c", "", "path to config.toml")
@@ -86,6 +86,7 @@ Tunnel types  ([tunnel] type = "..." in config.toml):
   udp-obfs        AES-256-GCM obfuscated UDP port 443
   gre             Kernel GRE (proto 47)      raw
   tcp             User-space TCP tunnel      port 8443
+  openvpn         OpenVPN (openvpn core)     port 1194
   udp             User-space UDP tunnel      port 5060
   icmp            ICMP Echo tunnel (proto 1) raw
   bip             BIP tunnel (proto 58)      raw

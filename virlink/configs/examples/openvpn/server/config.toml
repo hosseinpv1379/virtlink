@@ -1,0 +1,45 @@
+# ── virlink · OpenVPN · SERVER (UDP · fast profile) ──────────────────────────
+# Performance-tuned site-to-site OpenVPN via the openvpn core.
+# Generate with: sudo virlink-setup → userspace → openvpn
+#
+# Usage:   sudo virlink -c config.toml
+# Overlay: server → 10.99.0.2/24  ·  client peer → 10.99.0.1
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tunnel]
+type      = "openvpn"
+mode      = "server"
+local_ip  = "203.0.113.10"
+remote_ip = "198.51.100.20"
+cidr      = "10.99.0.0/24"
+mtu       = 1472
+name      = "site1"
+
+[transport]
+port               = 1194
+proto              = "udp"
+heartbeat_interval = 20
+
+[openvpn]
+config = "/opt/virlink/pki/site1/server.conf"
+dev    = "ovpn-tun0"
+
+[security]
+encryption = true
+
+[tuning]
+enabled      = true
+mode         = "fast"
+tx_queue_len = 10000
+poll_ms      = 50
+
+[logging]
+level = "info"
+
+[health]
+disabled = false
+port     = 6543
+
+[forward]
+enabled = false
+rules = []

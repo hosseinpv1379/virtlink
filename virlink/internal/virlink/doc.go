@@ -48,6 +48,6 @@
 //	  tun_gre_fou.go  tun_ipip_fou.go  tun_bonded.go  tun_l2tpv3.go
 //	  tun_ipsec.go   tun_gre.go
 //
-//	Userspace tunnels (TUN + raw/UDP/TCP)
-//	  tun_icmp.go  tun_udp.go  tun_tcp.go  tun_bip.go  tun_udp_obfs.go
+//	Userspace tunnels (TUN + raw/UDP/TCP/OpenVPN)
+//	  tun_icmp.go  tun_udp.go  tun_tcp.go  tun_bip.go  tun_udp_obfs.go  tun_openvpn.go
 package virlink

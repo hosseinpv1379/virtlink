@@ -42,6 +42,7 @@ sudo virlink-setup
 | `udp` | UDP | User-space plain UDP | ✗ | Simple UDP transport |
 | `icmp` | IP/1 | ICMP Echo carrier | ✗ | DPI evasion |
 | `bip` | IP/58 | Proto-58 carrier (ICMPv6 number) | ✗ | DPI evasion |
+| `openvpn` | UDP/TCP | OpenVPN core site-to-site | ✓ | Encrypted link · UDP=max BW |
 
 ---
 

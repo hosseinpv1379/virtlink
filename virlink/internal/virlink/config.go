@@ -97,6 +97,12 @@ type HealthCfg struct {
 	Port     int  `toml:"port"`     // default 6543
 }
 
+// OpenVPNCfg maps to [openvpn]
+type OpenVPNCfg struct {
+	Config string `toml:"config"` // path to openvpn .conf file
+	Dev    string `toml:"dev"`    // TUN name (must match dev in .conf, default ovpn-tun0)
+}
+
 // MangleCfg maps to [mangle] — optional wire IP spoof (manual config only).
 // Userspace (icmp/udp/bip): IP_HDRINCL  ·  Kernel (gre-fou, gre, …): nftables mangle
 // Client: srcip=1.1.1.1 dstip=2.2.2.2  ·  Server: srcip=2.2.2.2 dstip=1.1.1.1
@@ -119,6 +125,7 @@ type Config struct {
 	Obfs      ObfsCfg      `toml:"obfs"`
 	Health    HealthCfg    `toml:"health"`
 	Mangle    MangleCfg    `toml:"mangle"`
+	OpenVPN   OpenVPNCfg   `toml:"openvpn"`
 
 	// Convenience aliases (set after parse, not from TOML)
 	Mode     string `toml:"-"`
@@ -221,6 +228,16 @@ func setDefaults(c *Config) {
 		default:                t.MTU = 1420
 		}
 	}
+	if tr.Proto == "" && t.Type == "openvpn" {
+		tr.Proto = "udp"
+	}
+	if t.MTU == 0 && t.Type == "openvpn" {
+		if tr.Proto == "tcp" {
+			t.MTU = 1400
+		} else {
+			t.MTU = 1472
+		}
+	}
 
 	if tr.Port == 0 {
 		switch t.Type {
@@ -230,6 +247,7 @@ func setDefaults(c *Config) {
 		case "l2tpv3":                   tr.Port = 5059
 		case "udp-obfs":                 tr.Port = 443
 		case "tcp":                      tr.Port = 8443
+		case "openvpn":                  tr.Port = 1194
 		case "udp":                      tr.Port = 5060
 		// gre, icmp, bip don't use ports (raw protocol tunnels)
 		default:                         tr.Port = 5556
@@ -237,6 +255,9 @@ func setDefaults(c *Config) {
 	}
 	if tr.Port2 == 0 && t.Type == "bonded-gre-fou" {
 		tr.Port2 = tr.Port + 1
+	}
+	if c.OpenVPN.Dev == "" && t.Type == "openvpn" {
+		c.OpenVPN.Dev = "ovpn-tun0"
 	}
 
 	l := &c.L2TP
@@ -254,7 +275,11 @@ func setDefaults(c *Config) {
 	if s.AuthKeyIn == ""  { s.AuthKeyIn = "0xb2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1" }
 
 	if c.Tuning.Mode == "" {
-		c.Tuning.Mode = tuningBalanced
+		if t.Type == "openvpn" {
+			c.Tuning.Mode = tuningFast
+		} else {
+			c.Tuning.Mode = tuningBalanced
+		}
 	}
 	if c.Tuning.ChannelSize == 0 { c.Tuning.ChannelSize = 10_000 }
 	if c.Logging.Level == ""     { c.Logging.Level = "info" }
@@ -273,7 +298,7 @@ func validate(c *Config) error {
 		"l2tpv3", "gre-fou-ipsec",
 		"udp-obfs",
 		// raw protocol tunnels
-		"gre", "tcp", "udp", "icmp", "bip",
+		"gre", "tcp", "udp", "icmp", "bip", "openvpn",
 	}
 	ok := false
 	for _, v := range valid {
@@ -303,6 +328,11 @@ func validate(c *Config) error {
 	if wireSpoofEnabled(c) {
 		if err := validateWireSpoofTunnel(c.Tunnel.Type); err != nil {
 			return err
+		}
+	}
+	if c.Tunnel.Type == "openvpn" {
+		if c.OpenVPN.Config == "" {
+			return fmt.Errorf("[openvpn] config path is required")
 		}
 	}
 	return nil
