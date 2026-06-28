@@ -79,7 +79,7 @@ func (b *BenchMgr) runServer() {
 		bindIP = "0.0.0.0"
 	}
 	addr := fmt.Sprintf("%s:%d", bindIP, b.port)
-	ln, err := net.Listen("tcp4", addr)
+	ln, err := listenTCPReuseAddr(addr)
 	if err != nil {
 		logWarn(fmt.Sprintf("bench server: listen %s: %v", addr, err))
 		return

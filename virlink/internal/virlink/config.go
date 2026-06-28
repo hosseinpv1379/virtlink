@@ -339,7 +339,7 @@ func setDefaults(c *Config) {
 	}
 	if c.Tuning.ChannelSize == 0 { c.Tuning.ChannelSize = 10_000 }
 	if c.Logging.Level == ""     { c.Logging.Level = "info" }
-	if c.Health.Port == 0        { c.Health.Port = defaultHealthPort }
+	applyHealthPort(c)
 	if t.Type == "hysteria2"     { c.Health.Disabled = true }
 }
 

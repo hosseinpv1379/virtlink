@@ -1266,9 +1266,23 @@ _userspace_tcp_streams() {
   echo "$n"
 }
 
+# FNV-1a health port offset — must match Go healthPortOffset + defaultHealthPort (6543).
+health_port_for_tunnel() {
+  local name="$1"
+  local h=2166136261
+  local i c
+  for ((i=0; i<${#name}; i++)); do
+    c=$(printf '%d' "'${name:$i:1}")
+    h=$(( (h ^ c) * 16777619 ))
+    h=$(( h & 0xFFFFFFFF ))
+  done
+  echo $(( 6543 + h % 400 ))
+}
+
 write_userspace_tuning() {
-  local file="$1" proto="$2"
-  local queues streams
+  local file="$1" proto="$2" tun_name="${3:-}"
+  local queues streams hp=6543
+  [[ -n "$tun_name" ]] && hp=$(health_port_for_tunnel "$tun_name")
   queues=$(_userspace_queues)
   streams=$(_userspace_tcp_streams)
   case "$proto" in
@@ -1327,7 +1341,7 @@ profile_interval = 30
 EOF
       ;;
     openvpn|openvpnmultu)
-      write_openvpn_tuning "$file" "fast"
+      write_openvpn_tuning "$file" "fast" false "$tun_name"
       return
       ;;
     hysteria2)
@@ -1350,15 +1364,15 @@ EOF
       return
       ;;
     wireguard)
-      write_openvpn_tuning "$file" "fast"
+      write_openvpn_tuning "$file" "fast" false "$tun_name"
       return
       ;;
     amneziawg)
-      write_openvpn_tuning "$file" "fast"
+      write_openvpn_tuning "$file" "fast" false "$tun_name"
       return
       ;;
     *)
-      write_tuning "$file"
+      write_tuning "$file" false "$tun_name"
       return
       ;;
   esac
@@ -1366,12 +1380,14 @@ EOF
 
 [health]
 disabled = false
-port     = 6543
+port     = ${hp}
 EOF
 }
 
 write_tuning() {
-  local file="$1" multipath="${2:-false}"
+  local file="$1" multipath="${2:-false}" tun_name="${3:-}"
+  local hp=6543
+  [[ -n "$tun_name" ]] && hp=$(health_port_for_tunnel "$tun_name")
   cat >> "$file" << EOF
 
 [tuning]
@@ -1393,7 +1409,7 @@ profile_interval = 30
 
 [health]
 disabled = false
-port     = 6543
+port     = ${hp}
 EOF
 }
 
@@ -1433,7 +1449,7 @@ cidr      = "${cidr}"
 mtu       = ${mtu}
 EOF
   write_transport "$cfg" "$port" "fou" "10"
-  write_tuning    "$cfg"
+  write_tuning    "$cfg" "false" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "gre-fou" "$port"
@@ -1456,7 +1472,7 @@ cidr      = "${cidr}"
 mtu       = ${mtu}
 EOF
   write_transport "$cfg" "$port" "fou" "10"
-  write_tuning    "$cfg"
+  write_tuning    "$cfg" "false" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "ipip-fou" "$port"
@@ -1485,7 +1501,7 @@ port2              = ${port2}
 proto              = "fou"
 heartbeat_interval = 10
 EOF
-  write_tuning "$cfg" "true"
+  write_tuning "$cfg" "true" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "bonded-gre-fou" "$port1"
@@ -1518,7 +1534,7 @@ server_tunnel_id  = 2000
 client_session_id = 1000
 server_session_id = 2000
 EOF
-  write_tuning "$cfg"
+  write_tuning "$cfg" "false" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "l2tpv3" "$port"
@@ -1568,7 +1584,7 @@ padding = ${padding}
 [security]
 encryption = true
 EOF
-  write_tuning "$cfg"
+  write_tuning "$cfg" "false" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "udp-obfs" "$port"
@@ -1618,7 +1634,7 @@ enc_key_in   = "${encin}"
 auth_key_out = "${authout}"
 auth_key_in  = "${authin}"
 EOF
-  write_tuning "$cfg"
+  write_tuning "$cfg" "false" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "gre-fou-ipsec" "$port"
@@ -1640,7 +1656,7 @@ cidr      = "${cidr}"
 mtu       = ${mtu}
 EOF
   write_transport_no_port "$cfg" "10"
-  write_tuning "$cfg"
+  write_tuning "$cfg" "false" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "gre" "0"
@@ -1719,8 +1735,9 @@ EOF
 }
 
 write_openvpn_tuning() {
-  local file="$1" perf="${2:-fast}" multipath="${3:-false}"
-  local mode="fast" txql=10000 hb=20 poll=50
+  local file="$1" perf="${2:-fast}" multipath="${3:-false}" tun_name="${4:-}"
+  local mode="fast" txql=10000 hb=20 poll=50 hp=6543
+  [[ -n "$tun_name" ]] && hp=$(health_port_for_tunnel "$tun_name")
   case "$perf" in
     resource) mode="resource"; txql=5000; hb=60; poll=100 ;;
     latency)  mode="latency";  txql=8000; hb=10; poll=20 ;;
@@ -1739,7 +1756,7 @@ level = "info"
 
 [health]
 disabled = false
-port     = 6543
+port     = ${hp}
 EOF
 }
 
@@ -2625,7 +2642,7 @@ dco    = ${dco_toml}
 [security]
 encryption = true
 EOF
-  write_openvpn_tuning "$cfg" "$perf"
+  write_openvpn_tuning "$cfg" "$perf" false "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
@@ -2760,7 +2777,7 @@ workers  = ${workers}
 [security]
 encryption = true
 EOF
-  write_openvpn_tuning "$cfg" "$perf" true
+  write_openvpn_tuning "$cfg" "$perf" true "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
@@ -3339,7 +3356,7 @@ dev    = "${dev}"
 [security]
 encryption = true
 EOF
-  write_userspace_tuning "$cfg" "hysteria2"
+  write_userspace_tuning "$cfg" "hysteria2" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
@@ -3575,7 +3592,7 @@ dev    = "${dev}"
 [security]
 encryption = true
 EOF
-  write_openvpn_tuning "$cfg" "fast"
+  write_openvpn_tuning "$cfg" "fast" false "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
@@ -3942,7 +3959,7 @@ dev    = "${dev}"
 [security]
 encryption = true
 EOF
-  write_openvpn_tuning "$cfg" "fast"
+  write_openvpn_tuning "$cfg" "fast" false "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
@@ -3993,7 +4010,7 @@ cidr      = "${cidr}"
 mtu       = ${mtu}
 EOF
   write_transport "$cfg" "$port" "tcp" "10"
-  write_userspace_tuning "$cfg" "tcp"
+  write_userspace_tuning "$cfg" "tcp" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "tcp" "$port"
@@ -4023,7 +4040,7 @@ hash = "${hash}"
 
 EOF
   write_transport "$cfg" "$port" "tcp" "10"
-  write_userspace_tuning "$cfg" "tcpmux"
+  write_userspace_tuning "$cfg" "tcpmux" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "tcpmux" "$port"
@@ -4046,7 +4063,7 @@ cidr      = "${cidr}"
 mtu       = ${mtu}
 EOF
   write_transport "$cfg" "$port" "udp" "10"
-  write_userspace_tuning "$cfg" "udp"
+  write_userspace_tuning "$cfg" "udp" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "udp" "$port"
@@ -4070,7 +4087,7 @@ cidr      = "${cidr}"
 mtu       = ${mtu}
 EOF
   write_transport_no_port "$cfg" "10"
-  write_userspace_tuning "$cfg" "icmp"
+  write_userspace_tuning "$cfg" "icmp" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "icmp" "0"
@@ -4094,7 +4111,7 @@ cidr      = "${cidr}"
 mtu       = ${mtu}
 EOF
   write_transport_no_port "$cfg" "10"
-  write_userspace_tuning "$cfg" "bip"
+  write_userspace_tuning "$cfg" "bip" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "bip" "0"

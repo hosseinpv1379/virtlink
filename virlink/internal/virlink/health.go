@@ -13,16 +13,54 @@
 package virlink
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 const defaultHealthPort = 6543
+
+const healthPortSpan = 400 // ports 6543–6942 via healthPortOffset
+
+// healthPortOffset returns a stable offset in [0, healthPortSpan) from tunnel name.
+func healthPortOffset(name string) int {
+	h := uint32(2166136261)
+	for i := 0; i < len(name); i++ {
+		h ^= uint32(name[i])
+		h *= 16777619
+	}
+	return int(h % healthPortSpan)
+}
+
+// applyHealthPort assigns a unique health port when unset or left at default.
+func applyHealthPort(c *Config) {
+	if c.Health.Port != 0 && c.Health.Port != defaultHealthPort {
+		return
+	}
+	c.Health.Port = defaultHealthPort + healthPortOffset(tunnelInstanceName(c))
+}
+
+func listenTCPReuseAddr(addr string) (net.Listener, error) {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var setErr error
+			err := c.Control(func(fd uintptr) {
+				setErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+			})
+			if err != nil {
+				return err
+			}
+			return setErr
+		},
+	}
+	return lc.Listen(context.Background(), "tcp4", addr)
+}
 
 // probe wire format: 4-byte magic + 8-byte unix-nano timestamp
 var probeMagic = [4]byte{'V', 'L', 0x01, 0x70}
@@ -249,13 +287,17 @@ func (h *HealthMgr) runHTTPServer(overlayIP string, port int, tun Tunnel, bm *Be
 
 	addr := fmt.Sprintf("%s:%d", overlayIP, port)
 	srv := &http.Server{
-		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 120 * time.Second, // bench can take up to 60s
 	}
+	ln, err := listenTCPReuseAddr(addr)
+	if err != nil {
+		logWarn(fmt.Sprintf("health HTTP: listen %s: %v", addr, err))
+		return
+	}
 	logInfo(fmt.Sprintf("health HTTP  listen=%s  /health  /profile  /bench(port %d)", addr, port+1))
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		logWarn(fmt.Sprintf("health HTTP: %v", err))
 	}
 }
