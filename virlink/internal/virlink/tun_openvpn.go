@@ -100,9 +100,8 @@ func (t *OpenvpnTunnel) Up() error {
 	}
 	if t.useDCO {
 		args = append(args, "--enable-dco")
-	} else {
-		args = append(args, "--disable-dco")
 	}
+	// omit --disable-dco when unsupported — stock 2.6 without DCO rejects unknown options
 
 	t.cmd = exec.Command("openvpn", args...)
 	t.cmd.Stdout = logFile

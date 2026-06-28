@@ -8,17 +8,28 @@ package virlink
 import (
 	"os"
 	"os/exec"
-	"regexp"
-	"strconv"
 	"strings"
 )
 
-// openvpnUseDCO decides whether to enable Data Channel Offload (OpenVPN 2.6+).
+// openvpnUseDCO decides whether to enable Data Channel Offload (OpenVPN 2.6+ built with DCO).
 func openvpnUseDCO(c *Config) bool {
-	if c.OpenVPN.DCO != nil {
-		return *c.OpenVPN.DCO
+	supported := openvpnBinarySupportsDCO()
+	module := ovpnDCOModulePresent()
+	if c.OpenVPN.DCO != nil && *c.OpenVPN.DCO {
+		if !supported {
+			logWarn("dco=true but openvpn lacks DCO (enable-dco unknown) — install openvpn-dco-dkms or rebuild; running without DCO")
+			return false
+		}
+		if !module {
+			logWarn("dco=true but ovpn-dco kernel module missing — modprobe ovpn_dco_v2; running without DCO")
+			return false
+		}
+		return true
 	}
-	return ovpnDCOModulePresent() && openvpnBinarySupportsDCO()
+	if c.OpenVPN.DCO != nil && !*c.OpenVPN.DCO {
+		return false
+	}
+	return supported && module
 }
 
 func ovpnDCOModulePresent() bool {
@@ -36,20 +47,13 @@ func ovpnDCOModulePresent() bool {
 	return false
 }
 
-var openvpnVersionRe = regexp.MustCompile(`OpenVPN\s+(\d+)\.(\d+)`)
-
 func openvpnBinarySupportsDCO() bool {
-	out, err := exec.Command("openvpn", "--version").CombinedOutput()
+	out, err := exec.Command("openvpn", "--help").CombinedOutput()
 	if err != nil {
 		return false
 	}
-	m := openvpnVersionRe.FindSubmatch(out)
-	if len(m) < 3 {
-		return false
-	}
-	major, _ := strconv.Atoi(string(m[1]))
-	minor, _ := strconv.Atoi(string(m[2]))
-	return major > 2 || (major == 2 && minor >= 6)
+	// Version 2.6+ alone is not enough — distro packages often omit DCO at compile time.
+	return strings.Contains(string(out), "enable-dco")
 }
 
 func openvpnDCOActive(logPath string) bool {

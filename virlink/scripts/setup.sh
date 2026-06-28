@@ -561,8 +561,17 @@ openvpn_dco_module_present() {
   return 1
 }
 
+openvpn_binary_supports_dco() {
+  command -v openvpn &>/dev/null || return 1
+  openvpn --help 2>&1 | grep -q 'enable-dco'
+}
+
 ensure_openvpn_dco() {
-  openvpn_dco_module_present && { ok "OpenVPN DCO kernel module ready"; return 0; }
+  openvpn_binary_supports_dco || {
+    warn "openvpn binary has no DCO (enable-dco unknown) — need openvpn-dco-dkms or rebuild with DCO"
+    return 1
+  }
+  openvpn_dco_module_present && { ok "OpenVPN DCO ready (binary + kernel module)"; return 0; }
   require_root
   warn "OpenVPN DCO module not loaded — trying package install..."
   for pkg in openvpn-dco-dkms kmod-ovpn-dco-v2; do
@@ -2166,7 +2175,7 @@ ca ca.crt
 cert server.crt
 key server.key
 EOF
-  if [[ "$use_dco" == "1" ]]; then
+  if [[ "$use_dco" == "1" ]] && openvpn_binary_supports_dco; then
     echo "enable-dco" >> "$out"
   else
     cat >> "$out" << EOF
@@ -2206,7 +2215,7 @@ ca ca.crt
 cert client.crt
 key client.key
 EOF
-  if [[ "$use_dco" == "1" ]]; then
+  if [[ "$use_dco" == "1" ]] && openvpn_binary_supports_dco; then
     echo "enable-dco" >> "$out"
   fi
   openvpn_write_crypto_block "$dir" client >> "$out"
