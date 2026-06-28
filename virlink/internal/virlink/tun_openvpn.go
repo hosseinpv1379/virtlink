@@ -5,11 +5,14 @@
 package virlink
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -92,7 +95,7 @@ func (t *OpenvpnTunnel) Up() error {
 	go func() { _ = logFile.Close() }()
 
 	step("waiting for TUN device " + dev + "...")
-	if err := waitForLink(dev, 30*time.Second); err != nil {
+	if err := waitForOpenVPN(dev, logPath, t.cmd, 120*time.Second); err != nil {
 		t.stopProcess()
 		return err
 	}
@@ -180,16 +183,74 @@ func (t *OpenvpnTunnel) Status() {
 }
 
 func waitForLink(name string, timeout time.Duration) error {
+	return waitForOpenVPN(name, "", nil, timeout)
+}
+
+func waitForOpenVPN(dev, logPath string, cmd *exec.Cmd, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if l, err := netlink.LinkByName(name); err == nil {
-			if l.Attrs().Flags&net.FlagUp != 0 {
+		if linkUp(dev) {
+			return nil
+		}
+		if logPath != "" && openvpnLogContains(logPath, "Initialization Sequence Completed") {
+			time.Sleep(500 * time.Millisecond)
+			if linkUp(dev) {
 				return nil
 			}
 		}
-		time.Sleep(200 * time.Millisecond)
+		if cmd != nil && !openvpnProcessAlive(cmd) {
+			return fmt.Errorf("openvpn exited before %s came up:\n%s",
+				dev, openvpnLogTail(logPath, 20))
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
-	return fmt.Errorf("timeout waiting for interface %s", name)
+	hint := "start OpenVPN server first; match port/proto/PKI on both sides; open firewall for OpenVPN port"
+	if logPath != "" {
+		return fmt.Errorf("timeout waiting for %s (%s):\n%s\nlog: %s",
+			dev, hint, openvpnLogTail(logPath, 25), logPath)
+	}
+	return fmt.Errorf("timeout waiting for interface %s", dev)
+}
+
+func linkUp(name string) bool {
+	l, err := netlink.LinkByName(name)
+	if err != nil {
+		return false
+	}
+	return l.Attrs().Flags&net.FlagUp != 0
+}
+
+func openvpnProcessAlive(cmd *exec.Cmd) bool {
+	if cmd == nil || cmd.Process == nil {
+		return false
+	}
+	return cmd.Process.Signal(syscall.Signal(0)) == nil
+}
+
+func openvpnLogContains(path, needle string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(b, []byte(needle))
+}
+
+func openvpnLogTail(path string, n int) string {
+	if path == "" {
+		return "(no log path)"
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("(log unreadable: %v)", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) == 0 {
+		return "(log empty — openvpn failed immediately?)"
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func openvpnLogPath(c *Config) string {

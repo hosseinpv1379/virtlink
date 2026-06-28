@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.3"
+SCRIPT_VERSION="1.2.4"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -1881,6 +1881,8 @@ dev-type tun
 proto ${proto}
 remote ${remote_ip} ${port}
 nobind
+connect-timeout 30
+connect-retry-max 5
 persist-key
 persist-tun
 ca ca.crt
@@ -1956,10 +1958,17 @@ gen_openvpn() {
     blank
     info "Privacy: CA/server private keys remain on this host only."
     openvpn_server_send_credentials "$name" "$remote_ip" "$pki_dir" "$local_ip"
+    blank
+    warn "Start this server tunnel before the client: virlink-setup → Start tunnel → ${name}"
+    warn "Firewall: allow ${proto}/${port} from client ${remote_ip}"
   else
     ovpn_conf="${pki_dir}/client.conf"
     openvpn_write_client_conf "$pki_dir" "$port" "$proto" "$remote_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"
     ok "Wrote ${ovpn_conf} (${perf}, ${proto})"
+    blank
+    warn "Start the OpenVPN SERVER tunnel first (peer ${remote_ip})."
+    warn "Firewall: allow ${proto}/${port} from this host → server (Hetzner cloud firewall too)."
+    info "If tunnel fails: tail -30 /var/log/virlink/${name}-openvpn.log"
   fi
 
   cfg="${CONFIGS_DIR}/${name}.toml"
