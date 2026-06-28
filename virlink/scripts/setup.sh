@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.5.3"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -802,6 +802,63 @@ tunnel_stop() {
   systemctl stop    "$svc" 2>/dev/null || true
   systemctl disable "$svc" 2>/dev/null || true
   ok "Tunnel '${name}' stopped and disabled."
+}
+
+tunnel_restart() {
+  local name="$1"
+  local cfg="${CONFIGS_DIR}/${name}.toml"
+  local svc; svc="$(svc_name "$name")"
+
+  [[ -f "$cfg" ]] || die "No tunnel '${name}' — config missing: ${cfg}"
+
+  info "Restarting ${svc}..."
+  if systemctl restart "$svc" 2>/dev/null; then
+    sleep 1
+  else
+    warn "systemctl restart failed — stop + start"
+    tunnel_stop "$name"
+    tunnel_start "$name"
+    return $?
+  fi
+
+  if tunnel_is_running "$name"; then
+    ok "Tunnel '${name}' restarted  (log: $(svc_log "$name"))"
+  else
+    err "Tunnel '${name}' failed after restart — check log:"
+    tail -20 "$(svc_log "$name")" 2>/dev/null | _virlink_color_log | sed 's/^/  /' || \
+      journalctl -u "$svc" -n 20 --no-pager 2>/dev/null | _virlink_color_log | sed 's/^/  /' || true
+    return 1
+  fi
+}
+
+tunnel_remove_cli() {
+  local name="$1"
+  shift || true
+  local force=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes) force=1; shift ;;
+      -h|--help)
+        cat << EOF
+Usage: $0 remove NAME [-y|--yes]
+
+  NAME          tunnel name (e.g. awg)
+  -y, --yes     skip confirmation prompt
+EOF
+        exit 0
+        ;;
+      *) die "remove: unknown option '$1' (try: remove NAME -y)" ;;
+    esac
+  done
+
+  [[ -f "${CONFIGS_DIR}/${name}.toml" ]] || die "No tunnel '${name}'"
+
+  if (( force )) || confirm "Completely remove tunnel '${name}' (service + logs + config)"; then
+    tunnel_remove "$name"
+  else
+    info "Cancelled."
+  fi
 }
 
 _virlink_color_log() {
@@ -3750,11 +3807,7 @@ menu_tunnel_management() {
           tunnel_stop "$name"
           ;;
         restart)
-          systemctl restart "$(svc_name "$name")" 2>/dev/null || {
-            tunnel_stop "$name"
-            tunnel_start "$name"
-          }
-          ok "Restarted."
+          tunnel_restart "$name"
           ;;
         status)
           tunnel_status "$name"
@@ -3763,8 +3816,7 @@ menu_tunnel_management() {
           local editor="${EDITOR:-nano}"
           "$editor" "${CONFIGS_DIR}/${name}.toml"
           if confirm "Restart tunnel to apply changes"; then
-            systemctl restart "$(svc_name "$name")" 2>/dev/null || true
-            ok "Restarted."
+            tunnel_restart "$name" || true
           fi
           ;;
         remove)
@@ -3883,8 +3935,7 @@ EOF
   fi
   if tunnel_is_running "$name" && confirm "Restart tunnel to apply"; then
     require_root
-    systemctl restart "$(svc_name "$name")" 2>/dev/null || true
-    ok "Restarted."
+    tunnel_restart "$name" || true
   fi
 }
 
@@ -4033,7 +4084,8 @@ Commands:
   menu (default)  interactive setup
   start NAME      start tunnel systemd service
   stop NAME       stop tunnel
-  restart NAME    restart tunnel
+  restart NAME    restart tunnel service
+  remove NAME     delete tunnel (service + config + log)
   status NAME     show tunnel status
   logs NAME       show tunnel log (add -f to follow)
   list            list configured tunnels
@@ -4052,13 +4104,12 @@ done
 case "${1:-menu}" in
   start)   require_root; ensure_dirs; tunnel_start  "${2:?tunnel name required}" ;;
   stop)    require_root; ensure_dirs; tunnel_stop   "${2:?tunnel name required}" ;;
-  restart) require_root; ensure_dirs
-           systemctl restart "$(svc_name "${2:?name required}")" 2>/dev/null || \
-           { tunnel_stop "${2}"; tunnel_start "${2}"; } ;;
+  restart) require_root; ensure_dirs; tunnel_restart "${2:?tunnel name required}" ;;
+  remove)  require_root; ensure_dirs; tunnel_remove_cli "${2:?tunnel name required}" "${@:3}" ;;
   status)  tunnel_status "${2:?tunnel name required}" ;;
   logs)    tunnel_logs   "${2:?tunnel name required}" "${@:3}" ;;
   list)    list_tunnels ;;
   update)  require_root; check_update; do_update_all ;;
   menu)    main ;;
-  *)       echo "Usage: $0 [-v|--verbose] [-x|--debug] [menu|start|stop|restart|status|logs|list|update] [name]"; exit 1 ;;
+  *)       echo "Usage: $0 [-v|--verbose] [-x|--debug] [menu|start|stop|restart|remove|status|logs|list|update] [name]"; exit 1 ;;
 esac
