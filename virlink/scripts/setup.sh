@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -419,8 +419,105 @@ do_remove_core() {
 # ══════════════════════════════════════════════════════════════════════════════
 require_root() { [[ $EUID -eq 0 ]] || die "Requires root — run: sudo virlink-setup"; }
 require_bin()  { [[ -x "$VIRLINK_BIN" ]] || die "Binary not found: $VIRLINK_BIN"; }
-require_cmd()  { command -v "$1" >/dev/null 2>&1 || die "'$1' not found — install it first"; }
 ensure_dirs()  { mkdir -p "$CONFIGS_DIR" "$LOGS_DIR"; }
+
+_detect_pkg_mgr() {
+  if command -v apt-get &>/dev/null; then echo apt
+  elif command -v dnf &>/dev/null; then echo dnf
+  elif command -v yum &>/dev/null; then echo yum
+  elif command -v apk &>/dev/null; then echo apk
+  elif command -v zypper &>/dev/null; then echo zypper
+  else echo ""
+  fi
+}
+
+_cmd_pkg_name() {
+  case "$1" in
+    openvpn) echo openvpn ;;
+    openssl) echo openssl ;;
+    ssh|scp)
+      case "$(_detect_pkg_mgr)" in
+        dnf|yum) echo openssh-clients ;;
+        *)       echo openssh-client ;;
+      esac
+      ;;
+    *) echo "$1" ;;
+  esac
+}
+
+_pkg_install() {
+  local -a pkgs=("$@")
+  local mgr seen=() p
+  mgr="$(_detect_pkg_mgr)"
+  [[ -n "$mgr" ]] || die "No supported package manager — install manually: ${pkgs[*]}"
+
+  for p in "${pkgs[@]}"; do
+    [[ " ${seen[*]} " == *" $p "* ]] || seen+=("$p")
+  done
+
+  info "Installing: ${seen[*]} (${mgr})..."
+  case "$mgr" in
+    apt)
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+        || die "apt-get update failed"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${seen[@]}" \
+        || die "apt-get install failed for: ${seen[*]}"
+      ;;
+    dnf)
+      dnf install -y "${seen[@]}" || die "dnf install failed for: ${seen[*]}"
+      ;;
+    yum)
+      yum install -y "${seen[@]}" || die "yum install failed for: ${seen[*]}"
+      ;;
+    apk)
+      apk add --no-cache "${seen[@]}" || die "apk add failed for: ${seen[*]}"
+      ;;
+    zypper)
+      zypper --non-interactive install -y "${seen[@]}" \
+        || die "zypper install failed for: ${seen[*]}"
+      ;;
+  esac
+  ok "Packages installed: ${seen[*]}"
+}
+
+# Install missing command via system package manager (requires root).
+ensure_cmd() {
+  local cmd="$1"
+  command -v "$cmd" &>/dev/null && return 0
+  require_root
+  warn "'${cmd}' not found — installing dependency..."
+  _pkg_install "$(_cmd_pkg_name "$cmd")"
+  command -v "$cmd" &>/dev/null \
+    || die "'${cmd}' still missing after package install"
+  ok "${cmd} ready"
+}
+
+ensure_openvpn_deps() {
+  local -a need=() c pkg
+  for c in openssl openvpn; do
+    command -v "$c" &>/dev/null || need+=("$(_cmd_pkg_name "$c")")
+  done
+  ((${#need[@]})) || return 0
+  require_root
+  warn "OpenVPN dependencies missing — installing..."
+  _pkg_install "${need[@]}"
+  for c in openssl openvpn; do
+    command -v "$c" &>/dev/null || die "'${c}' still missing after install"
+  done
+}
+
+ensure_ssh_deps() {
+  local -a need=() c
+  for c in ssh scp; do
+    command -v "$c" &>/dev/null || need+=("$(_cmd_pkg_name "$c")")
+  done
+  ((${#need[@]})) || return 0
+  require_root
+  _pkg_install "$(_cmd_pkg_name ssh)"
+  for c in ssh scp; do
+    command -v "$c" &>/dev/null || die "'${c}' still missing — install openssh-client"
+  done
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Systemd service helpers
@@ -1204,8 +1301,7 @@ EOF
 
 openvpn_gen_pki() {
   local dir="$1"
-  require_cmd openssl
-  require_cmd openvpn
+  ensure_openvpn_deps
   mkdir -p "$dir"
   chmod 700 "$dir"
 
@@ -1294,8 +1390,7 @@ openvpn_fetch_pki_from_server() {
   local ssh_base=(ssh -p "$ssh_port" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new)
   local scp_base=(scp -P "$ssh_port" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new)
 
-  require_cmd ssh
-  require_cmd scp
+  ensure_ssh_deps
   mkdir -p "$pki_dir"
   chmod 700 "$pki_dir"
 
@@ -1328,8 +1423,7 @@ openvpn_push_client_bundle() {
   local export_dir="${pki_dir}/export"
   local remote_dir="${INSTALL_DIR}/pki/${name}"
 
-  require_cmd ssh
-  require_cmd scp
+  ensure_ssh_deps
   openvpn_export_client_bundle "$pki_dir" || die "Export bundle missing — regenerate PKI on server"
 
   blank
@@ -1464,7 +1558,7 @@ gen_openvpn() {
   perf="$(label_key "$perf_raw")"
   dev="ovpn-tun0"
 
-  require_cmd openvpn
+  ensure_openvpn_deps
   pki_dir="${INSTALL_DIR}/pki/${name}"
   mkdir -p "$pki_dir"
 
