@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.12"
+SCRIPT_VERSION="1.2.13"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -1945,15 +1945,15 @@ openvpn_write_crypto_block() {
   local tls_line
   tls_line="$(openvpn_tls_key_directive "$dir" "$role")"
   if [[ -f "${dir}/tc.key" ]]; then
+    [[ "$role" == "server" ]] && echo "dh none"
     cat << EOF
-dh none
 tls-groups X25519:prime256v1
 ${tls_line}
 tls-version-min 1.2
 EOF
   elif [[ -f "${dir}/dh.pem" ]]; then
+    [[ "$role" == "server" ]] && echo "dh dh.pem"
     cat << EOF
-dh dh.pem
 ${tls_line}
 tls-version-min 1.2
 EOF
@@ -1994,13 +1994,13 @@ openvpn_write_client_conf() {
   local dir="$1" port="$2" proto="$3" remote_ip="$4" client_ip="$5" server_ip="$6" mtu="$7" dev="$8" perf="$9"
   local tun_mtu="${10}" mssfix="${11}"
   cat > "${dir}/client.conf" << EOF
-# virlink OpenVPN — client (site-to-site, ${perf} profile, ${proto})
-client
+# virlink OpenVPN — client (site-to-site p2p, ${perf} profile, ${proto})
 dev ${dev}
 dev-type tun
 proto ${proto}
 remote ${remote_ip} ${port}
 nobind
+tls-client
 connect-timeout 30
 connect-retry-max 5
 persist-key
