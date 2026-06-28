@@ -111,7 +111,7 @@ func (t *Hysteria2Tunnel) Up() error {
 		return fmt.Errorf("addr: %w", err)
 	}
 	if err := netlink.LinkSetUp(l); err != nil {
-		return fmt.Errorf("link up %s: %w", err)
+		return fmt.Errorf("link up %s: %w", dev, err)
 	}
 	logOK(fmt.Sprintf("%s  %s  MTU=%d  queues=%d", dev, addr, mtu, t.tun.QueueCount()))
 

@@ -1,0 +1,30 @@
+# sepehr-sabz · ipip-fou · SERVER
+
+[tunnel]
+type      = "ipip-fou"
+mode      = "server"
+local_ip  = "64.118.156.193"
+remote_ip = "95.38.195.35"
+cidr      = "10.99.0.0/24"
+mtu       = 1440
+
+[transport]
+port  = 5702
+proto = "fou"
+
+[security]
+encryption = false
+
+[mangle]
+srcip = "37.152.181.38"
+dstip = "185.41.1.52"
+
+[tuning]
+enabled = true
+mode    = "balanced"
+
+[logging]
+level = "debug"
+
+[health]
+disabled = true

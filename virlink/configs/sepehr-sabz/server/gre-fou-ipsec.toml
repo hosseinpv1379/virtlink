@@ -1,0 +1,36 @@
+# sepehr-sabz · gre-fou-ipsec · SERVER
+
+[tunnel]
+type      = "gre-fou-ipsec"
+mode      = "server"
+local_ip  = "64.118.156.193"
+remote_ip = "95.38.195.35"
+cidr      = "10.99.0.0/24"
+mtu       = 1380
+
+[transport]
+port  = 5706
+proto = "fou"
+
+[security]
+encryption   = true
+spi_out      = "0x00000001"
+spi_in       = "0x00000002"
+enc_key_out  = "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+enc_key_in   = "0x2f2e2d2c2b2a29282726252423222120201f1e1d1c1b1a191817161514131211"
+auth_key_out = "0xa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+auth_key_in  = "0xb2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1"
+
+[mangle]
+srcip = "37.152.181.38"
+dstip = "185.41.1.52"
+
+[tuning]
+enabled = true
+mode    = "balanced"
+
+[logging]
+level = "debug"
+
+[health]
+disabled = true

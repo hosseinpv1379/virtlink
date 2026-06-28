@@ -85,8 +85,13 @@ func logWireSpoof(w wireSpoof) {
 	if !w.on {
 		return
 	}
+	warnWireSpoofPrereqs()
 	logOK("wire spoof enabled (IPPROTO_RAW)")
 	logDebug(fmt.Sprintf("wire spoof srcip=%v dstip=%v", w.src, w.dst))
+}
+
+func warnWireSpoofPrereqs() {
+	logWarn("wire spoof: require root + rp_filter=0 (sysctl net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0)")
 }
 
 var wireTxErrWarned atomic.Bool

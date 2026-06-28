@@ -1,0 +1,29 @@
+# sepehr-sabz · gre · SERVER
+
+[tunnel]
+type      = "gre"
+mode      = "server"
+local_ip  = "64.118.156.193"
+remote_ip = "95.38.195.35"
+cidr      = "10.99.0.0/24"
+mtu       = 1476
+
+[transport]
+heartbeat_interval = 10
+
+[security]
+encryption = false
+
+[mangle]
+srcip = "37.152.181.38"
+dstip = "185.41.1.52"
+
+[tuning]
+enabled = true
+mode    = "balanced"
+
+[logging]
+level = "debug"
+
+[health]
+disabled = true

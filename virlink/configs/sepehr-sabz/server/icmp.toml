@@ -1,0 +1,33 @@
+# sepehr-sabz · icmp · SERVER
+
+[tunnel]
+type      = "icmp"
+mode      = "server"
+local_ip  = "64.118.156.193"
+remote_ip = "95.38.195.35"
+cidr      = "10.99.0.0/24"
+mtu       = 1472
+
+[transport]
+heartbeat_interval = 10
+
+[security]
+encryption = false
+
+[mangle]
+srcip = "37.152.181.38"
+dstip = "185.41.1.52"
+
+[tuning]
+enabled    = true
+mode       = "resource"
+sock_buf_mb = 32
+tun_queues  = 1
+batch_size  = 64
+poll_ms     = 50
+
+[logging]
+level = "info"
+
+[health]
+disabled = true

@@ -1,0 +1,33 @@
+# sepehr-sabz · bip · CLIENT (userspace IP_HDRINCL spoof, proto 58)
+# فایروال: proto 58 بین IPهای واقعی
+
+[tunnel]
+type      = "bip"
+mode      = "client"
+local_ip  = "95.38.195.35"
+remote_ip = "64.118.156.193"
+cidr      = "10.99.0.0/24"
+mtu       = 1480
+
+[transport]
+heartbeat_interval = 10
+
+[security]
+encryption = false
+
+[mangle]
+srcip = "185.41.1.52"
+dstip = "37.152.181.38"
+
+[tuning]
+enabled    = true
+mode       = "balanced"
+sock_buf_mb = 32
+tun_queues  = 1
+poll_ms     = 10
+
+[logging]
+level = "debug"
+
+[health]
+disabled = true

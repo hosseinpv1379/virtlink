@@ -1,0 +1,32 @@
+# sepehr-sabz · bonded-gre-fou · CLIENT
+
+[tunnel]
+type      = "bonded-gre-fou"
+mode      = "client"
+local_ip  = "95.38.195.35"
+remote_ip = "64.118.156.193"
+cidr      = "10.99.0.0/24"
+mtu       = 1400
+
+[transport]
+port  = 5703
+port2 = 5704
+proto = "fou"
+
+[security]
+encryption = false
+
+[mangle]
+srcip = "185.41.1.52"
+dstip = "37.152.181.38"
+
+[tuning]
+enabled   = true
+mode      = "balanced"
+multipath = true
+
+[logging]
+level = "debug"
+
+[health]
+disabled = true
