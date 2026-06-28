@@ -13,10 +13,11 @@ import (
 
 const wireLoLabel = "lo:virlink_wire"
 
-// tcpWireKernelUp prepares routing so FREEBIND to [mangle] srcip can reach remote_ip.
-// ICMP/UDP build full IP headers on a raw socket; kernel TCP needs a local /32 + host route.
+// tcpWireKernelUp prepares client routing for FREEBIND spoof src.
 func tcpWireKernelUp(cfg *Config) error {
-	if cfg.Mode != "client" {
+	if cfg.Mode == "server" {
+		// Remove stale lo alias from older releases that listened on wire srcip.
+		wireLoAddrDel(cfg.Mangle.SrcIP)
 		return nil
 	}
 	_ = nlSysctl("net.ipv4.conf.all.accept_local", "1")

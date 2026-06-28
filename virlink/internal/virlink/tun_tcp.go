@@ -89,7 +89,7 @@ func (t *TcpTunnel) Up() error {
 		if err != nil {
 			return fmt.Errorf("tcp listen :%d: %w", port, err)
 		}
-		logOK(fmt.Sprintf("TCP listening :%d  streams=%d", port, streams))
+		logOK(fmt.Sprintf("TCP listening %s  streams=%d", t.ln.Addr(), streams))
 		go t.acceptLoop(tun0)
 	} else {
 		go t.connectLoop(tun0)
