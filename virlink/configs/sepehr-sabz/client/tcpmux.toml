@@ -1,0 +1,36 @@
+# sepehr-sabz · tcpmux · CLIENT (kernel socket wire spoof)
+# فایروال: TCP 8444 بین IPهای واقعی
+# rp_filter=0 روی eth0
+
+[tunnel]
+type      = "tcpmux"
+mode      = "client"
+local_ip  = "95.38.195.35"
+remote_ip = "64.118.156.193"
+cidr      = "10.99.0.0/24"
+mtu       = 1400
+
+[transport]
+port               = 8444
+proto              = "tcp"
+heartbeat_interval = 10
+
+[security]
+encryption = false
+
+[mangle]
+srcip = "185.41.1.52"
+dstip = "37.152.181.38"
+
+[tcpmux]
+hash = "fnv1a"
+
+[tuning]
+enabled = true
+mode    = "balanced"
+
+[logging]
+level = "info"
+
+[health]
+disabled = true

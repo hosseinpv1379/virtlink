@@ -22,12 +22,8 @@ srcip = "37.152.181.38"
 dstip = "185.41.1.52"
 
 [tuning]
-enabled     = true
-mode        = "resource"
-sock_buf_mb = 32
-tun_queues  = 1
-tcp_streams = 2
-poll_ms     = 10
+enabled = true
+mode    = "balanced"
 
 [logging]
 level = "info"

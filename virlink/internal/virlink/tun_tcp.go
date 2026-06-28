@@ -185,10 +185,6 @@ func (t *TcpTunnel) acceptLoop(tun *os.File) {
 }
 
 func (t *TcpTunnel) connectLoop(tun *os.File) {
-	port := t.cfg.Transport.Port
-	if port == 0 {
-		port = 8443
-	}
 	for s := 0; s < perfTcpStreams(); s++ {
 		go t.connectOne(tun, s)
 	}
@@ -198,13 +194,14 @@ func (t *TcpTunnel) connectLoop(tun *os.File) {
 }
 
 func (t *TcpTunnel) connectOne(tun *os.File, slot int) {
+	tcpConnectStagger(slot)
 	for {
 		if t.stop.stopped() {
 			return
 		}
 		conn, err := dialTCPWire(t.cfg, 10*time.Second)
 		if err != nil {
-			logWarn(fmt.Sprintf("[wire] tcp stream %d: %v — retry in 3s", slot, err))
+			logTcpStreamRetry("tcp", slot, err)
 			select {
 			case <-t.done:
 				return
@@ -213,6 +210,7 @@ func (t *TcpTunnel) connectOne(tun *os.File, slot int) {
 			}
 		}
 		tuneTCPConn(conn)
+		noteTcpWireConnected()
 		logOK(fmt.Sprintf("tcp: stream %d up  %s ↔ %s", slot, conn.LocalAddr(), conn.RemoteAddr()))
 		t.setConn(slot, conn)
 		t.rxLoop(conn, tun, slot)
@@ -275,6 +273,7 @@ func (t *TcpTunnel) Down() error {
 }
 
 func (t *TcpTunnel) doClean() {
+	resetTcpWireConnectState()
 	tcpTunnelWireDown(t.cfg)
 	restoreTunnelTuning()
 	t.stop.stop()

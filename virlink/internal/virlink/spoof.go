@@ -55,12 +55,23 @@ func validateMangle(m *MangleCfg) error {
 
 func validateWireSpoofTunnel(typ string) error {
 	switch typ {
+	case "icmp", "udp", "bip", "tcp", "tcpmux",
+		"gre", "gre-fou", "ipip-fou", "bonded-gre-fou", "l2tpv3", "gre-fou-ipsec":
+		return nil
 	case "udp-obfs":
 		return fmt.Errorf("[mangle] wire spoof is not supported for %q tunnel", typ)
 	case "openvpn", "openvpnmultu", "hysteria2", "wireguard", "amneziawg":
 		return fmt.Errorf("[mangle] wire spoof is not supported for %q tunnel", typ)
 	default:
-		return nil
+		return fmt.Errorf("[mangle] wire spoof is not supported for %q tunnel", typ)
+	}
+}
+
+// WireSpoofTunnelTypes lists tunnel types that support [mangle] wire relay.
+func WireSpoofTunnelTypes() []string {
+	return []string{
+		"icmp", "udp", "bip", "tcp", "tcpmux",
+		"gre", "gre-fou", "ipip-fou", "bonded-gre-fou", "l2tpv3", "gre-fou-ipsec",
 	}
 }
 

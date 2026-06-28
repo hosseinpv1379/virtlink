@@ -181,6 +181,46 @@ func applyPerfFromConfig(c *Config) {
 		perf.tcpStreams < perf.tunQueues {
 		perf.tcpStreams = perf.tunQueues
 	}
+
+	applyWirePerfBoost(c)
+}
+
+// applyWirePerfBoost raises throughput defaults when [mangle] wire relay is active.
+func applyWirePerfBoost(c *Config) {
+	if !wireSpoofEnabled(c) {
+		return
+	}
+	perf.sockBuf = maxInt(perf.sockBuf, 64<<20)
+	switch c.Tunnel.Type {
+	case "tcp", "tcpmux":
+		n := clampInt(userspaceCPU(), 4, maxPerfQueues)
+		perf.tcpStreams = maxInt(perf.tcpStreams, n)
+		perf.tunQueues = maxInt(perf.tunQueues, n)
+		perf.pollMs = minInt(perf.pollMs, 2)
+		perf.batchSize = maxInt(perf.batchSize, 32)
+	case "icmp":
+		perf.tunQueues = maxInt(perf.tunQueues, userspaceQueues())
+		perf.batchSize = maxInt(perf.batchSize, 64)
+		perf.pollMs = minInt(perf.pollMs, 5)
+	case "udp", "bip":
+		perf.tunQueues = maxInt(perf.tunQueues, userspaceQueues())
+		perf.batchSize = maxInt(perf.batchSize, 32)
+		perf.pollMs = minInt(perf.pollMs, 5)
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func clampInt(v, lo, hi int) int {

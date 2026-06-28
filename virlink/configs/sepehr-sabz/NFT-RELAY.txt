@@ -52,3 +52,12 @@
   startup log: [wire] nft relay loaded  counters in=… out=…
 
   tcpdump KHAREJ: syn از 185.41.1.52 باید بیاید
+
+تunnel types با wire spoof ([mangle])
+-------------------------------------
+  icmp, udp, bip, tcp, tcpmux,
+  gre, gre-fou, ipip-fou, bonded-gre-fou, l2tpv3, gre-fou-ipsec
+
+  TCP و tcpmux همان مدل nft relay بالا را استفاده می‌کنند (kernel socket +
+  input/output mangling). تفاوت فقط در framing روی stream است؛ tcpmux flow-hash
+  multiplexing دارد (configs: client/tcpmux.toml, server/tcpmux.toml, port 8444).

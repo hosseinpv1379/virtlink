@@ -1,0 +1,35 @@
+# sepehr-sabz · tcpmux · SERVER (kernel socket wire spoof)
+# rp_filter=0 روی eth0
+
+[tunnel]
+type      = "tcpmux"
+mode      = "server"
+local_ip  = "64.118.156.193"
+remote_ip = "95.38.195.35"
+cidr      = "10.99.0.0/24"
+mtu       = 1400
+
+[transport]
+port               = 8444
+proto              = "tcp"
+heartbeat_interval = 10
+
+[security]
+encryption = false
+
+[mangle]
+srcip = "37.152.181.38"
+dstip = "185.41.1.52"
+
+[tcpmux]
+hash = "fnv1a"
+
+[tuning]
+enabled = true
+mode    = "balanced"
+
+[logging]
+level = "info"
+
+[health]
+disabled = true
