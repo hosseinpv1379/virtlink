@@ -145,6 +145,19 @@ func printHeartbeat(tun Tunnel, fwdRules []ForwardRule, since time.Time, hm *Hea
 		hsState = "hy2"
 		lastProbe = "n/a (check hysteria2 log)"
 	}
+	if wg, ok := tun.(*WireGuardTunnel); ok {
+		dev := wg.DevName()
+		if ts, wgOK := wireguardLatestHandshake(dev); wgOK {
+			wgAge := time.Since(ts).Round(time.Second).String()
+			if hsState == "" || hsState == "waiting" {
+				hsState = "wg-ok"
+			}
+			lastProbe = "wg " + wgAge + " ago"
+		} else if hsState == "" || hsState == "waiting" {
+			hsState = "wg-wait"
+			lastProbe = "no wg handshake"
+		}
+	}
 
 	msg := fmtHeartbeat(dev, linkState, hsState, lastProbe,
 		rxB, txB, rxPkt, txPkt, uptime)

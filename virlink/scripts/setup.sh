@@ -540,6 +540,82 @@ ensure_openvpn_deps() {
   ok "OpenVPN core installed"
 }
 
+openvpn_version_at_least() {
+  local major="${1:-2}" minor="${2:-6}"
+  local v maj min
+  v="$(openvpn --version 2>/dev/null | head -1 || true)"
+  [[ -n "$v" ]] || return 1
+  maj="$(sed -n 's/OpenVPN \([0-9]*\)\.\([0-9]*\).*/\1/p' <<< "$v")"
+  min="$(sed -n 's/OpenVPN \([0-9]*\)\.\([0-9]*\).*/\2/p' <<< "$v")"
+  [[ -n "$maj" && -n "$min" ]] || return 1
+  (( maj > major || (maj == major && min >= minor) ))
+}
+
+openvpn_dco_module_present() {
+  local m
+  for m in ovpn_dco_v2 ovpn_dco ovpn; do
+    [[ -d "/sys/module/${m}" ]] && return 0
+    modprobe "$m" 2>/dev/null || true
+    [[ -d "/sys/module/${m}" ]] && return 0
+  done
+  return 1
+}
+
+ensure_openvpn_dco() {
+  openvpn_dco_module_present && { ok "OpenVPN DCO kernel module ready"; return 0; }
+  require_root
+  warn "OpenVPN DCO module not loaded — trying package install..."
+  for pkg in openvpn-dco-dkms kmod-ovpn-dco-v2; do
+    _pkg_install "$pkg" 2>/dev/null && break
+  done
+  openvpn_dco_module_present || {
+    warn "DCO unavailable — OpenVPN stays single-thread user-space (use parallel workers in setup)"
+    return 1
+  }
+  ok "OpenVPN DCO module loaded"
+}
+
+openvpn_worker_overlay_ips() {
+  local cidr="$1" mode="$2" worker="${3:-0}"
+  local ip="${cidr%%/*}" a b c d
+  IFS=. read -r a b c d <<< "$ip"
+  d=$((d + worker * 4))
+  if [[ "$mode" == "client" ]]; then
+    OPENVPN_CLIENT_IP="${a}.${b}.${c}.$((d + 1))"
+    OPENVPN_SERVER_IP="${a}.${b}.${c}.$((d + 2))"
+  else
+    OPENVPN_SERVER_IP="${a}.${b}.${c}.$((d + 2))"
+    OPENVPN_CLIENT_IP="${a}.${b}.${c}.$((d + 1))"
+  fi
+}
+
+openvpn_worker_dev() {
+  local base="$1" worker="${2:-0}"
+  if [[ "$worker" == "0" ]]; then
+    echo "$base"
+    return
+  fi
+  if [[ "$base" == *0 ]]; then
+    echo "${base%0}${worker}"
+  else
+    echo "${base}${worker}"
+  fi
+}
+
+openvpn_worker_conf_path() {
+  local base="$1" worker="${2:-0}"
+  if [[ "$worker" == "0" ]]; then
+    echo "$base"
+    return
+  fi
+  local dir file ext stem
+  dir="$(dirname "$base")"
+  file="$(basename "$base")"
+  ext=".${file##*.}"
+  stem="${file%${ext}}"
+  echo "${dir}/${stem}-${worker}${ext}"
+}
+
 _wireguard_pkg_name() {
   case "$(_detect_pkg_mgr)" in
     dnf|yum|zypper) echo wireguard-tools ;;
@@ -562,6 +638,18 @@ ensure_wireguard_deps() {
     command -v "$c" &>/dev/null || die "'${c}' still missing after install"
   done
   ok "WireGuard tools installed"
+}
+
+ensure_wireguard_module() {
+  modprobe wireguard 2>/dev/null || true
+  [[ -d /sys/module/wireguard ]] && return 0
+  require_root
+  warn "wireguard kernel module not loaded — trying kmod package..."
+  for pkg in wireguard-dkms kmod-wireguard; do
+    _pkg_install "$pkg" 2>/dev/null && break
+  done
+  modprobe wireguard 2>/dev/null || true
+  [[ -d /sys/module/wireguard ]] || warn "wireguard module missing — run: modprobe wireguard"
 }
 
 ensure_hysteria2_deps() {
@@ -645,6 +733,16 @@ _cfg_tunnel_type() {
   grep -E '^\s*type\s*=' "$1" 2>/dev/null | head -1 | awk -F'"' '{print $2}'
 }
 
+_cfg_tunnel_mode() {
+  grep -E '^\s*mode\s*=' "$1" 2>/dev/null | head -1 | awk -F'"' '{print $2}'
+}
+
+_cfg_transport_port() {
+  awk -F= '/^\[transport\]/{t=1; next} /^\[/{t=0} t && /^[[:space:]]*port[[:space:]]*=/{
+    gsub(/[[:space:]]/,"",$2); print $2; exit
+  }' "$1" 2>/dev/null
+}
+
 tunnel_start() {
   local name="$1"
   local cfg="${CONFIGS_DIR}/${name}.toml"
@@ -657,6 +755,10 @@ tunnel_start() {
   fi
   if [[ "$(_cfg_tunnel_type "$cfg")" == "wireguard" ]]; then
     ensure_wireguard_deps
+    ensure_wireguard_module
+    if [[ "$(_cfg_tunnel_mode "$cfg")" == "server" ]]; then
+      wireguard_allow_firewall_port "$(_cfg_transport_port "$cfg")"
+    fi
   fi
   write_service_file "$name"
   local svc; svc="$(svc_name "$name")"
@@ -1808,6 +1910,27 @@ openvpn_allow_bundle_firewall_port() {
   fi
 }
 
+wireguard_allow_firewall_port() {
+  local port="$1"
+  [[ -n "$port" ]] || return 0
+
+  if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    info "Opening UFW UDP/${port} (WireGuard)..."
+    ufw allow "${port}/udp" comment 'virlink wireguard' >/dev/null 2>&1 || true
+  fi
+
+  if command -v firewall-cmd &>/dev/null && systemctl is-active firewalld &>/dev/null; then
+    firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+
+  if command -v iptables &>/dev/null; then
+    if ! iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; then
+      iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+    fi
+  fi
+}
+
 openvpn_save_bundle_info() {
   local pki_dir="$1" server_ip="$2" name="$3"
   local port="${OPENVPN_BUNDLE_PORT:-8765}"
@@ -2068,38 +2191,46 @@ openvpn_openvpn_proto() {
 
 openvpn_write_server_conf() {
   local dir="$1" port="$2" proto="$3" client_ip="$4" server_ip="$5" mtu="$6" dev="$7" perf="$8"
-  local tun_mtu="$9" mssfix="${10}" ovpn_proto
+  local tun_mtu="$9" mssfix="${10}" out="${11:-${dir}/server.conf}" use_dco="${12:-0}"
+  local ovpn_proto
   ovpn_proto="$(openvpn_openvpn_proto "$proto" server)"
-  cat > "${dir}/server.conf" << EOF
+  cat > "$out" << EOF
 # virlink OpenVPN — server (site-to-site, ${perf} profile, ${proto})
 port ${port}
 proto ${ovpn_proto}
 dev ${dev}
 dev-type tun
-user nobody
-group nogroup
 persist-key
 persist-tun
 ca ca.crt
 cert server.crt
 key server.key
 EOF
-  openvpn_write_crypto_block "$dir" server >> "${dir}/server.conf"
-  cat >> "${dir}/server.conf" << EOF
+  if [[ "$use_dco" == "1" ]]; then
+    echo "enable-dco" >> "$out"
+  else
+    cat >> "$out" << EOF
+user nobody
+group nogroup
+EOF
+  fi
+  openvpn_write_crypto_block "$dir" server >> "$out"
+  cat >> "$out" << EOF
 tls-server
 ifconfig ${server_ip} ${client_ip}
 EOF
-  openvpn_perf_block "$perf" "$proto" "$tun_mtu" "$mssfix" >> "${dir}/server.conf"
+  openvpn_perf_block "$perf" "$proto" "$tun_mtu" "$mssfix" >> "$out"
   if [[ "$proto" == "udp" ]]; then
-    echo "explicit-exit-notify 1" >> "${dir}/server.conf"
+    echo "explicit-exit-notify 1" >> "$out"
   fi
 }
 
 openvpn_write_client_conf() {
   local dir="$1" port="$2" proto="$3" remote_ip="$4" client_ip="$5" server_ip="$6" mtu="$7" dev="$8" perf="$9"
-  local tun_mtu="${10}" mssfix="${11}" ovpn_proto
+  local tun_mtu="${10}" mssfix="${11}" out="${12:-${dir}/client.conf}" use_dco="${13:-0}"
+  local ovpn_proto
   ovpn_proto="$(openvpn_openvpn_proto "$proto" client)"
-  cat > "${dir}/client.conf" << EOF
+  cat > "$out" << EOF
 # virlink OpenVPN — client (site-to-site p2p, ${perf} profile, ${proto})
 dev ${dev}
 dev-type tun
@@ -2115,12 +2246,15 @@ ca ca.crt
 cert client.crt
 key client.key
 EOF
-  openvpn_write_crypto_block "$dir" client >> "${dir}/client.conf"
-  cat >> "${dir}/client.conf" << EOF
+  if [[ "$use_dco" == "1" ]]; then
+    echo "enable-dco" >> "$out"
+  fi
+  openvpn_write_crypto_block "$dir" client >> "$out"
+  cat >> "$out" << EOF
 remote-cert-tls server
 ifconfig ${client_ip} ${server_ip}
 EOF
-  openvpn_perf_block "$perf" "$proto" "$tun_mtu" "$mssfix" >> "${dir}/client.conf"
+  openvpn_perf_block "$perf" "$proto" "$tun_mtu" "$mssfix" >> "$out"
 }
 
 openvpn_require_client_pki() {
@@ -2137,6 +2271,7 @@ openvpn_require_client_pki() {
 gen_openvpn() {
   local name mode local_ip remote_ip cidr port proto mtu dev pki_dir ovpn_conf cfg perf_raw perf
   local client_ip server_ip tun_mtu mssfix default_mtu hb
+  local use_dco=0 workers=1 w wport wdev wclient wserver wconf dco_toml dco_raw workers_raw ncpu
   collect_base_inputs name mode local_ip remote_ip cidr
   blank
   info "Transport: UDP = max bandwidth · TCP = firewall-friendly (slower)"
@@ -2167,6 +2302,46 @@ gen_openvpn() {
     openvpn_acquire_client_pki "$name" "$remote_ip" "$pki_dir"
   fi
 
+  blank
+  info "Multi-core: DCO (kernel offload, OpenVPN 2.6+) or parallel links when DCO unavailable."
+  if openvpn_version_at_least 2 6 && ensure_openvpn_dco; then
+    pick dco_raw "Data Channel Offload (DCO)" \
+      "yes — multi-core in kernel (recommended)" \
+      "no — user-space crypto only"
+    if [[ "$(label_key "$dco_raw")" == "yes" ]]; then
+      use_dco=1
+      workers=1
+      ok "DCO enabled — one tunnel, crypto spread across CPU cores"
+    fi
+  else
+    warn "DCO not available (need OpenVPN 2.6+ and ovpn-dco kernel module)"
+  fi
+
+  if [[ "$use_dco" -eq 0 ]]; then
+    ncpu="$(nproc 2>/dev/null || echo 2)"
+    (( ncpu > 4 )) && ncpu=4
+    pick workers_raw "Parallel OpenVPN links (multi-path)" \
+      "1 — single link" \
+      "2 — dual path" \
+      "4 — quad path" \
+      "auto — match CPU count (${ncpu})"
+    case "$(label_key "$workers_raw")" in
+      2) workers=2 ;;
+      4) workers=4 ;;
+      auto) workers="$ncpu" ;;
+      *) workers=1 ;;
+    esac
+    (( workers < 1 )) && workers=1
+    (( workers > 4 )) && workers=4
+    if [[ "$workers" -gt 1 ]]; then
+      info "Parallel links: ${workers}  ports ${port}-$((port + workers - 1))  (ECMP load-sharing)"
+      warn "Firewall: open ${proto} ports ${port}-$((port + workers - 1)) on server"
+    fi
+  fi
+
+  dco_toml="false"
+  [[ "$use_dco" -eq 1 ]] && dco_toml="true"
+
   openvpn_overlay_ips "$cidr" "$mode"
   client_ip="$OPENVPN_CLIENT_IP"
   server_ip="$OPENVPN_SERVER_IP"
@@ -2177,18 +2352,36 @@ gen_openvpn() {
     *)        hb=20 ;;
   esac
 
-  if [[ "$mode" == "server" ]]; then
-    ovpn_conf="${pki_dir}/server.conf"
-    openvpn_write_server_conf "$pki_dir" "$port" "$proto" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"
-    openvpn_write_client_conf "$pki_dir" "$port" "$proto" "$local_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"
-    ok "Wrote ${ovpn_conf} (${perf}, ${proto})"
-  else
-    ovpn_conf="${pki_dir}/client.conf"
-    openvpn_write_client_conf "$pki_dir" "$port" "$proto" "$remote_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"
-    ok "Wrote ${ovpn_conf} (${perf}, ${proto})"
+  for ((w=0; w<workers; w++)); do
+    openvpn_worker_overlay_ips "$cidr" "$mode" "$w"
+    wclient="$OPENVPN_CLIENT_IP"
+    wserver="$OPENVPN_SERVER_IP"
+    wport=$((port + w))
+    wdev="$(openvpn_worker_dev "$dev" "$w")"
+    if [[ "$mode" == "server" ]]; then
+      wconf="$(openvpn_worker_conf_path "${pki_dir}/server.conf" "$w")"
+      openvpn_write_server_conf "$pki_dir" "$wport" "$proto" "$wclient" "$wserver" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$wconf" "$use_dco"
+      wconf="$(openvpn_worker_conf_path "${pki_dir}/client.conf" "$w")"
+      openvpn_write_client_conf "$pki_dir" "$wport" "$proto" "$local_ip" "$wclient" "$wserver" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$wconf" "$use_dco"
+      ok "Wrote worker ${w}: ${wconf}  ${wdev}  ${wserver}↔${wclient}  :${wport}"
+    else
+      wconf="$(openvpn_worker_conf_path "${pki_dir}/client.conf" "$w")"
+      openvpn_write_client_conf "$pki_dir" "$wport" "$proto" "$remote_ip" "$wclient" "$wserver" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$wconf" "$use_dco"
+      ok "Wrote ${wconf}  ${wdev}  :${wport}"
+    fi
+  done
+
+  ovpn_conf="${pki_dir}/server.conf"
+  [[ "$mode" == "client" ]] && ovpn_conf="${pki_dir}/client.conf"
+
+  if [[ "$mode" == "client" ]]; then
     blank
     warn "Start the OpenVPN SERVER tunnel first (peer ${remote_ip})."
-    warn "Firewall: allow ${proto}/${port} from this host → server (Hetzner cloud firewall too)."
+    if [[ "$workers" -gt 1 ]]; then
+      warn "Firewall: allow ${proto} ports ${port}-$((port + workers - 1)) to server"
+    else
+      warn "Firewall: allow ${proto}/${port} from this host → server (Hetzner cloud firewall too)."
+    fi
     info "If tunnel fails: tail -30 /var/log/virlink/${name}-openvpn.log"
   fi
 
@@ -2210,8 +2403,10 @@ proto              = "${proto}"
 heartbeat_interval = ${hb}
 
 [openvpn]
-config = "${ovpn_conf}"
-dev    = "${dev}"
+config  = "${ovpn_conf}"
+dev     = "${dev}"
+workers = ${workers}
+dco     = ${dco_toml}
 
 [security]
 encryption = true
@@ -2965,6 +3160,7 @@ gen_wireguard() {
   dev="wg-virlink0"
 
   ensure_wireguard_deps
+  ensure_wireguard_module
   pki_dir="${INSTALL_DIR}/pki/${name}"
   mkdir -p "$pki_dir"
 
@@ -2985,12 +3181,13 @@ gen_wireguard() {
   if [[ "$mode" == "server" ]]; then
     wireguard_write_server_conf "$pki_dir" "$port" "$server_addr" "" "$client_ip" "$cidr"
     wireguard_write_client_conf "$pki_dir" "$port" "$local_ip" "$client_addr" "$server_ip" "$cidr"
+    wireguard_allow_firewall_port "$port"
     wg_conf="${pki_dir}/wg-server.conf"
     ok "Wrote ${wg_conf}"
   else
+    wireguard_write_client_conf "$pki_dir" "$port" "$remote_ip" "$client_addr" "$server_ip" "$cidr"
     wg_conf="${pki_dir}/wg-client.conf"
-    [[ -f "$wg_conf" ]] || die "Missing ${wg_conf}"
-    ok "Using ${wg_conf}"
+    ok "Wrote ${wg_conf}  Endpoint=${remote_ip}:${port}"
     blank
     warn "Start the WireGuard SERVER on ${remote_ip} first."
     warn "Firewall: allow UDP/${port} to server (cloud firewall too)."
