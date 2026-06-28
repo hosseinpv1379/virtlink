@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.5"
+SCRIPT_VERSION="1.2.6"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -1520,7 +1520,9 @@ openvpn_start_bundle_server() {
   local name="$1" pki_dir="$2" port="${3:-$OPENVPN_BUNDLE_PORT}"
   local export_dir="${pki_dir}/export"
   local token serve_root bundle meta="/var/run/virlink/bundle-${name}.meta"
-  local unit="virlink-bundle-${name}" unit_file="/etc/systemd/system/${unit}.service"
+  local unit unit_file
+  unit="virlink-bundle-${name}"
+  unit_file="/etc/systemd/system/${unit}.service"
   local py_bin log="/var/log/virlink/bundle-${name}.log"
   local try_port started=0
 
