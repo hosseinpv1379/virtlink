@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.4"
+SCRIPT_VERSION="1.2.5"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -1263,6 +1263,7 @@ openvpn_perf_block() {
   cat << EOF
 allow-compression no
 topology p2p
+float
 fast-io
 sndbuf 0
 rcvbuf 0
@@ -1335,6 +1336,11 @@ openvpn_gen_pki() {
 
   if [[ -f "$dir/ca.crt" ]]; then
     ok "PKI already exists in ${dir}"
+    # Drop legacy tls-auth key when tls-crypt is present (prevents TLS mismatch).
+    if [[ -f "$dir/tc.key" && -f "$dir/ta.key" ]]; then
+      rm -f "$dir/ta.key"
+      warn "Removed legacy ta.key (using tls-crypt tc.key only)"
+    fi
     openvpn_export_client_bundle "$dir" 2>/dev/null || true
     return 0
   fi
@@ -1385,6 +1391,15 @@ openvpn_export_client_bundle() {
   chmod 600 "${export_dir}/client.key" "${export_dir}/${tls_key}"
   chmod 644 "${export_dir}/ca.crt" "${export_dir}/client.crt"
   ok "Client export: ${export_dir} (no server or CA private keys)"
+}
+
+openvpn_show_pki_fingerprint() {
+  local pki_dir="$1"
+  local tls="tc.key"
+  [[ -f "${pki_dir}/tc.key" ]] || tls="ta.key"
+  blank
+  info "PKI fingerprint — must match on client after credential copy:"
+  md5sum "${pki_dir}/ca.crt" "${pki_dir}/${tls}" 2>/dev/null | sed 's/^/    /'
 }
 
 # Remove server-only material if it ever lands on a client (privacy).
@@ -1701,6 +1716,7 @@ openvpn_acquire_client_pki() {
 
   if [[ -f "${pki_dir}/ca.crt" ]]; then
     openvpn_require_client_pki "$pki_dir"
+    openvpn_show_pki_fingerprint "$pki_dir"
     return 0
   fi
 
@@ -1737,6 +1753,7 @@ openvpn_acquire_client_pki() {
       ;;
   esac
   openvpn_require_client_pki "$pki_dir"
+  openvpn_show_pki_fingerprint "$pki_dir"
 }
 
 openvpn_server_send_credentials() {
@@ -1958,6 +1975,7 @@ gen_openvpn() {
     blank
     info "Privacy: CA/server private keys remain on this host only."
     openvpn_server_send_credentials "$name" "$remote_ip" "$pki_dir" "$local_ip"
+    openvpn_show_pki_fingerprint "$pki_dir"
     blank
     warn "Start this server tunnel before the client: virlink-setup → Start tunnel → ${name}"
     warn "Firewall: allow ${proto}/${port} from client ${remote_ip}"
