@@ -95,6 +95,16 @@ func tuneTCPConn(conn net.Conn) {
 	}
 }
 
+// udpConnFD returns the underlying socket fd for sendmmsg batching.
+func udpConnFD(conn *net.UDPConn) (int, error) {
+	f, err := conn.File()
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return int(f.Fd()), nil
+}
+
 // openRawICMP creates one raw ICMP socket (no SO_REUSEPORT — duplicates packets).
 func openRawICMP() (int, error) {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)

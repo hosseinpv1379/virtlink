@@ -88,6 +88,7 @@ func (t *TcpMuxTunnel) Up() error {
 	header("tcpmux / " + c.Mode)
 	logInfo(fmt.Sprintf("flow hash multiplex  seed=%s (0x%08x)", hashLabel, t.hashSeed))
 	applyPerfFromConfig(c)
+	step("perf: " + perfSummary())
 	step("cleanup...")
 	t.doClean()
 	t.stop.reset()

@@ -61,7 +61,7 @@ type TuningCfg struct {
 	BatchSize   int `toml:"batch_size"`     // ICMP sendmmsg batch count (default 32, max 128)
 	TxQLen      int `toml:"tx_queue_len"`   // TUN interface txqueuelen (default from mode)
 	PollMs      int `toml:"poll_ms"`        // I/O poll timeout ms (default 10)
-	TcpStreams  int `toml:"tcp_streams"`    // TCP tunnel parallel streams (default = tun_queues)
+	TcpStreams  int `toml:"tcp_streams"`    // TCP/tcpmux parallel streams (default 4–8 by CPU; not tied to tun_queues)
 	Workers     int `toml:"workers"`        // reserved
 	ChannelSize int `toml:"channel_size"`   // reserved (legacy)
 	BBR         bool `toml:"bbr"`           // legacy; mode takes precedence

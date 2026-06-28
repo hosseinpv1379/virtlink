@@ -1,6 +1,6 @@
 // tun_bip.go — BIP tunnel (IPv4 protocol 58).
 //
-// Performance (v2.7): multi-queue TUN, peer filter, non-blocking raw socket.
+// Performance: multi-queue TUN, sendmmsg TX batching, tuned raw socket buffers.
 package virlink
 
 import (
@@ -52,6 +52,7 @@ func (t *BipTunnel) Up() error {
 
 	header("bip / " + c.Mode)
 	applyPerfFromConfig(c)
+	step("perf: " + perfSummary())
 	t.doClean()
 	t.stop.reset()
 
@@ -83,6 +84,7 @@ func (t *BipTunnel) Up() error {
 	if err != nil {
 		return fmt.Errorf("SOCK_RAW proto=%d: %w", bipProto, err)
 	}
+	tuneRawSock(t.rawFd)
 	_ = unix.SetNonblock(t.rawFd, true)
 	logOK(fmt.Sprintf("raw proto=%d ready", bipProto))
 	logWireSpoof(t.wire)
@@ -157,8 +159,31 @@ func (t *BipTunnel) txPollLoop(rawFd int) {
 	poller := newTunPoller(t.tun, &t.stop)
 	defer poller.close()
 
+	var batch icmpTxBatch
+	bsz := perfBatchSize()
+
+	flush := func() {
+		if batch.n == 0 {
+			return
+		}
+		statAdd(statBIPTxSend, uint64(batch.n))
+		if nerr := mmsgSendBatch(rawFd, &batch); nerr > 0 {
+			noteWireTxErr(nerr)
+		}
+		for i := 0; i < batch.n; i++ {
+			putBuf(batch.frames[i])
+			batch.frames[i] = nil
+		}
+		batch.reset()
+	}
+
 	poller.Run(
-		func() { statInc(statBIPTxPoll) },
+		func() {
+			statInc(statBIPTxPoll)
+			if batch.n > 0 {
+				flush()
+			}
+		},
 		func(pkt []byte, n int) bool {
 			statInc(statBIPTxRead)
 			var routeDst [4]byte
@@ -170,23 +195,22 @@ func (t *BipTunnel) txPollLoop(rawFd int) {
 				statInc(statBIPTxNoDst)
 				return true
 			}
+			frame := getBuf()
 			var out []byte
 			if t.wire.on {
-				frame := getBuf()
 				out = buildWireProto(frame, t.wire.src, routeDst, bipProto, pkt[:n])
-				defer putBuf(frame)
 			} else {
-				out = pkt[:n]
+				out = frame[:n]
+				copy(out, pkt[:n])
 			}
-			sa := &unix.SockaddrInet4{Addr: routeDst}
-			if err := unix.Sendto(rawFd, out, 0, sa); err != nil && err != unix.EAGAIN {
-				noteWireTxErr(1)
-			} else if err == nil {
-				statInc(statBIPTxSend)
+			batch.add(frame, len(out), routeDst, 0)
+			if batch.n >= bsz {
+				flush()
 			}
 			return !t.stop.stopped()
 		},
 	)
+	flush()
 }
 
 func (t *BipTunnel) Down() error {

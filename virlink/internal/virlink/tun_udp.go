@@ -1,7 +1,6 @@
 // tun_udp.go — plain UDP tunnel.
 //
-// Performance (v2.7): IFF_MULTI_QUEUE TUN (parallel tx readers), single UDP socket,
-// connected client socket, 16 MB buffers.
+// Performance: multi-queue TUN, sendmmsg TX batching, tuned socket buffers.
 package virlink
 
 import (
@@ -55,6 +54,7 @@ func (t *UdpTunnel) Up() error {
 
 	header("udp / " + c.Mode)
 	applyPerfFromConfig(c)
+	step("perf: " + perfSummary())
 	t.doClean()
 	t.stop.reset()
 
@@ -176,8 +176,48 @@ func (t *UdpTunnel) txPollLoopRaw(rawFd int, port int) {
 	poller := newTunPoller(t.tun, &t.stop)
 	defer poller.close()
 
+	var batch icmpTxBatch
+	bsz := perfBatchSize()
+	var curDst [4]byte
+	var haveDst bool
+
+	flush := func() {
+		if batch.n == 0 {
+			return
+		}
+		statAdd(statUDPTxSend, uint64(batch.n))
+		if nerr := mmsgSendBatch(rawFd, &batch); nerr > 0 {
+			noteWireTxErr(nerr)
+		}
+		for i := 0; i < batch.n; i++ {
+			putBuf(batch.frames[i])
+			batch.frames[i] = nil
+		}
+		batch.reset()
+		haveDst = false
+	}
+
+	addPkt := func(routeDst [4]byte, payload []byte) {
+		if haveDst && routeDst != curDst {
+			flush()
+		}
+		curDst = routeDst
+		haveDst = true
+		frame := getBuf()
+		out := buildWireUDP(frame, t.wire.src, routeDst, uint16(port), uint16(port), payload)
+		batch.add(frame, len(out), routeDst, 0)
+		if batch.n >= bsz {
+			flush()
+		}
+	}
+
 	poller.Run(
-		func() { statInc(statUDPTxPoll) },
+		func() {
+			statInc(statUDPTxPoll)
+			if batch.n > 0 {
+				flush()
+			}
+		},
 		func(pkt []byte, n int) bool {
 			statInc(statUDPTxRead)
 			var routeDst [4]byte
@@ -189,18 +229,11 @@ func (t *UdpTunnel) txPollLoopRaw(rawFd int, port int) {
 				statInc(statUDPTxNoDst)
 				return true
 			}
-			frame := getBuf()
-			out := buildWireUDP(frame, t.wire.src, routeDst, uint16(port), uint16(port), pkt[:n])
-			sa := &unix.SockaddrInet4{Addr: routeDst}
-			if err := unix.Sendto(rawFd, out, 0, sa); err != nil && err != unix.EAGAIN {
-				noteWireTxErr(1)
-			} else if err == nil {
-				statInc(statUDPTxSend)
-			}
-			putBuf(frame)
+			addPkt(routeDst, pkt[:n])
 			return !t.stop.stopped()
 		},
 	)
+	flush()
 }
 
 func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
@@ -242,6 +275,82 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 }
 
 func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
+	rawFd, err := udpConnFD(conn)
+	if err != nil {
+		logWarn("udp tx batch: " + err.Error())
+		t.txPollLoopUnbatched(conn)
+		return
+	}
+
+	poller := newTunPoller(t.tun, &t.stop)
+	defer poller.close()
+
+	var batch icmpTxBatch
+	bsz := perfBatchSize()
+	var curDst [4]byte
+	var curPort uint16
+	var haveDst bool
+
+	flush := func() {
+		if batch.n == 0 {
+			return
+		}
+		statAdd(statUDPTxSend, uint64(batch.n))
+		if nerr := mmsgSendBatch(rawFd, &batch); nerr > 0 {
+			noteWireTxErr(nerr)
+		}
+		for i := 0; i < batch.n; i++ {
+			putBuf(batch.frames[i])
+			batch.frames[i] = nil
+		}
+		batch.reset()
+		haveDst = false
+	}
+
+	addPkt := func(dst [4]byte, port uint16, payload []byte) {
+		if haveDst && (dst != curDst || port != curPort) {
+			flush()
+		}
+		curDst = dst
+		curPort = port
+		haveDst = true
+		frame := getBuf()
+		n := copy(frame, payload)
+		batch.add(frame, n, dst, port)
+		if batch.n >= bsz {
+			flush()
+		}
+	}
+
+	poller.Run(
+		func() {
+			statInc(statUDPTxPoll)
+			if batch.n > 0 {
+				flush()
+			}
+		},
+		func(pkt []byte, n int) bool {
+			statInc(statUDPTxRead)
+			var dst [4]byte
+			var port uint16
+			if t.cfg.Mode == "client" {
+				dst = t.peerIP
+				port = uint16(t.cfg.Transport.Port)
+			} else if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
+				copy(dst[:], p.IP.To4())
+				port = uint16(p.Port)
+			} else {
+				statInc(statUDPTxNoDst)
+				return true
+			}
+			addPkt(dst, port, pkt[:n])
+			return !t.stop.stopped()
+		},
+	)
+	flush()
+}
+
+func (t *UdpTunnel) txPollLoopUnbatched(conn *net.UDPConn) {
 	poller := newTunPoller(t.tun, &t.stop)
 	defer poller.close()
 

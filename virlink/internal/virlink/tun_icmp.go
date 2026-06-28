@@ -182,7 +182,7 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 			} else {
 				built = buildICMPFrame(frame, icmpTunID, seq, payload)
 			}
-			batch.add(frame, len(built), dst)
+			batch.add(frame, len(built), dst, 0)
 			if batch.n >= bsz {
 				flush()
 			}

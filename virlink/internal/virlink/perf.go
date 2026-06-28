@@ -58,53 +58,55 @@ func isUserspaceTunnel(typ string) bool {
 	return false
 }
 
-// initUserspacePerfDefaults picks per-protocol defaults: low goroutine count,
-// enough buffers/batching for throughput without the 16-queue overhead.
+func isTcpUserspaceTunnel(typ string) bool {
+	return typ == "tcp" || typ == "tcpmux"
+}
+
+// userspaceCPU caps parallelism for userspace tunnels (TUN pollers + TCP streams).
+func userspaceCPU() int {
+	return clampInt(runtime.NumCPU(), 1, 8)
+}
+
+// userspaceQueues — multi-queue TUN lets the kernel spread stack→TUN traffic across fds.
+func userspaceQueues() int {
+	return clampInt(userspaceCPU(), 2, maxPerfQueues)
+}
+
+// userspaceTcpStreams — parallel TCP conns for tcp/tcpmux (independent of tun_queues).
+func userspaceTcpStreams() int {
+	return clampInt(userspaceCPU(), 4, maxPerfQueues)
+}
+
+// initUserspacePerfDefaults picks per-protocol defaults tuned for throughput on Linux.
 func initUserspacePerfDefaults(c *Config) {
-	ncpu := runtime.NumCPU()
-	if ncpu > 4 {
-		ncpu = 4
-	}
-	if ncpu < 1 {
-		ncpu = 1
-	}
+	queues := userspaceQueues()
+	streams := userspaceTcpStreams()
 
 	perf = perfRuntime{
-		sockBuf:    defSockBufMB << 20,
-		tunQueues:  1,
+		sockBuf:    64 << 20,
+		tunQueues:  queues,
 		batchSize:  defBatchSize,
 		txQLen:     defTxQLen,
-		pollMs:     defPollMs,
-		tcpStreams: 2,
+		pollMs:     5,
+		tcpStreams: streams,
 	}
 
 	switch c.Tunnel.Type {
 	case "icmp":
-		// 2 queues + sendmmsg batch = best throughput/resource ratio for ICMP
-		perf.sockBuf = 64 << 20
-		perf.tunQueues = clampInt(ncpu, 2, 4)
 		perf.batchSize = 64
-		perf.pollMs = 5
-	case "udp":
-		// single queue + single poller — UDP socket is already parallel enough
-		perf.sockBuf = 32 << 20
-		perf.tunQueues = 1
-		perf.pollMs = 10
-	case "bip":
-		perf.sockBuf = 32 << 20
-		perf.tunQueues = 1
-		perf.pollMs = 10
+	case "udp", "bip":
+		perf.batchSize = 32
 	case "tcp", "tcpmux":
-		perf.sockBuf = 32 << 20
-		perf.tunQueues = 1
-		perf.tcpStreams = clampInt(ncpu, 2, 4)
-		perf.pollMs = 10
+		// tun_queues feeds the TUN poller; tcp_streams feeds parallel carrier TCP sockets.
+		perf.pollMs = 5
 	case "udp-obfs":
-		perf.sockBuf = 16 << 20
-		perf.tunQueues = 1
+		perf.sockBuf = 32 << 20
+		perf.tunQueues = clampInt(userspaceCPU(), 2, 4)
 		perf.pollMs = 10
 	case "openvpn":
 		perf.tunQueues = 1
+		perf.sockBuf = defSockBufMB << 20
+		perf.tcpStreams = 1
 		switch tuningMode(c) {
 		case tuningResource:
 			perf.pollMs = 100
@@ -113,15 +115,23 @@ func initUserspacePerfDefaults(c *Config) {
 		default:
 			perf.pollMs = 50
 		}
-	case "hysteria2":
+	case "hysteria2", "wireguard", "amneziawg":
 		perf.tunQueues = 1
+		perf.sockBuf = defSockBufMB << 20
+		perf.tcpStreams = 1
 		perf.pollMs = 50
-	case "wireguard":
+	}
+
+	if tuningMode(c) == tuningResource {
+		perf.sockBuf = 16 << 20
 		perf.tunQueues = 1
-		perf.pollMs = 50
-	case "amneziawg":
-		perf.tunQueues = 1
-		perf.pollMs = 50
+		perf.batchSize = 16
+		perf.pollMs = 20
+		if isTcpUserspaceTunnel(c.Tunnel.Type) {
+			perf.tcpStreams = 2
+		} else {
+			perf.tcpStreams = 1
+		}
 	}
 }
 
@@ -148,7 +158,8 @@ func applyPerfFromConfig(c *Config) {
 	}
 	if t.TcpStreams > 0 {
 		perf.tcpStreams = clampInt(t.TcpStreams, 1, maxPerfQueues)
-	} else {
+	} else if !isTcpUserspaceTunnel(c.Tunnel.Type) {
+		// Non-TCP tunnels ignore tcp_streams; do not clobber protocol defaults.
 		perf.tcpStreams = perf.tunQueues
 	}
 
@@ -163,6 +174,12 @@ func applyPerfFromConfig(c *Config) {
 		case tuningLatency:
 			perf.txQLen = 5000
 		}
+	}
+
+	// When only tun_queues is raised for tcp/tcpmux, scale streams to match unless set explicitly.
+	if isTcpUserspaceTunnel(c.Tunnel.Type) && t.TcpStreams == 0 && t.TunQueues > 0 &&
+		perf.tcpStreams < perf.tunQueues {
+		perf.tcpStreams = perf.tunQueues
 	}
 }
 

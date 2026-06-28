@@ -24,7 +24,6 @@ type TcpTunnel struct {
 	conns  [maxPerfQueues]atomic.Pointer[net.Conn]
 	done   chan struct{}
 	stop   stoppedFlag
-	rr     rrCounter
 }
 
 func (t *TcpTunnel) DevName() string   { return "tcp-tun0" }
@@ -44,6 +43,7 @@ func (t *TcpTunnel) Up() error {
 
 	header("tcp / " + c.Mode)
 	applyPerfFromConfig(c)
+	step("perf: " + perfSummary())
 	step("cleanup...")
 	t.doClean()
 	t.stop.reset()
@@ -103,11 +103,21 @@ func (t *TcpTunnel) Up() error {
 	return nil
 }
 
-func (t *TcpTunnel) pickConn() net.Conn {
+func tcpStreamSlot(data []byte, streams int) int {
+	if streams <= 1 {
+		return 0
+	}
+	return int(hashIPPacket(data) % uint32(streams))
+}
+
+func (t *TcpTunnel) pickConn(data []byte) net.Conn {
 	n := perfTcpStreams()
+	slot := tcpStreamSlot(data, n)
+	if c := t.conns[slot].Load(); c != nil {
+		return *c
+	}
 	for i := 0; i < n; i++ {
-		idx := t.rr.next(n)
-		if c := t.conns[idx].Load(); c != nil {
+		if c := t.conns[i].Load(); c != nil {
 			return *c
 		}
 	}
@@ -120,7 +130,7 @@ func (t *TcpTunnel) txPollLoop() {
 
 	poller.Run(nil, func(pkt []byte, n int) bool {
 		statInc(statTCPTxRead)
-		c := t.pickConn()
+		c := t.pickConn(pkt[:n])
 		if c == nil {
 			statInc(statTCPTxNoConn)
 			return true

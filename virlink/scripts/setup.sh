@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.6.1"
+SCRIPT_VERSION="1.6.2"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -1191,8 +1191,31 @@ heartbeat_interval = $2
 EOF
 }
 
+_userspace_cpu() {
+  local n
+  n=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+  (( n > 8 )) && n=8
+  (( n < 2 )) && n=2
+  echo "$n"
+}
+
+_userspace_queues() {
+  local n; n=$(_userspace_cpu)
+  (( n < 2 )) && n=2
+  echo "$n"
+}
+
+_userspace_tcp_streams() {
+  local n; n=$(_userspace_cpu)
+  (( n < 4 )) && n=4
+  echo "$n"
+}
+
 write_userspace_tuning() {
   local file="$1" proto="$2"
+  local queues streams
+  queues=$(_userspace_queues)
+  streams=$(_userspace_tcp_streams)
   case "$proto" in
     icmp)
       cat >> "$file" << EOF
@@ -1201,7 +1224,7 @@ write_userspace_tuning() {
 enabled      = true
 mode         = "fast"
 sock_buf_mb  = 64
-tun_queues   = 2
+tun_queues   = ${queues}
 batch_size   = 64
 poll_ms      = 5
 tx_queue_len = 10000
@@ -1218,9 +1241,10 @@ EOF
 [tuning]
 enabled      = true
 mode         = "fast"
-sock_buf_mb  = 32
-tun_queues   = 1
-poll_ms      = 10
+sock_buf_mb  = 64
+tun_queues   = ${queues}
+batch_size   = 32
+poll_ms      = 5
 tx_queue_len = 10000
 
 [logging]
@@ -1235,10 +1259,10 @@ EOF
 [tuning]
 enabled      = true
 mode         = "fast"
-sock_buf_mb  = 32
-tun_queues   = 1
-tcp_streams  = 2
-poll_ms      = 10
+sock_buf_mb  = 64
+tun_queues   = ${queues}
+tcp_streams  = ${streams}
+poll_ms      = 5
 tx_queue_len = 10000
 
 [logging]

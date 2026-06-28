@@ -49,6 +49,7 @@ type icmpTxBatch struct {
 	n      int
 	frames [icmpBatchMax][]byte
 	lens   [icmpBatchMax]int
+	ports  [icmpBatchMax]uint16 // host order; 0 for raw IP sockets
 	iovs   [icmpBatchMax]unix.Iovec
 	addrs  [icmpBatchMax]unix.RawSockaddrInet4
 	msgs   [icmpBatchMax]mmsghdr
@@ -56,11 +57,16 @@ type icmpTxBatch struct {
 
 func (b *icmpTxBatch) reset() { b.n = 0 }
 
-func (b *icmpTxBatch) add(frame []byte, pktLen int, dst [4]byte) {
+func (b *icmpTxBatch) add(frame []byte, pktLen int, dst [4]byte, port uint16) {
 	i := b.n
 	b.frames[i] = frame
 	b.lens[i] = pktLen
-	b.addrs[i] = unix.RawSockaddrInet4{Family: unix.AF_INET, Addr: dst}
+	b.ports[i] = port
+	portBE := port
+	if port != 0 {
+		portBE = (port << 8) | (port >> 8)
+	}
+	b.addrs[i] = unix.RawSockaddrInet4{Family: unix.AF_INET, Port: portBE, Addr: dst}
 	b.iovs[i].Base = &frame[0]
 	b.iovs[i].Len = uint64(pktLen)
 	b.msgs[i].Hdr.Name = (*byte)(unsafe.Pointer(&b.addrs[i]))
@@ -70,9 +76,9 @@ func (b *icmpTxBatch) add(frame []byte, pktLen int, dst [4]byte) {
 	b.n++
 }
 
-// icmpSendBatch sends batched ICMP frames; falls back to Sendto per packet.
+// mmsgSendBatch sends batched raw/UDP frames via sendmmsg; falls back to Sendto per packet.
 // Returns the number of packets that failed to send.
-func icmpSendBatch(rawFd int, b *icmpTxBatch) int {
+func mmsgSendBatch(rawFd int, b *icmpTxBatch) int {
 	if b.n == 0 {
 		return 0
 	}
@@ -83,9 +89,15 @@ func icmpSendBatch(rawFd int, b *icmpTxBatch) int {
 	}
 	for i := sent; i < b.n; i++ {
 		sa := &unix.SockaddrInet4{Addr: b.addrs[i].Addr}
+		if p := b.ports[i]; p != 0 {
+			sa.Port = int(p)
+		}
 		if e := unix.Sendto(rawFd, b.frames[i][:b.lens[i]], 0, sa); e != nil && e != unix.EAGAIN {
 			errs++
 		}
 	}
 	return errs
 }
+
+// icmpSendBatch is an alias for mmsgSendBatch (ICMP TX path).
+func icmpSendBatch(rawFd int, b *icmpTxBatch) int { return mmsgSendBatch(rawFd, b) }
