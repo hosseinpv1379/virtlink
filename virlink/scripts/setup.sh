@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.0.9"
+SCRIPT_VERSION="1.1.0"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -419,6 +419,7 @@ do_remove_core() {
 # ══════════════════════════════════════════════════════════════════════════════
 require_root() { [[ $EUID -eq 0 ]] || die "Requires root — run: sudo virlink-setup"; }
 require_bin()  { [[ -x "$VIRLINK_BIN" ]] || die "Binary not found: $VIRLINK_BIN"; }
+require_cmd()  { command -v "$1" >/dev/null 2>&1 || die "'$1' not found — install it first"; }
 ensure_dirs()  { mkdir -p "$CONFIGS_DIR" "$LOGS_DIR"; }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1203,43 +1204,176 @@ EOF
 
 openvpn_gen_pki() {
   local dir="$1"
-  require_bin openssl
+  require_cmd openssl
+  require_cmd openvpn
   mkdir -p "$dir"
   chmod 700 "$dir"
 
   if [[ -f "$dir/ca.crt" ]]; then
     ok "PKI already exists in ${dir}"
+    openvpn_export_client_bundle "$dir" 2>/dev/null || true
     return 0
   fi
 
-  info "Generating OpenVPN PKI in ${dir}..."
-  openssl genrsa -out "$dir/ca.key" 2048 2>/dev/null
+  info "Generating OpenVPN PKI (ECDSA P-256, tls-crypt, no DH file)..."
+  openssl ecparam -genkey -name prime256v1 -out "$dir/ca.key" 2>/dev/null
   openssl req -new -x509 -days 3650 -key "$dir/ca.key" -out "$dir/ca.crt" \
-    -subj "/CN=virlink-openvpn-ca" 2>/dev/null
+    -subj "/CN=vl-ca" 2>/dev/null
 
-  openssl genrsa -out "$dir/server.key" 2048 2>/dev/null
+  openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" 2>/dev/null
   openssl req -new -key "$dir/server.key" -out "$dir/server.csr" \
-    -subj "/CN=virlink-server" 2>/dev/null
+    -subj "/CN=vl-srv" 2>/dev/null
   openssl x509 -req -days 3650 -in "$dir/server.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
     -CAcreateserial -out "$dir/server.crt" 2>/dev/null
 
-  openssl genrsa -out "$dir/client.key" 2048 2>/dev/null
+  openssl ecparam -genkey -name prime256v1 -out "$dir/client.key" 2>/dev/null
   openssl req -new -key "$dir/client.key" -out "$dir/client.csr" \
-    -subj "/CN=virlink-client" 2>/dev/null
+    -subj "/CN=vl-cli" 2>/dev/null
   openssl x509 -req -days 3650 -in "$dir/client.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
     -CAcreateserial -out "$dir/client.crt" 2>/dev/null
 
-  openssl dhparam -out "$dir/dh.pem" 2048 2>/dev/null
-
-  if command -v openvpn >/dev/null 2>&1; then
-    openvpn --genkey secret "$dir/ta.key"
+  if openvpn --genkey tls-crypt "$dir/tc.key" 2>/dev/null; then
+    :
   else
-    openssl rand -out "$dir/ta.key" 256
+    openvpn --genkey secret "$dir/tc.key"
   fi
 
   rm -f "$dir/server.csr" "$dir/client.csr"
-  chmod 600 "$dir"/*.key "$dir/dh.pem" 2>/dev/null || true
-  ok "PKI generated (ca, server, client, dh, tls-auth)"
+  chmod 600 "$dir"/*.key "$dir/tc.key" 2>/dev/null || true
+  chmod 644 "$dir"/*.crt 2>/dev/null || true
+  ok "PKI generated (ECDSA, tls-crypt — server/CA private keys stay on server)"
+  openvpn_export_client_bundle "$dir"
+}
+
+# Client-safe bundle: public CA + client creds + tls-crypt only (no server/ca private keys).
+openvpn_export_client_bundle() {
+  local pki_dir="$1"
+  local export_dir="${pki_dir}/export"
+  local tls_key="tc.key"
+  local f
+  [[ -f "${pki_dir}/tc.key" ]] || tls_key="ta.key"
+  mkdir -p "$export_dir"
+  chmod 700 "$export_dir"
+  for f in ca.crt client.crt client.key "$tls_key"; do
+    [[ -f "${pki_dir}/${f}" ]] || return 1
+    cp -f "${pki_dir}/${f}" "${export_dir}/${f}"
+  done
+  chmod 600 "${export_dir}/client.key" "${export_dir}/${tls_key}"
+  chmod 644 "${export_dir}/ca.crt" "${export_dir}/client.crt"
+  ok "Client export: ${export_dir} (no server or CA private keys)"
+}
+
+# Remove server-only material if it ever lands on a client (privacy).
+openvpn_strip_server_secrets() {
+  local dir="$1"
+  local f
+  for f in server.key server.crt ca.key dh.pem ta.key; do
+    if [[ -f "${dir}/${f}" ]]; then
+      warn "Removing ${f} from client (server-only)"
+      rm -f "${dir}/${f}"
+    fi
+  done
+}
+
+openvpn_tls_key_directive() {
+  local dir="$1" role="$2"
+  if [[ -f "${dir}/tc.key" ]]; then
+    echo "tls-crypt tc.key"
+  elif [[ -f "${dir}/ta.key" ]]; then
+    [[ "$role" == "server" ]] && echo "tls-auth ta.key 0" || echo "tls-auth ta.key 1"
+  else
+    die "Missing tls-crypt key (tc.key) — fetch PKI from server"
+  fi
+}
+
+openvpn_fetch_pki_from_server() {
+  local name="$1" server_host="$2" pki_dir="$3"
+  local ssh_user="${4:-root}" ssh_port="${5:-22}"
+  local remote_pki="${INSTALL_DIR}/pki/${name}"
+  local remote_export="${remote_pki}/export"
+  local ssh_base=(ssh -p "$ssh_port" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new)
+  local scp_base=(scp -P "$ssh_port" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new)
+
+  require_cmd ssh
+  require_cmd scp
+  mkdir -p "$pki_dir"
+  chmod 700 "$pki_dir"
+
+  blank
+  info "Fetching client credentials from ${ssh_user}@${server_host} (SSH, client bundle only)..."
+  if ! "${ssh_base[@]}" "${ssh_user}@${server_host}" "test -d '${remote_pki}'"; then
+    die "No PKI on server at ${remote_pki} — run OpenVPN setup on the server first"
+  fi
+
+  if "${ssh_base[@]}" "${ssh_user}@${server_host}" "test -d '${remote_export}'"; then
+    "${scp_base[@]}" -r "${ssh_user}@${server_host}:${remote_export}/." "${pki_dir}/" \
+      || die "SCP failed — check SSH keys: ssh ${ssh_user}@${server_host}"
+  else
+    local f tls_key="tc.key"
+    "${ssh_base[@]}" "${ssh_user}@${server_host}" "test -f '${remote_pki}/tc.key'" \
+      || tls_key="ta.key"
+    for f in ca.crt client.crt client.key "$tls_key"; do
+      "${scp_base[@]}" "${ssh_user}@${server_host}:${remote_pki}/${f}" "${pki_dir}/${f}" \
+        || die "Failed to fetch ${f} — re-run server setup to refresh export bundle"
+    done
+  fi
+
+  openvpn_strip_server_secrets "$pki_dir"
+  ok "PKI fetched from ${server_host}"
+}
+
+openvpn_push_client_bundle() {
+  local name="$1" client_host="$2" pki_dir="$3"
+  local ssh_user="${4:-root}" ssh_port="${5:-22}"
+  local export_dir="${pki_dir}/export"
+  local remote_dir="${INSTALL_DIR}/pki/${name}"
+
+  require_cmd ssh
+  require_cmd scp
+  openvpn_export_client_bundle "$pki_dir" || die "Export bundle missing — regenerate PKI on server"
+
+  blank
+  info "Pushing client credentials to ${ssh_user}@${client_host} (export bundle only)..."
+  ssh -p "$ssh_port" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new \
+    "${ssh_user}@${client_host}" "mkdir -p '${remote_dir}' && chmod 700 '${remote_dir}'" \
+    || die "SSH to client failed — check keys: ssh ${ssh_user}@${client_host}"
+
+  scp -P "$ssh_port" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new \
+    -r "${export_dir}/." "${ssh_user}@${client_host}:${remote_dir}/" \
+    || die "SCP to client failed"
+
+  ok "Client credentials pushed to ${client_host}:${remote_dir}"
+  info "On client: run setup again (same tunnel name) or start the tunnel"
+}
+
+openvpn_prompt_ssh() {
+  local _u _p
+  prompt _u "SSH user" "root"
+  prompt _p "SSH port" "22"
+  OPENVPN_SSH_USER="$_u"
+  OPENVPN_SSH_PORT="$_p"
+}
+
+openvpn_write_crypto_block() {
+  local dir="$1" role="$2"
+  local tls_line
+  tls_line="$(openvpn_tls_key_directive "$dir" "$role")"
+  if [[ -f "${dir}/tc.key" ]]; then
+    cat << EOF
+dh none
+ecdh-curve prime256v1
+${tls_line}
+tls-version-min 1.2
+EOF
+  elif [[ -f "${dir}/dh.pem" ]]; then
+    cat << EOF
+dh dh.pem
+${tls_line}
+tls-version-min 1.2
+EOF
+  else
+    die "Incomplete PKI in ${dir} — missing tc.key or dh.pem"
+  fi
 }
 
 openvpn_write_server_conf() {
@@ -1258,8 +1392,9 @@ persist-tun
 ca ca.crt
 cert server.crt
 key server.key
-dh dh.pem
-tls-auth ta.key 0
+EOF
+  openvpn_write_crypto_block "$dir" server >> "${dir}/server.conf"
+  cat >> "${dir}/server.conf" << EOF
 mode server
 tls-server
 ifconfig ${server_ip} ${client_ip}
@@ -1286,7 +1421,9 @@ persist-tun
 ca ca.crt
 cert client.crt
 key client.key
-tls-auth ta.key 1
+EOF
+  openvpn_write_crypto_block "$dir" client >> "${dir}/client.conf"
+  cat >> "${dir}/client.conf" << EOF
 remote-cert-tls server
 ifconfig ${client_ip} ${server_ip}
 EOF
@@ -1296,9 +1433,12 @@ EOF
 openvpn_require_client_pki() {
   local dir="$1"
   local f
-  for f in ca.crt client.crt client.key ta.key; do
-    [[ -f "${dir}/${f}" ]] || die "Missing ${dir}/${f} — copy PKI from server or run setup on server first"
+  for f in ca.crt client.crt client.key; do
+    [[ -f "${dir}/${f}" ]] || die "Missing ${dir}/${f} — fetch PKI from server"
   done
+  [[ -f "${dir}/tc.key" || -f "${dir}/ta.key" ]] \
+    || die "Missing tls-crypt key (tc.key) — fetch PKI from server"
+  openvpn_strip_server_secrets "$dir"
 }
 
 gen_openvpn() {
@@ -1324,7 +1464,7 @@ gen_openvpn() {
   perf="$(label_key "$perf_raw")"
   dev="ovpn-tun0"
 
-  require_bin openvpn
+  require_cmd openvpn
   pki_dir="${INSTALL_DIR}/pki/${name}"
   mkdir -p "$pki_dir"
 
@@ -1332,9 +1472,12 @@ gen_openvpn() {
     openvpn_gen_pki "$pki_dir"
   else
     if [[ ! -f "${pki_dir}/ca.crt" ]]; then
-      warn "Client needs PKI files from the server."
-      info "On server: scp -r root@SERVER:${INSTALL_DIR}/pki/${name} ${pki_dir%/*}/"
-      die "PKI not found in ${pki_dir}"
+      blank
+      warn "Client PKI not found locally."
+      info "Privacy: only client certs + tls-crypt are fetched (never server/CA private keys)."
+      openvpn_prompt_ssh
+      openvpn_fetch_pki_from_server "$name" "$remote_ip" "$pki_dir" \
+        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
     fi
     openvpn_require_client_pki "$pki_dir"
   fi
@@ -1353,7 +1496,16 @@ gen_openvpn() {
     ovpn_conf="${pki_dir}/server.conf"
     openvpn_write_server_conf "$pki_dir" "$port" "$proto" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"
     ok "Wrote ${ovpn_conf} (${perf}, ${proto})"
-    info "Copy to client: scp -r ${pki_dir} root@CLIENT:${INSTALL_DIR}/pki/"
+    blank
+    info "Privacy: CA/server private keys remain on this host only."
+    info "Client bundle: ${pki_dir}/export/"
+    if confirm "Push client credentials to peer (${remote_ip}) via SSH?"; then
+      openvpn_prompt_ssh
+      openvpn_push_client_bundle "$name" "$remote_ip" "$pki_dir" \
+        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
+    else
+      info "On client: re-run setup — PKI auto-fetches from this server via SSH."
+    fi
   else
     ovpn_conf="${pki_dir}/client.conf"
     openvpn_write_client_conf "$pki_dir" "$port" "$proto" "$remote_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"
