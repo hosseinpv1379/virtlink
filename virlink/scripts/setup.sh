@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -442,6 +442,8 @@ _cmd_pkg_name() {
   case "$1" in
     openvpn) echo openvpn ;;
     openssl) echo openssl ;;
+    curl)    echo curl ;;
+    tar)     echo tar ;;
     ssh|scp)
       case "$(_detect_pkg_mgr)" in
         dnf|yum) echo openssh-clients ;;
@@ -509,6 +511,7 @@ ensure_cmd() {
     || die "'${cmd}' still missing after package install"
   ok "${cmd} ready"
 }
+require_cmd() { ensure_cmd "$@"; }
 
 ensure_openvpn_deps() {
   local -a need=() c
