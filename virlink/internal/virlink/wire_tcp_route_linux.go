@@ -10,7 +10,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const wireLoLabel = "virlink_wire"
+const wireLoLabel = "lo:virlink_wire"
 
 // tcpWireKernelUp installs kernel routes/addresses so TCP wire spoof works without
 // nftables IP mangling. The socket stack binds FREEBIND to [mangle] srcip and
@@ -59,6 +59,7 @@ func tcpWireServerDown(cfg *Config) {
 	if err != nil {
 		return
 	}
+	addr.Label = wireLoLabel
 	_ = netlink.AddrDel(lo, addr)
 }
 
