@@ -1,6 +1,6 @@
 // tun_openvpnmultu.go — parallel OpenVPN workers + kernel ECMP load-balancing.
 //
-// N independent openvpn processes (one CPU thread each) share the same overlay peer IP
+// N independent openvpn processes (CPU-pinned, ECMP load-balanced) share the same overlay peer IP.
 // via per-flow ECMP routing — same idea as bonded-gre-fou, without touching tun_openvpn.go.
 package virlink
 
@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ const (
 
 type openvpnMultuWorker struct {
 	index   int
+	cpu     int
 	dev     string
 	conf    string
 	logPath string
@@ -69,8 +71,12 @@ func (t *OpenvpnMultuTunnel) Up() error {
 	}
 
 	header("openvpnmultu / " + c.Mode)
-	logInfo(fmt.Sprintf("%d parallel OpenVPN workers + ECMP flow-hash load-balancer", n))
-	logWarn("DCO is disabled per worker — use openvpnmultu for multi-process bandwidth without ovpn-dco")
+	ncpu := runtime.NumCPU()
+	logInfo(fmt.Sprintf("%d OpenVPN workers — CPU-pinned (0..%d) + kernel ECMP per-flow LB", n, ncpu-1))
+	if n > ncpu {
+		logWarn(fmt.Sprintf("%d workers on %d CPU cores — some workers share a core (still ECMP across processes)", n, ncpu))
+	}
+	logWarn("DCO is disabled per worker — use openvpnmultu for multi-flow bandwidth without ovpn-dco")
 
 	applyPerfFromConfig(c)
 	step("cleanup...")
@@ -118,7 +124,7 @@ func (t *OpenvpnMultuTunnel) Up() error {
 				_ = netlink.LinkSetMTU(l, c.Tunnel.MTU)
 			}
 		}
-		logOK(fmt.Sprintf("worker %d up  dev=%s  log=%s", i, w.dev, w.logPath))
+		logOK(fmt.Sprintf("worker %d up  dev=%s  cpu=%d  log=%s", i, w.dev, w.cpu, w.logPath))
 	}
 
 	overlay := t.OverlayIP()
@@ -160,9 +166,9 @@ func (t *OpenvpnMultuTunnel) Up() error {
 	}
 
 	done(t.DevName(), overlay, peer,
-		fmt.Sprintf("workers   : %d parallel openvpn (no DCO)", n),
+		fmt.Sprintf("workers   : %d openvpn (CPU-pinned, no DCO)", n),
 		fmt.Sprintf("transport : OpenVPN %s ports %s", c.Transport.Proto, ports),
-		"routing   : per-worker overlay routes → kernel ECMP when all sessions up",
+		"routing   : ECMP /32 overlay → all connected workers (L4 flow hash)",
 		"pki       : "+pkiDir+"  (PKI only — worker configs internal)",
 		"runtime   : workers materialized at "+t.runtimeDir,
 		"bench     : iperf3 -P"+fmt.Sprint(n)+" -c "+peer,
@@ -204,6 +210,12 @@ func (t *OpenvpnMultuTunnel) startWorker(w *openvpnMultuWorker) error {
 	if err := w.cmd.Start(); err != nil {
 		logFile.Close()
 		return fmt.Errorf("openvpn start: %w", err)
+	}
+	w.cpu = openvpnMultuWorkerCPU(w.index)
+	if err := pinOpenVPNWorkerCPU(w.cmd.Process.Pid, w.cpu); err != nil {
+		logWarn(fmt.Sprintf("worker %d (%s): pin CPU %d failed: %v", w.index, w.dev, w.cpu, err))
+	} else {
+		logInfo(fmt.Sprintf("worker %d (%s) pinned to CPU %d", w.index, w.dev, w.cpu))
 	}
 	go func() { _ = logFile.Close() }()
 	return nil
@@ -331,7 +343,7 @@ func (t *OpenvpnMultuTunnel) Status() {
 	for _, w := range t.workers {
 		state := "down"
 		if w.cmd != nil && w.cmd.Process != nil && openvpnProcessAlive(w.cmd) {
-			state = fmt.Sprintf("pid=%d", w.cmd.Process.Pid)
+			state = fmt.Sprintf("pid=%d cpu=%d", w.cmd.Process.Pid, w.cpu)
 		}
 		fmt.Printf("  %s: %s\n", w.dev, state)
 	}

@@ -39,8 +39,12 @@ func openvpnMultuSyncPeerRoutes(workers []openvpnMultuWorker, localPlain, peer s
 		nlRouteDelAll(peer)
 		return fmt.Errorf("no connected workers for overlay route to %s", peer)
 	}
-	if err := nlRouteECMPWithSrc(peer, localPlain, active...); err != nil {
+	nh, err := nlRouteECMPWithSrc(peer, localPlain, active...)
+	if err != nil {
 		return err
+	}
+	if nh > 1 {
+		logDebug(fmt.Sprintf("ECMP %d-way → %s/32 src %s devs=%v", nh, peer, localPlain, active))
 	}
 	return nil
 }
@@ -97,6 +101,10 @@ func openvpnMultuWaitOverlayRoute(workers []openvpnMultuWorker, localPlain, peer
 		if err := openvpnMultuSyncPeerRoutes(workers, localPlain, peer); err != nil {
 			logDebug("openvpnmultu route sync: " + err.Error())
 		} else if openvpnMultuOverlayRouteReady(peer, localPlain, workers) {
+			active := openvpnMultuActiveWorkers(workers)
+			if len(active) > 1 {
+				logOK(fmt.Sprintf("ECMP %d-way load-balance → %s/32 via %v", len(active), peer, active))
+			}
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)

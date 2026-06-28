@@ -2714,7 +2714,7 @@ gen_openvpnmultu() {
 
   collect_base_inputs name mode local_ip remote_ip cidr
   blank
-  info "OpenVPN multi-worker — N parallel openvpn processes + ECMP load-balancer (no DCO)."
+  info "OpenVPN multi-worker — N processes (CPU-pinned) + kernel ECMP load-balance (no DCO)."
   info "Use when ovpn-dco is unavailable; each worker uses one CPU core for crypto."
   pick proto "OpenVPN transport" \
     "udp — max bandwidth (recommended)" \
