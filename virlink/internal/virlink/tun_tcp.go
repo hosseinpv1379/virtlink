@@ -176,8 +176,8 @@ func (t *TcpTunnel) acceptLoop(tun *os.File) {
 		}
 		tuneTCPConn(conn)
 		idx := slot % perfTcpStreams()
-		logInfo(fmt.Sprintf("[wire] tcp accept stream %d  stack peer=%s  (wire src was %s)",
-			idx, conn.RemoteAddr(), t.cfg.Mangle.DstIP))
+		logInfo(fmt.Sprintf("[wire] tcp accept stream %d  wire peer=%s",
+			idx, conn.RemoteAddr()))
 		slot++
 		t.setConn(idx, conn)
 		go t.rxLoop(conn, tun, idx)

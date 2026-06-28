@@ -1,4 +1,4 @@
-# sepehr-sabz · tcp · CLIENT (nftables wire spoof)
+# sepehr-sabz · tcp · CLIENT (kernel socket wire spoof)
 # فایروال: TCP 8443 بین IPهای واقعی
 # rp_filter=0 روی eth0
 

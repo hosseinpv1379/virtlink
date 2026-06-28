@@ -55,14 +55,25 @@ func tcpTunnelWireUp(cfg *Config) error {
 		return nil
 	}
 	warnWireSpoofPrereqs()
-	return applyTCPWireMangle(cfg)
+	if err := tcpWireKernelUp(cfg); err != nil {
+		return err
+	}
+	if err := applyTCPMSSForward(); err != nil {
+		tcpWireKernelDown(cfg)
+		return err
+	}
+	initWireMonitor(cfg, wirePathTCPSock)
+	logOK("wire spoof enabled (TCP kernel socket: FREEBIND + wire route)")
+	logDebug(fmt.Sprintf("wire spoof srcip=%s peer_wire=%s", cfg.Mangle.SrcIP, cfg.Mangle.DstIP))
+	return nil
 }
 
 func tcpTunnelWireDown(cfg *Config) {
 	if !wireSpoofEnabled(cfg) || (cfg.Tunnel.Type != "tcp" && cfg.Tunnel.Type != "tcpmux") {
 		return
 	}
-	restoreKernelMangle()
+	tcpWireKernelDown(cfg)
+	restoreTCPMSSForward()
 }
 
 // applyKernelMangle installs scoped nftables rules for kernel encapsulation tunnels.
@@ -102,52 +113,35 @@ table inet %s {
 	return nil
 }
 
-// applyTCPWireMangle rewrites outer TCP IP headers so the tunnel uses spoofed identities.
-func applyTCPWireMangle(cfg *Config) error {
+// applyTCPMSSForward clamps MSS on forwarded overlay traffic (no IP mangling).
+func applyTCPMSSForward() error {
 	kernelMangleMu.Lock()
 	defer kernelMangleMu.Unlock()
 
-	restoreKernelMangleLocked()
+	restoreTCPMSSForwardLocked()
 
-	src := cfg.Mangle.SrcIP
-	peerWireSrc := cfg.Mangle.DstIP
-	local := cfg.LocalIP
-	remote := cfg.RemoteIP
-	port := cfg.Transport.Port
-	if port == 0 {
-		port = 8443
-	}
-	script := fmt.Sprintf(`table ip %s {
-	chain prerouting {
-		type filter hook prerouting priority %d; policy accept;
-		ip daddr %s ip saddr %s tcp sport %d ip saddr set %s counter name vlk_wire_in_peer notrack
-		ip daddr %s ip saddr %s tcp dport %d ip saddr set %s counter name vlk_wire_in_peer notrack
-	}
-	chain output {
-		type filter hook output priority %d; policy accept;
-		ip daddr %s tcp dport %d ip saddr set %s counter name vlk_wire_out notrack
-		ip daddr %s tcp sport %d ip saddr set %s counter name vlk_wire_out notrack
-	}
-}
-table inet %s {
+	script := fmt.Sprintf(`table inet %s {
 	chain forward {
 		type filter hook forward priority filter; policy accept;
 		tcp flags syn tcp option maxseg size set %d
 	}
 }
-`, nftMangleTable,
-		nftSpoofPrio, local, peerWireSrc, port, remote,
-		local, peerWireSrc, port, remote,
-		nftSpoofPrio, remote, port, src, remote, port, src,
-		nftFwdTable, mangleMSS)
+`, nftFwdTable, mangleMSS)
 
 	if err := nftRunScript(script); err != nil {
-		return fmt.Errorf("tcp wire mangle nft: %w", err)
+		return fmt.Errorf("tcp mss nft: %w", err)
 	}
-	initWireMonitor(cfg, wirePathTCP)
-	logOK("wire spoof enabled (TCP nftables mangle)")
-	logDebug(fmt.Sprintf("wire spoof srcip=%s peer_wire_src=%s port=%d", src, peerWireSrc, port))
 	return nil
+}
+
+func restoreTCPMSSForward() {
+	kernelMangleMu.Lock()
+	defer kernelMangleMu.Unlock()
+	restoreTCPMSSForwardLocked()
+}
+
+func restoreTCPMSSForwardLocked() {
+	try("nft", "delete", "table", "inet", nftFwdTable)
 }
 
 func restoreKernelMangle() {
@@ -158,7 +152,7 @@ func restoreKernelMangle() {
 
 func restoreKernelMangleLocked() {
 	try("nft", "delete", "table", "ip", nftMangleTable)
-	try("nft", "delete", "table", "inet", nftFwdTable)
+	restoreTCPMSSForwardLocked()
 }
 
 func nftRunScript(script string) error {

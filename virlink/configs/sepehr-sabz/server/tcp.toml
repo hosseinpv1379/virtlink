@@ -1,4 +1,4 @@
-# sepehr-sabz · tcp · SERVER (nftables wire spoof)
+# sepehr-sabz · tcp · SERVER (kernel socket wire spoof)
 # rp_filter=0 روی eth0
 
 [tunnel]

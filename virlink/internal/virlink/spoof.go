@@ -98,8 +98,12 @@ func wireTCPDoneExtra(cfg *Config) string {
 	if !wireSpoofEnabled(cfg) {
 		return ""
 	}
-	return fmt.Sprintf("wire      : bind src=%s  route dst=%s  nft reply outer src %s→%s",
-		cfg.Mangle.SrcIP, cfg.RemoteIP, cfg.Mangle.DstIP, cfg.RemoteIP)
+	if cfg.Mode == "server" {
+		return fmt.Sprintf("wire      : listen %s  expect client wire src=%s",
+			cfg.Mangle.SrcIP, cfg.Mangle.DstIP)
+	}
+	return fmt.Sprintf("wire      : bind src=%s  dial %s  route via %s",
+		cfg.Mangle.SrcIP, cfg.Mangle.DstIP, cfg.RemoteIP)
 }
 
 var wireTxErrWarned atomic.Bool
