@@ -87,7 +87,7 @@ func (t *BipTunnel) Up() error {
 	tuneRawSock(t.rawFd)
 	_ = unix.SetNonblock(t.rawFd, true)
 	logOK(fmt.Sprintf("raw proto=%d ready", bipProto))
-	logWireSpoof(t.wire)
+	logWireSpoof(t.cfg, t.wire)
 
 	addMSS(dev)
 	t.done = make(chan struct{})
@@ -161,13 +161,22 @@ func (t *BipTunnel) txPollLoop(rawFd int) {
 
 	var batch icmpTxBatch
 	bsz := perfBatchSize()
+	var lastDst [4]byte
+	var lastPLen int
 
 	flush := func() {
 		if batch.n == 0 {
 			return
 		}
 		statAdd(statBIPTxSend, uint64(batch.n))
-		if nerr := mmsgSendBatch(rawFd, &batch); nerr > 0 {
+		nerr := mmsgSendBatch(rawFd, &batch)
+		if t.wire.on {
+			sent := batch.n - nerr
+			if sent < 0 {
+				sent = 0
+			}
+			wireMon.noteTxBatch(sent, nerr, t.wire.src, lastDst, bipProto, lastPLen)
+		} else if nerr > 0 {
 			noteWireTxErr(nerr)
 		}
 		for i := 0; i < batch.n; i++ {
@@ -193,6 +202,9 @@ func (t *BipTunnel) txPollLoop(rawFd int) {
 				routeDst = v.([4]byte)
 			} else {
 				statInc(statBIPTxNoDst)
+				if t.wire.on {
+					wireMon.noteTxNoDst()
+				}
 				return true
 			}
 			frame := getBuf()
@@ -204,6 +216,8 @@ func (t *BipTunnel) txPollLoop(rawFd int) {
 				copy(out, pkt[:n])
 			}
 			batch.add(frame, len(out), routeDst, 0)
+			lastDst = routeDst
+			lastPLen = n
 			if batch.n >= bsz {
 				flush()
 			}

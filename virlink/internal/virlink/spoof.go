@@ -81,17 +81,25 @@ func rememberPeerRoute(w wireSpoof, fromAddr, configuredPeer [4]byte) [4]byte {
 	return fromAddr
 }
 
-func logWireSpoof(w wireSpoof) {
+func logWireSpoof(cfg *Config, w wireSpoof) {
 	if !w.on {
 		return
 	}
-	warnWireSpoofPrereqs()
+	initWireMonitor(cfg, wirePathUserspace)
 	logOK("wire spoof enabled (IPPROTO_RAW)")
 	logDebug(fmt.Sprintf("wire spoof srcip=%v dstip=%v", w.src, w.dst))
 }
 
 func warnWireSpoofPrereqs() {
 	logWarn("wire spoof: require root + rp_filter=0 (sysctl net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0)")
+}
+
+func wireTCPDoneExtra(cfg *Config) string {
+	if !wireSpoofEnabled(cfg) {
+		return ""
+	}
+	return fmt.Sprintf("wire      : bind src=%s  route dst=%s  nft reply outer src %s→%s",
+		cfg.Mangle.SrcIP, cfg.RemoteIP, cfg.Mangle.DstIP, cfg.RemoteIP)
 }
 
 var wireTxErrWarned atomic.Bool
@@ -101,6 +109,8 @@ func noteWireTxErr(n int) {
 		return
 	}
 	if wireTxErrWarned.CompareAndSwap(false, true) {
-		logWarn(fmt.Sprintf("wire tx: %d packet(s) failed — run as root, set rp_filter=0, check firewall", n))
+		logWarn(fmt.Sprintf("[wire] TX failed %d packet(s) — run as root, rp_filter=0, check firewall / routing", n))
+	} else if n > 0 {
+		logDebug(fmt.Sprintf("[wire] TX failed %d packet(s)", n))
 	}
 }

@@ -112,28 +112,3 @@ func parseUDPInner(pkt []byte) (payload []byte, ok bool) {
 	}
 	return pkt[ihl+udpHdrLen:], true
 }
-
-func acceptWirePeer(pkt []byte, sa *unix.SockaddrInet4, local, peer, spoofSrc [4]byte, w wireSpoof, wantProto byte) bool {
-	if w.on {
-		_, ok := parseIPv4Payload(pkt)
-		if !ok {
-			return false
-		}
-		if wantProto != 0 && pkt[9] != wantProto {
-			return false
-		}
-		var src [4]byte
-		copy(src[:], pkt[12:16])
-		if src == local || src == spoofSrc {
-			return false
-		}
-		return src == peer
-	}
-	if sa == nil {
-		return false
-	}
-	if sa.Addr == local {
-		return false
-	}
-	return sa.Addr == peer
-}

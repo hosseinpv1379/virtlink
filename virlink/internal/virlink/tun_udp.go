@@ -85,7 +85,7 @@ func (t *UdpTunnel) Up() error {
 		}
 		_ = unix.SetNonblock(t.rawFd, true)
 		logOK(fmt.Sprintf("raw UDP (IPPROTO_RAW) :%d", port))
-		logWireSpoof(t.wire)
+		logWireSpoof(t.cfg, t.wire)
 	} else {
 		t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{Port: port})
 		if err != nil {
@@ -157,6 +157,14 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 			continue
 		}
 		if int(binary.BigEndian.Uint16(buf[ihl+2:])) != port {
+			statInc(statUDPRxDrop)
+			if wireMonitorActive() {
+				sport := binary.BigEndian.Uint16(buf[ihl:])
+				var src [4]byte
+				copy(src[:], buf[12:16])
+				logWarn(fmt.Sprintf("[wire] RX drop bad_udp_port sport=%d want=%d outer src=%s",
+					sport, port, ip4Fmt(src)))
+			}
 			continue
 		}
 		payload := buf[ihl+udpHdrLen : n]
@@ -180,13 +188,21 @@ func (t *UdpTunnel) txPollLoopRaw(rawFd int, port int) {
 	bsz := perfBatchSize()
 	var curDst [4]byte
 	var haveDst bool
+	var lastPLen int
 
 	flush := func() {
 		if batch.n == 0 {
 			return
 		}
 		statAdd(statUDPTxSend, uint64(batch.n))
-		if nerr := mmsgSendBatch(rawFd, &batch); nerr > 0 {
+		nerr := mmsgSendBatch(rawFd, &batch)
+		if t.wire.on {
+			sent := batch.n - nerr
+			if sent < 0 {
+				sent = 0
+			}
+			wireMon.noteTxBatch(sent, nerr, t.wire.src, curDst, unix.IPPROTO_UDP, lastPLen)
+		} else if nerr > 0 {
 			noteWireTxErr(nerr)
 		}
 		for i := 0; i < batch.n; i++ {
@@ -206,6 +222,7 @@ func (t *UdpTunnel) txPollLoopRaw(rawFd int, port int) {
 		frame := getBuf()
 		out := buildWireUDP(frame, t.wire.src, routeDst, uint16(port), uint16(port), payload)
 		batch.add(frame, len(out), routeDst, 0)
+		lastPLen = len(payload)
 		if batch.n >= bsz {
 			flush()
 		}
@@ -227,6 +244,9 @@ func (t *UdpTunnel) txPollLoopRaw(rawFd int, port int) {
 				routeDst = v.([4]byte)
 			} else {
 				statInc(statUDPTxNoDst)
+				if t.wire.on {
+					wireMon.noteTxNoDst()
+				}
 				return true
 			}
 			addPkt(routeDst, pkt[:n])

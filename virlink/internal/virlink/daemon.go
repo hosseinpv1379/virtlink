@@ -175,6 +175,7 @@ func printHeartbeat(tun Tunnel, fwdRules []ForwardRule, since time.Time, hm *Hea
 	msg := fmtHeartbeat(dev, linkState, hsState, lastProbe,
 		rxB, txB, rxPkt, txPkt, uptime)
 	logInfo(msg)
+	wireLogHeartbeat()
 }
 
 // ── formatting helpers ────────────────────────────────────────────────────────

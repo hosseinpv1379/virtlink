@@ -77,11 +77,11 @@ func applyKernelMangle(cfg *Config) error {
 	script := fmt.Sprintf(`table ip %s {
 	chain input {
 		type filter hook input priority %d; policy accept;
-		ip daddr %s ip saddr %s ip saddr set %s
+		ip daddr %s ip saddr %s counter name vlk_wire_in_peer ip saddr set %s
 	}
 	chain output {
 		type filter hook output priority %d; policy accept;
-		ip daddr %s ip saddr set %s
+		ip daddr %s counter name vlk_wire_out ip saddr set %s
 	}
 }
 table inet %s {
@@ -96,6 +96,7 @@ table inet %s {
 	if err := nftRunScript(script); err != nil {
 		return fmt.Errorf("kernel mangle nft: %w", err)
 	}
+	initWireMonitor(cfg, wirePathKernel)
 	logOK("wire spoof enabled (kernel nftables mangle)")
 	logDebug(fmt.Sprintf("wire spoof srcip=%s peer_wire_src=%s mss=%d", src, peerWireSrc, mangleMSS))
 	return nil
@@ -117,15 +118,15 @@ func applyTCPWireMangle(cfg *Config) error {
 		port = 8443
 	}
 	script := fmt.Sprintf(`table ip %s {
-	chain input {
-		type filter hook input priority %d; policy accept;
-		ip daddr %s ip saddr %s tcp sport %d ip saddr set %s
-		ip daddr %s ip saddr %s tcp dport %d ip saddr set %s
+	chain prerouting {
+		type filter hook prerouting priority %d; policy accept;
+		ip daddr %s ip saddr %s tcp sport %d ip saddr set %s counter name vlk_wire_in_peer notrack
+		ip daddr %s ip saddr %s tcp dport %d ip saddr set %s counter name vlk_wire_in_peer notrack
 	}
 	chain output {
 		type filter hook output priority %d; policy accept;
-		ip daddr %s tcp dport %d ip saddr set %s
-		ip daddr %s tcp sport %d ip saddr set %s
+		ip daddr %s tcp dport %d ip saddr set %s counter name vlk_wire_out notrack
+		ip daddr %s tcp sport %d ip saddr set %s counter name vlk_wire_out notrack
 	}
 }
 table inet %s {
@@ -143,6 +144,7 @@ table inet %s {
 	if err := nftRunScript(script); err != nil {
 		return fmt.Errorf("tcp wire mangle nft: %w", err)
 	}
+	initWireMonitor(cfg, wirePathTCP)
 	logOK("wire spoof enabled (TCP nftables mangle)")
 	logDebug(fmt.Sprintf("wire spoof srcip=%s peer_wire_src=%s port=%d", src, peerWireSrc, port))
 	return nil

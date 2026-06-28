@@ -130,7 +130,7 @@ func (t *TcpMuxTunnel) Up() error {
 
 	streams := perfTcpStreams()
 	if c.Mode == "server" {
-		t.ln, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
+		t.ln, err = listenTCPWire(c, port)
 		if err != nil {
 			return fmt.Errorf("tcpmux listen :%d: %w", port, err)
 		}
@@ -143,6 +143,7 @@ func (t *TcpMuxTunnel) Up() error {
 	done(dev, addr, peer,
 		fmt.Sprintf("transport : TCPmux ×%d streams  hash=%s  :%d", streams, hashLabel, port),
 		"frame     : len(2) + flow_hash(4) + IP packet",
+		wireTCPDoneExtra(c),
 		"reconnect : automatic (client retries every 3 s)",
 		"test      : ping -c3 "+peer,
 	)
@@ -223,23 +224,22 @@ func (t *TcpMuxTunnel) acceptLoop(tun *os.File) {
 }
 
 func (t *TcpMuxTunnel) connectLoop(tun *os.File) {
-	addr := fmt.Sprintf("%s:%d", t.cfg.RemoteIP, t.cfg.Transport.Port)
 	for s := 0; s < perfTcpStreams(); s++ {
-		go t.connectOne(tun, addr, s)
+		go t.connectOne(tun, s)
 	}
 	select {
 	case <-t.done:
 	}
 }
 
-func (t *TcpMuxTunnel) connectOne(tun *os.File, addr string, slot int) {
+func (t *TcpMuxTunnel) connectOne(tun *os.File, slot int) {
 	for {
 		if t.stop.stopped() {
 			return
 		}
-		conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+		conn, err := dialTCPWire(t.cfg, 10*time.Second)
 		if err != nil {
-			logWarn(fmt.Sprintf("tcpmux connect %s stream %d: %v — retry in 3s", addr, slot, err))
+			logWarn(fmt.Sprintf("[wire] tcpmux stream %d: %v — retry in 3s", slot, err))
 			select {
 			case <-t.done:
 				return
@@ -248,7 +248,7 @@ func (t *TcpMuxTunnel) connectOne(tun *os.File, addr string, slot int) {
 			}
 		}
 		tuneTCPConn(conn)
-		logOK(fmt.Sprintf("tcpmux: stream %d connected to %s", slot, addr))
+		logOK(fmt.Sprintf("tcpmux: stream %d up  %s ↔ %s", slot, conn.LocalAddr(), conn.RemoteAddr()))
 		t.setConn(slot, conn)
 		t.rxLoop(conn, tun, slot)
 		t.conns[slot].Store(nil)

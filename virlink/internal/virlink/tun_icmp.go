@@ -104,7 +104,7 @@ func (t *IcmpTunnel) Up() error {
 	}
 	_ = unix.SetNonblock(t.rawFd, true)
 	logOK("raw ICMP socket ready")
-	logWireSpoof(t.wire)
+	logWireSpoof(t.cfg, t.wire)
 
 	addMSS(dev)
 	t.done = make(chan struct{})
@@ -139,13 +139,22 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 	var batch icmpTxBatch
 	bsz := perfBatchSize()
 	useDedup := t.tun.QueueCount() > 1
+	var lastDst [4]byte
+	var lastPLen int
 
 	flush := func() {
 		if batch.n == 0 {
 			return
 		}
 		statAdd(statICMPTxSend, uint64(batch.n))
-		if nerr := icmpSendBatch(rawFd, &batch); nerr > 0 {
+		nerr := icmpSendBatch(rawFd, &batch)
+		if t.wire.on {
+			sent := batch.n - nerr
+			if sent < 0 {
+				sent = 0
+			}
+			wireMon.noteTxBatch(sent, nerr, t.wire.src, lastDst, unix.IPPROTO_ICMP, lastPLen)
+		} else if nerr > 0 {
 			noteWireTxErr(nerr)
 		}
 		for i := 0; i < batch.n; i++ {
@@ -167,6 +176,9 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 			dst, ok := t.resolveDst()
 			if !ok {
 				statInc(statICMPTxNoDst)
+				if t.wire.on {
+					wireMon.noteTxNoDst()
+				}
 				return true
 			}
 			payload := pkt[:n]
@@ -183,6 +195,8 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 				built = buildICMPFrame(frame, icmpTunID, seq, payload)
 			}
 			batch.add(frame, len(built), dst, 0)
+			lastDst = dst
+			lastPLen = len(payload)
 			if batch.n >= bsz {
 				flush()
 			}
