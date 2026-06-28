@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="1.3.3"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -2260,9 +2260,7 @@ hysteria2_write_client_yaml() {
 # virlink Hysteria2 — client (site-to-site TUN)
 server: ${remote_ip}:${port}
 
-auth:
-  type: password
-  password: ${pass}
+auth: ${pass}
 
 tls:
   ca: server.crt
