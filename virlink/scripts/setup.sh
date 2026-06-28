@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.5.2"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -804,25 +804,82 @@ tunnel_stop() {
   ok "Tunnel '${name}' stopped and disabled."
 }
 
+_virlink_color_log() {
+  sed -E \
+    -e "s/  INF  /  $(printf '\033[90m')·$(printf '\033[0m')  /g" \
+    -e "s/  WRN  /  $(printf '\033[33m')⚠$(printf '\033[0m')  /g" \
+    -e "s/  ERR  /  $(printf '\033[1;31m')✗$(printf '\033[0m')  /g" \
+    -e "s/  DBG  /  $(printf '\033[36m')·$(printf '\033[0m')  /g" \
+    -e "s/(♥)/$(printf '\033[32m')\1$(printf '\033[0m')/g" \
+    -e "s/\bconnected\b/$(printf '\033[32m')connected$(printf '\033[0m')/g" \
+    -e "s/\bdegraded\b/$(printf '\033[33m')degraded$(printf '\033[0m')/g" \
+    -e "s/\bdead\b/$(printf '\033[31m')dead$(printf '\033[0m')/g" \
+    -e "s/\blink=UP\b/link=$(printf '\033[32m')UP$(printf '\033[0m')/g" \
+    -e "s/\blink=DOWN\b/link=$(printf '\033[31m')DOWN$(printf '\033[0m')/g"
+}
+
+tunnel_logs() {
+  local name="$1"
+  shift || true
+  local lines=50 follow=0
+  local svc log cfg
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow) follow=1; shift ;;
+      -n)
+        [[ -n "${2:-}" ]] || die "logs: -n requires a line count"
+        lines="$2"; shift 2
+        ;;
+      -h|--help)
+        cat << EOF
+Usage: $0 logs NAME [-f|--follow] [-n LINES]
+
+  NAME          tunnel name (e.g. awg)
+  -f, --follow  stream new log lines (tail -f)
+  -n LINES      show last N lines (default: 50)
+EOF
+        exit 0
+        ;;
+      *) die "logs: unknown option '$1' (try: logs NAME -f)" ;;
+    esac
+  done
+
+  cfg="${CONFIGS_DIR}/${name}.toml"
+  svc="$(svc_name "$name")"
+  log="$(svc_log "$name")"
+  [[ -f "$cfg" ]] || die "No tunnel '${name}' — config missing: ${cfg}"
+
+  blank
+  if (( follow )); then
+    info "Following ${log}  (Ctrl+C to stop)"
+  else
+    info "Log ${log}  (last ${lines} lines)"
+  fi
+  sep_thin
+
+  if [[ -f "$log" ]]; then
+    if (( follow )); then
+      tail -n "$lines" -f "$log" | _virlink_color_log
+    else
+      tail -n "$lines" "$log" | _virlink_color_log
+    fi
+    return 0
+  fi
+
+  warn "Log file not found — reading journal for ${svc}"
+  if (( follow )); then
+    journalctl -u "$svc" -n "$lines" -f --no-pager 2>/dev/null | _virlink_color_log
+  else
+    journalctl -u "$svc" -n "$lines" --no-pager 2>/dev/null | _virlink_color_log
+  fi
+}
+
 tunnel_status() {
   local name="$1"
   local cfg="${CONFIGS_DIR}/${name}.toml"
   local svc; svc="$(svc_name "$name")"
   local log; log="$(svc_log "$name")"
-
-  _clog() {
-    sed -E \
-      -e "s/  INF  /  $(printf '\033[90m')·$(printf '\033[0m')  /g" \
-      -e "s/  WRN  /  $(printf '\033[33m')⚠$(printf '\033[0m')  /g" \
-      -e "s/  ERR  /  $(printf '\033[1;31m')✗$(printf '\033[0m')  /g" \
-      -e "s/  DBG  /  $(printf '\033[36m')·$(printf '\033[0m')  /g" \
-      -e "s/(♥)/$(printf '\033[32m')\1$(printf '\033[0m')/g" \
-      -e "s/\bconnected\b/$(printf '\033[32m')connected$(printf '\033[0m')/g" \
-      -e "s/\bdegraded\b/$(printf '\033[33m')degraded$(printf '\033[0m')/g" \
-      -e "s/\bdead\b/$(printf '\033[31m')dead$(printf '\033[0m')/g" \
-      -e "s/\blink=UP\b/link=$(printf '\033[32m')UP$(printf '\033[0m')/g" \
-      -e "s/\blink=DOWN\b/link=$(printf '\033[31m')DOWN$(printf '\033[0m')/g"
-  }
 
   blank
   echo -e "  ${BOLD}${C}⬡  ${name}${NC}"
@@ -858,12 +915,12 @@ tunnel_status() {
   blank
   echo -e "  ${DIM}── binary log (last 30 lines) ───────────────────${NC}"
   if [[ -f "$log" ]] && [[ -s "$log" ]]; then
-    tail -30 "$log" | _clog | sed 's/^/  /'
+    tail -30 "$log" | _virlink_color_log | sed 's/^/  /'
     echo -e "  ${DIM}↳ ${log}${NC}"
   else
     if (( running )); then
       echo -e "  ${DIM}(reading from journal)${NC}"
-      journalctl -u "$svc" -n 20 --no-pager 2>/dev/null | tail -20 | _clog | sed 's/^/  /'
+      journalctl -u "$svc" -n 20 --no-pager 2>/dev/null | tail -20 | _virlink_color_log | sed 's/^/  /'
     else
       echo -e "  ${DIM}(no log yet — start the tunnel first)${NC}"
     fi
@@ -3978,6 +4035,7 @@ Commands:
   stop NAME       stop tunnel
   restart NAME    restart tunnel
   status NAME     show tunnel status
+  logs NAME       show tunnel log (add -f to follow)
   list            list configured tunnels
   update          update virlink binary
 
@@ -3998,8 +4056,9 @@ case "${1:-menu}" in
            systemctl restart "$(svc_name "${2:?name required}")" 2>/dev/null || \
            { tunnel_stop "${2}"; tunnel_start "${2}"; } ;;
   status)  tunnel_status "${2:?tunnel name required}" ;;
+  logs)    tunnel_logs   "${2:?tunnel name required}" "${@:3}" ;;
   list)    list_tunnels ;;
   update)  require_root; check_update; do_update_all ;;
   menu)    main ;;
-  *)       echo "Usage: $0 [-v|--verbose] [-x|--debug] [menu|start|stop|restart|status|list|update] [name]"; exit 1 ;;
+  *)       echo "Usage: $0 [-v|--verbose] [-x|--debug] [menu|start|stop|restart|status|logs|list|update] [name]"; exit 1 ;;
 esac
