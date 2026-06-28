@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.5.4"
+SCRIPT_VERSION="1.5.5"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -3327,20 +3327,14 @@ ensure_amneziawg_module() {
 
 ensure_amneziawg_deps() {
   if command -v awg &>/dev/null && [[ -d /sys/module/amneziawg || -f /sys/module/amneziawg/refcnt ]]; then
-    if ! awg genkey >/dev/null 2>&1; then
-      die "awg genkey failed — reinstall: apt install amneziawg amneziawg-tools"
-    fi
     ok "AmneziaWG ready (awg + kernel module)"
     vinfo "awg=$(command -v awg)  module=loaded"
     return 0
   fi
   if command -v awg &>/dev/null; then
     ensure_amneziawg_module
-    if awg genkey >/dev/null 2>&1; then
-      ok "AmneziaWG ready (awg + kernel module)"
-      return 0
-    fi
-    die "awg found but genkey failed — install amneziawg-tools"
+    ok "AmneziaWG ready (awg + kernel module)"
+    return 0
   fi
   require_root
   warn "AmneziaWG missing — installing (Ubuntu/Debian: PPA amnezia/ppa)..."
@@ -3361,7 +3355,6 @@ ensure_amneziawg_deps() {
   esac
   ensure_amneziawg_module
   command -v awg &>/dev/null || die "awg not found after install — try: apt install amneziawg amneziawg-tools"
-  awg genkey >/dev/null 2>&1 || die "awg genkey failed after install — check amneziawg-tools"
   ok "AmneziaWG installed ($(awg --version 2>/dev/null | head -1 || echo awg))"
 }
 
@@ -3411,8 +3404,10 @@ amneziawg_keygen() {
   local cmd="$1"
   if command -v "$cmd" &>/dev/null; then
     "$cmd" genkey
-  else
+  elif command -v wg &>/dev/null; then
     wg genkey
+  else
+    return 1
   fi
 }
 
@@ -3420,14 +3415,49 @@ amneziawg_pubkey() {
   local cmd="$1"
   if command -v "$cmd" &>/dev/null; then
     "$cmd" pubkey
-  else
+  elif command -v wg &>/dev/null; then
     wg pubkey
+  else
+    return 1
   fi
+}
+
+# Write key pair to files (avoids pipefail/silent failures). Falls back to wg if awg hangs.
+amneziawg_write_keypair() {
+  local priv="$1" pub="$2"
+  local _try_awg=0
+
+  if command -v awg &>/dev/null; then
+    _try_awg=1
+    if command -v timeout &>/dev/null; then
+      if timeout 15 awg genkey > "$priv" 2>/dev/null && \
+         timeout 15 awg pubkey < "$priv" > "$pub" 2>/dev/null && \
+         [[ -s "$priv" && -s "$pub" ]]; then
+        return 0
+      fi
+    elif awg genkey > "$priv" 2>/dev/null && \
+         awg pubkey < "$priv" > "$pub" 2>/dev/null && \
+         [[ -s "$priv" && -s "$pub" ]]; then
+      return 0
+    fi
+    warn "awg genkey/pubkey failed or timed out — falling back to wg (same key format)"
+  fi
+
+  command -v wg &>/dev/null || {
+    if (( _try_awg )); then
+      err "awg keygen failed and wg not found — apt install amneziawg-tools wireguard-tools"
+    else
+      err "install wireguard-tools or amneziawg-tools for key generation"
+    fi
+    return 1
+  }
+  wg genkey > "$priv" || return 1
+  wg pubkey < "$priv" > "$pub" || return 1
+  [[ -s "$priv" && -s "$pub" ]]
 }
 
 amneziawg_gen_keys() {
   local dir="$1"
-  local sk ck sp cp
   mkdir -p "$dir"
   chmod 700 "$dir"
   if [[ -f "$dir/server.key" && -f "$dir/client.key" ]]; then
@@ -3437,16 +3467,13 @@ amneziawg_gen_keys() {
       amneziawg_gen_obfs_params
     return 0
   fi
-  info "Generating AmneziaWG keys (awg genkey)..."
+  info "Generating server key pair..."
   amneziawg_gen_obfs_params
-  sk=$(amneziawg_keygen awg) || die "awg genkey failed — install: apt install amneziawg amneziawg-tools"
-  ck=$(amneziawg_keygen awg) || die "awg genkey failed (client key)"
-  sp=$(printf '%s' "$sk" | amneziawg_pubkey awg) || die "awg pubkey failed (server)"
-  cp=$(printf '%s' "$ck" | amneziawg_pubkey awg) || die "awg pubkey failed (client)"
-  printf '%s\n' "$sk" > "$dir/server.key"
-  printf '%s\n' "$ck" > "$dir/client.key"
-  printf '%s\n' "$sp" > "$dir/server.pub"
-  printf '%s\n' "$cp" > "$dir/client.pub"
+  amneziawg_write_keypair "$dir/server.key" "$dir/server.pub" || \
+    die "key generation failed — try: apt install amneziawg-tools wireguard-tools"
+  info "Generating client key pair..."
+  amneziawg_write_keypair "$dir/client.key" "$dir/client.pub" || \
+    die "client key generation failed"
   chmod 600 "$dir"/*.key 2>/dev/null || true
   chmod 644 "$dir"/*.pub 2>/dev/null || true
   ok "AmneziaWG keys generated (obfs params embedded in awg conf)"
@@ -3555,7 +3582,7 @@ gen_amneziawg() {
   ensure_amneziawg_module
   pki_dir="${INSTALL_DIR}/pki/${name}"
   mkdir -p "$pki_dir"
-  info "PKI directory: ${pki_dir}"
+  info "PKI: ${pki_dir}"
 
   if [[ "$mode" == "server" ]]; then
     amneziawg_gen_keys "$pki_dir"
@@ -3564,6 +3591,7 @@ gen_amneziawg() {
     amneziawg_load_obfs_from_conf "${pki_dir}/awg-client.conf" 2>/dev/null || true
   fi
 
+  info "Overlay addresses for ${cidr}..."
   wireguard_overlay_addrs "$cidr" "$mode"
   client_ip="$WIREGUARD_CLIENT_IP"
   server_ip="$WIREGUARD_SERVER_IP"
@@ -3573,6 +3601,7 @@ gen_amneziawg() {
   hb=20
 
   if [[ "$mode" == "server" ]]; then
+    info "Writing awg-server.conf + awg-client.conf..."
     amneziawg_write_server_conf "$pki_dir" "$port" "$server_addr" "$client_ip" "$cidr"
     amneziawg_write_client_conf "$pki_dir" "$port" "$local_ip" "$client_addr" "$server_ip" "$cidr"
     wireguard_allow_firewall_port "$port"
@@ -3589,6 +3618,7 @@ gen_amneziawg() {
   fi
 
   cfg="${CONFIGS_DIR}/${name}.toml"
+  info "Writing ${cfg}..."
   cat > "$cfg" << EOF
 # virlink — ${name}  (AmneziaWG site-to-site · obfuscated WireGuard)
 [tunnel]
@@ -3762,8 +3792,20 @@ menu_create_tunnel() {
   category="$(label_key "$category_raw")"
 
   pick_tunnel_type "$category"
+  LAST_CFG_PATH=""
+  set +e
   dispatch_tunnel_generator "$PICKED_TUNNEL_TYPE"
+  local _gen_rc=$?
+  set -e
   PRESELECTED_MODE=""
+
+  if (( _gen_rc != 0 )) || [[ -z "${LAST_CFG_PATH:-}" || ! -f "${LAST_CFG_PATH:-}" ]]; then
+    blank
+    err "Tunnel setup did not complete."
+    warn "AmneziaWG: rm -rf /opt/virlink/pki/NAME then retry, or run: virlink-setup -x"
+    press_enter
+    return
+  fi
 
   blank
   ok "Config saved: ${LAST_CFG_PATH}"
