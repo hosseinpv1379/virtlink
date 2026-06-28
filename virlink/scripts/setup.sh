@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.3.5"
+SCRIPT_VERSION="1.3.6"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -2222,39 +2222,57 @@ EOF
     || die "OpenSSL: cannot create server certificate"
 }
 
-hysteria2_upgrade_tls_cert() {
+hysteria2_ensure_server_tls() {
   local dir="$1" server_ip="$2"
-  [[ -f "$dir/server.key" ]] || return 0
-  if [[ -n "$server_ip" ]] && openssl x509 -in "$dir/server.crt" -noout -text 2>/dev/null \
-      | grep -q "IP Address:${server_ip}"; then
-    return 0
+  local regen=0 cp kp
+  [[ -f "$dir/server.key" && -f "$dir/server.crt" ]] || regen=1
+  if [[ $regen -eq 0 ]]; then
+    cp=$(openssl x509 -in "$dir/server.crt" -noout -pubkey 2>/dev/null | openssl md5 2>/dev/null | awk '{print $NF}')
+    kp=$(openssl ec -in "$dir/server.key" -pubout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $NF}')
+    [[ -n "$cp" && "$cp" == "$kp" ]] || regen=1
   fi
-  if [[ -z "$server_ip" ]] && openssl x509 -in "$dir/server.crt" -noout -text 2>/dev/null \
-      | grep -q 'DNS:www.bing.com'; then
-    return 0
+  if [[ $regen -eq 1 ]]; then
+    info "Generating server TLS key (stays on server — client uses password only)..."
+    openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" \
+      || die "OpenSSL: cannot generate server key"
+    hysteria2_gen_tls_cert "$dir" "$server_ip"
+    chmod 600 "$dir/server.key"
+    chmod 644 "$dir/server.crt"
   fi
-  info "Upgrading Hysteria2 TLS cert (SAN www.bing.com + server IP)..."
-  hysteria2_gen_tls_cert "$dir" "$server_ip"
-  ok "Server certificate reissued (DNS + IP SAN)"
 }
 
 hysteria2_gen_credentials() {
   local dir="$1" server_ip="${2:-}"
   mkdir -p "$dir/export"
   chmod 700 "$dir"
-  if [[ -f "$dir/password" && -f "$dir/server.crt" ]]; then
-    ok "Hysteria2 credentials already exist in ${dir}"
-    hysteria2_upgrade_tls_cert "$dir" "$server_ip"
-    return 0
+  hysteria2_ensure_server_tls "$dir" "$server_ip"
+  if [[ ! -f "$dir/password" ]]; then
+    openssl rand -hex 16 > "$dir/password"
+    chmod 600 "$dir/password"
+    ok "Auth password generated"
+  else
+    ok "Auth password already exists"
   fi
-  info "Generating Hysteria2 TLS cert + password..."
-  openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" \
-    || die "OpenSSL: cannot generate server key"
-  hysteria2_gen_tls_cert "$dir" "$server_ip"
-  openssl rand -hex 16 > "$dir/password"
-  chmod 600 "$dir/server.key" "$dir/password"
-  chmod 644 "$dir/server.crt"
-  ok "Hysteria2 credentials generated"
+}
+
+hysteria2_save_export_info() {
+  local dir="$1" server_ip="$2" port="$3" name="$4"
+  local f="${dir}/export/COPY_TO_CLIENT.txt"
+  cat > "$f" << EOF
+# virlink Hysteria2 — copy to CLIENT (password only, no TLS cert)
+# Server: ${server_ip}:${port}  ·  tunnel: ${name}
+
+Copy to ${INSTALL_DIR}/pki/${name}/ on the client:
+  password
+  obfs.password   (only if server uses salamander obfs)
+
+Then run: virlink-setup → client → hysteria2 → same tunnel name
+
+Or scp:
+  scp root@${server_ip}:${dir}/export/password ${INSTALL_DIR}/pki/${name}/
+  scp root@${server_ip}:${dir}/export/obfs.password ${INSTALL_DIR}/pki/${name}/   # if present
+EOF
+  chmod 644 "$f"
 }
 
 hysteria2_write_server_yaml() {
@@ -2334,51 +2352,51 @@ EOF
 }
 
 hysteria2_export_client_bundle() {
-  local dir="$1"
+  local dir="$1" server_ip="$2" port="$3" name="$4"
   local export_dir="${dir}/export"
   mkdir -p "$export_dir"
-  cp -f "${dir}/server.crt" "${export_dir}/server.crt"
   cp -f "${dir}/password" "${export_dir}/password"
-  cp -f "${dir}/client.yaml" "${export_dir}/client.yaml"
   [[ -f "${dir}/obfs.password" ]] && cp -f "${dir}/obfs.password" "${export_dir}/obfs.password"
   chmod 600 "${export_dir}/password"
-  ok "Client export: ${export_dir}"
+  [[ -f "${export_dir}/obfs.password" ]] && chmod 600 "${export_dir}/obfs.password"
+  rm -f "${export_dir}/server.crt" "${export_dir}/client.yaml"
+  hysteria2_save_export_info "$dir" "$server_ip" "$port" "$name"
+  ok "Client export: ${export_dir} (password only — no TLS cert)"
 }
 
 hysteria2_show_fingerprint() {
   local dir="$1"
   blank
-  info "Credential fingerprint — must match on client:"
-  md5sum "${dir}/server.crt" "${dir}/password" 2>/dev/null | sed 's/^/    /'
+  info "Auth fingerprint — must match on client:"
+  md5sum "${dir}/password" 2>/dev/null | sed 's/^/    /'
+  [[ -f "${dir}/obfs.password" ]] && md5sum "${dir}/obfs.password" 2>/dev/null | sed 's/^/    /'
 }
 
 hysteria2_fetch_from_server() {
   local name="$1" server_host="$2" pki_dir="$3"
   local ssh_user="${4:-root}" ssh_port="${5:-22}"
   local remote="${INSTALL_DIR}/pki/${name}/export"
-  local -a ssh_opts=(-p "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
   local -a scp_opts=(-P "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
   ensure_ssh_deps
   mkdir -p "$pki_dir"
   chmod 700 "$pki_dir"
-  info "Fetching Hysteria2 credentials from ${server_host}..."
+  info "Fetching Hysteria2 password from ${server_host}..."
   scp "${scp_opts[@]}" -r "${ssh_user}@${server_host}:${remote}/." "${pki_dir}/" \
     || die "SCP failed — run Hysteria2 setup on server first"
-  [[ -f "${pki_dir}/client.yaml" && -f "${pki_dir}/password" && -f "${pki_dir}/server.crt" ]] \
-    || die "Incomplete bundle from server"
-  cp -f "${pki_dir}/server.crt" "${pki_dir}/server.crt"
-  cp -f "${pki_dir}/password" "${pki_dir}/password"
-  ok "Credentials copied to ${pki_dir}"
+  [[ -f "${pki_dir}/password" ]] || die "Missing password — re-run server setup"
+  rm -f "${pki_dir}/server.crt"
+  ok "Password copied to ${pki_dir}"
 }
 
 hysteria2_acquire_client() {
   local name="$1" server_host="$2" pki_dir="$3"
-  if [[ -f "${pki_dir}/client.yaml" ]]; then
+  if [[ -f "${pki_dir}/password" ]]; then
     hysteria2_show_fingerprint "$pki_dir"
     return 0
   fi
   blank
-  warn "Hysteria2 credentials not found locally."
+  warn "Hysteria2 password not found locally."
+  info "Client needs only ${W}password${NC} (+ obfs.password if enabled) — no TLS cert."
   pick method "Get credentials from server" \
     "ssh-password — SCP from server (recommended)" \
     "manual — copy export/ by hand"
@@ -2393,21 +2411,17 @@ hysteria2_acquire_client() {
       mkdir -p "$pki_dir"
       chmod 700 "$pki_dir"
       blank
-      info "Copy these 3 files from the server: client.yaml  server.crt  password"
-      tty_line -e "  ${W}mkdir -p ${pki_dir}${NC}"
-      tty_line -e "  ${W}scp root@${server_host}:${INSTALL_DIR}/pki/${name}/export/* ${pki_dir}/${NC}"
+      info "Copy from server → client (password only):"
+      tty_line -e "  ${W}scp root@${server_host}:${INSTALL_DIR}/pki/${name}/export/password ${pki_dir}/${NC}"
+      tty_line -e "  ${W}scp root@${server_host}:${INSTALL_DIR}/pki/${name}/export/obfs.password ${pki_dir}/${NC}  ${DIM}(if obfs enabled)${NC}"
       blank
-      while [[ ! -f "${pki_dir}/client.yaml" || ! -f "${pki_dir}/server.crt" || ! -f "${pki_dir}/password" ]]; do
-        warn "Missing in ${pki_dir}:"
-        for f in client.yaml server.crt password; do
-          [[ -f "${pki_dir}/${f}" ]] && echo -e "    ${G}✓${NC} ${f}" || echo -e "    ${R}✗${NC} ${f}"
-        done
-        blank
-        if ! confirm "Files copied — check again"; then
-          die "Need client.yaml + server.crt + password in ${pki_dir}"
+      while [[ ! -f "${pki_dir}/password" ]]; do
+        warn "Missing: ${pki_dir}/password"
+        if ! confirm "Copied password — check again"; then
+          die "Need password file in ${pki_dir}"
         fi
       done
-      ok "Credentials found in ${pki_dir}"
+      ok "Password found in ${pki_dir}"
       ;;
     *) die "Unknown method: $method" ;;
   esac
@@ -2415,13 +2429,13 @@ hysteria2_acquire_client() {
 }
 
 hysteria2_push_to_client() {
-  local name="$1" client_host="$2" pki_dir="$3"
-  local ssh_user="${4:-root}" ssh_port="${5:-22}"
+  local name="$1" client_host="$2" pki_dir="$3" server_ip="$4" port="$5"
+  local ssh_user="${6:-root}" ssh_port="${7:-22}"
   local export_dir="${pki_dir}/export"
   local remote_dir="${INSTALL_DIR}/pki/${name}"
   local -a ssh_opts=(-p "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
   local -a scp_opts=(-P "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
-  hysteria2_export_client_bundle "$pki_dir"
+  hysteria2_export_client_bundle "$pki_dir" "$server_ip" "$port" "$name"
   ensure_ssh_deps
   ssh "${ssh_opts[@]}" "${ssh_user}@${client_host}" "mkdir -p '${remote_dir}' && chmod 700 '${remote_dir}'" \
     || die "SSH to client failed"
@@ -2467,14 +2481,14 @@ gen_hysteria2() {
 
   if [[ "$mode" == "server" ]]; then
     hysteria2_write_server_yaml "$pki_dir" "$port" "$server_ip" "$mtu" "$dev" "$obfs"
-    hysteria2_write_client_yaml "$pki_dir" "$port" "$local_ip" "$client_ip" "$cidr" "$mtu" "$dev" "$obfs"
-    hysteria2_export_client_bundle "$pki_dir"
+    hysteria2_export_client_bundle "$pki_dir" "$local_ip" "$port" "$name"
     hy_conf="${pki_dir}/server.yaml"
     ok "Wrote ${hy_conf}"
     blank
+    info "Client only needs ${W}password${NC} file — TLS cert stays on server."
     if confirm "Push credentials to client ${remote_ip} via SSH password"; then
       openvpn_prompt_ssh
-      hysteria2_push_to_client "$name" "$remote_ip" "$pki_dir" \
+      hysteria2_push_to_client "$name" "$remote_ip" "$pki_dir" "$local_ip" "$port" \
         "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
     else
       info "Copy ${pki_dir}/export/ to client, then run setup there (client mode)."
