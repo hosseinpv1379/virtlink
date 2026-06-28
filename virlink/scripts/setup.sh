@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.6.5"
+SCRIPT_VERSION="1.6.6"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@mioopython"
 AUTHOR="Hossein"
@@ -788,6 +788,51 @@ tunnel_start() {
   return 1
 }
 
+tunnel_remove_pki() {
+  local name="$1" cfg="$2"
+  local default_pki="${INSTALL_DIR}/pki/${name}"
+  local -a removed=()
+
+  _tunnel_rm_pki_dir() {
+    local d="$1"
+    [[ -z "$d" || ! -d "$d" ]] && return 0
+    local x
+    for x in "${removed[@]}"; do
+      [[ "$x" == "$d" ]] && return 0
+    done
+    removed+=("$d")
+    info "Removing PKI ${d}..."
+    rm -rf "$d"
+  }
+
+  if [[ -f "$cfg" ]]; then
+    local from_cfg ovpn_conf
+    from_cfg=$(awk -F= '/^\[openvpnmultu\]/{t=1; next} /^\[/{t=0} t && /^[[:space:]]*pki_dir[[:space:]]*=/{
+      v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); gsub(/^"/,""); gsub(/"$/,""); print v; exit
+    }' "$cfg" 2>/dev/null)
+    [[ -n "$from_cfg" ]] && _tunnel_rm_pki_dir "$from_cfg"
+
+    ovpn_conf=$(awk -F= '/^\[openvpn\]/{t=1; next} /^\[/{t=0} t && /^[[:space:]]*config[[:space:]]*=/{
+      v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); gsub(/^"/,""); gsub(/"$/,""); print v; exit
+    }' "$cfg" 2>/dev/null)
+    if [[ -n "$ovpn_conf" ]]; then
+      _tunnel_rm_pki_dir "$(dirname "$ovpn_conf")"
+    fi
+  fi
+
+  _tunnel_rm_pki_dir "$default_pki"
+}
+
+tunnel_remove_extras() {
+  local name="$1"
+  openvpn_stop_bundle_server "$name" 2>/dev/null || true
+  rm -rf "/var/run/virlink/${name}" 2>/dev/null || true
+  rm -f "${LOGS_DIR}/${name}-openvpn.log" \
+        "${LOGS_DIR}/${name}"-w*-openvpn.log \
+        "${LOGS_DIR}/bundle-${name}.log" 2>/dev/null || true
+  rm -f /var/run/virlink/"${name}"-w*-openvpn.pid 2>/dev/null || true
+}
+
 tunnel_remove() {
   local name="$1"
   local svc; svc="$(svc_name "$name")"
@@ -810,13 +855,17 @@ tunnel_remove() {
     journalctl --vacuum-time=1s 2>/dev/null || true
   fi
 
+  tunnel_remove_extras "$name"
+
   info "Removing log file ${log}..."
   rm -f "$log"
+
+  tunnel_remove_pki "$name" "$cfg"
 
   info "Removing config ${cfg}..."
   rm -f "$cfg"
 
-  ok "Tunnel '${name}' completely removed."
+  ok "Tunnel '${name}' completely removed (service, logs, config, PKI)."
   blank
 }
 
@@ -883,7 +932,7 @@ EOF
 
   [[ -f "${CONFIGS_DIR}/${name}.toml" ]] || die "No tunnel '${name}'"
 
-  if (( force )) || confirm "Completely remove tunnel '${name}' (service + logs + config)"; then
+  if (( force )) || confirm "Completely remove tunnel '${name}' (service + logs + config + PKI)"; then
     tunnel_remove "$name"
   else
     info "Cancelled."
@@ -4108,7 +4157,7 @@ menu_tunnel_management() {
           fi
           ;;
         remove)
-          if confirm "Completely remove tunnel '${name}' (service + logs + config)"; then
+          if confirm "Completely remove tunnel '${name}' (service + logs + config + PKI)"; then
             tunnel_remove "$name"
           fi
           ;;
