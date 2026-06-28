@@ -117,6 +117,11 @@ type WireGuardCfg struct {
 	Dev    string `toml:"dev"`    // interface name (default wg-virlink0)
 }
 
+// TcpMuxCfg maps to [tcpmux] — flow-hash multiplexed TCP tunnel.
+type TcpMuxCfg struct {
+	Hash string `toml:"hash"` // fnv1a (default), 0x hex seed, decimal, or salt string
+}
+
 // AmneziaWGCfg maps to [amneziawg] — obfuscated WireGuard (awg + amneziawg kernel module).
 type AmneziaWGCfg struct {
 	Config string `toml:"config"` // path to awg-quick-style .conf file
@@ -148,6 +153,7 @@ type Config struct {
 	OpenVPN   OpenVPNCfg   `toml:"openvpn"`
 	Hysteria2 Hysteria2Cfg `toml:"hysteria2"`
 	WireGuard WireGuardCfg `toml:"wireguard"`
+	TcpMux    TcpMuxCfg    `toml:"tcpmux"`
 	AmneziaWG AmneziaWGCfg `toml:"amneziawg"`
 
 	// Convenience aliases (set after parse, not from TOML)
@@ -245,6 +251,7 @@ func setDefaults(c *Config) {
 		case "udp-obfs":        t.MTU = 1400
 		case "gre":             t.MTU = 1476
 		case "tcp":             t.MTU = 1460
+		case "tcpmux":          t.MTU = 1460
 		case "udp":             t.MTU = 1472
 		case "icmp":            t.MTU = 1472
 		case "bip":             t.MTU = 1480
@@ -272,7 +279,7 @@ func setDefaults(c *Config) {
 		case "bonded-gre-fou":           tr.Port = 5557
 		case "l2tpv3":                   tr.Port = 5059
 		case "udp-obfs":                 tr.Port = 443
-		case "tcp":                      tr.Port = 8443
+		case "tcp", "tcpmux":            tr.Port = 8443
 		case "openvpn":                  tr.Port = 1194
 		case "hysteria2":                tr.Port = 443
 		case "wireguard":                tr.Port = 51820
@@ -312,6 +319,10 @@ func setDefaults(c *Config) {
 	if s.AuthKeyOut == "" { s.AuthKeyOut = "0xa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2" }
 	if s.AuthKeyIn == ""  { s.AuthKeyIn = "0xb2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1" }
 
+	if c.TcpMux.Hash == "" && t.Type == "tcpmux" {
+		c.TcpMux.Hash = "fnv1a"
+	}
+
 	if c.Tuning.Mode == "" {
 		if t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard" || t.Type == "amneziawg" {
 			c.Tuning.Mode = tuningFast
@@ -337,7 +348,7 @@ func validate(c *Config) error {
 		"l2tpv3", "gre-fou-ipsec",
 		"udp-obfs",
 		// raw protocol tunnels
-		"gre", "tcp", "udp", "icmp", "bip", "openvpn", "hysteria2", "wireguard", "amneziawg",
+		"gre", "tcp", "tcpmux", "udp", "icmp", "bip", "openvpn", "hysteria2", "wireguard", "amneziawg",
 	}
 	ok := false
 	for _, v := range valid {

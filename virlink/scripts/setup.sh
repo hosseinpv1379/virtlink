@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.5.5"
+SCRIPT_VERSION="1.6.0"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -34,7 +34,7 @@ readonly -a KERNEL_TUNNEL_KEYS=(
   gre-fou ipip-fou bonded-gre-fou l2tpv3 gre-fou-ipsec gre
 )
 readonly -a USERSPACE_TUNNEL_KEYS=(
-  icmp udp bip tcp udp-obfs openvpn hysteria2 wireguard amneziawg
+  icmp udp bip tcp tcpmux udp-obfs openvpn hysteria2 wireguard amneziawg
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1071,6 +1071,7 @@ icmp           — ICMP Echo tunnel (proto 1)        DPI bypass
 udp            — User-space UDP tunnel             plain UDP
 bip            — BIP tunnel (proto 58)             DPI bypass
 tcp            — User-space TCP tunnel             auto-reconnect
+tcpmux         — TCP flow-hash multiplex           parallel flows · hash routing
 openvpn        — OpenVPN core (encrypted link)     UDP/TCP · high throughput
 hysteria2      — Hysteria2 QUIC tunnel             fast · censorship-resistant
 wireguard      — WireGuard (kernel crypto)         UDP · fast site-to-site
@@ -1109,6 +1110,7 @@ dispatch_tunnel_generator() {
     gre-fou-ipsec)  gen_ipsec    ;;
     gre)            gen_gre      ;;
     tcp)            gen_tcp      ;;
+    tcpmux)         gen_tcpmux   ;;
     openvpn)        gen_openvpn  ;;
     hysteria2)     gen_hysteria2 ;;
     wireguard)     gen_wireguard ;;
@@ -1202,7 +1204,7 @@ profile          = true
 profile_interval = 30
 EOF
       ;;
-    tcp)
+    tcp|tcpmux)
       cat >> "$file" << EOF
 
 [tuning]
@@ -3697,6 +3699,36 @@ EOF
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "tcp" "$port"
+}
+
+gen_tcpmux() {
+  local name mode local_ip remote_ip cidr port mtu hash cfg
+  collect_base_inputs name mode local_ip remote_ip cidr
+  blank
+  info "TCPmux — flow-hash multiplexing across parallel TCP streams (same TCP port)."
+  prompt port "TCP port" "8443"
+  prompt mtu  "MTU"      "1400"
+  prompt hash "Flow hash seed (fnv1a, 0x..., or salt string)" "fnv1a"
+  cfg="${CONFIGS_DIR}/${name}.toml"
+  cat > "$cfg" << EOF
+# virlink — ${name}  (TCPmux · flow-hash multiplex)
+[tunnel]
+type      = "tcpmux"
+mode      = "${mode}"
+local_ip  = "${local_ip}"
+remote_ip = "${remote_ip}"
+cidr      = "${cidr}"
+mtu       = ${mtu}
+
+[tcpmux]
+hash = "${hash}"
+
+EOF
+  write_transport "$cfg" "$port" "tcp" "10"
+  write_userspace_tuning "$cfg" "tcpmux"
+  add_forward_section "$cfg" "$mode"
+  LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "tcpmux" "$port"
 }
 
 gen_udp() {

@@ -35,6 +35,8 @@ func newTunnel(cfg *Config) (Tunnel, error) {
 		return &GreTunnel{cfg: cfg}, nil
 	case "tcp":
 		return &TcpTunnel{cfg: cfg}, nil
+	case "tcpmux":
+		return &TcpMuxTunnel{cfg: cfg}, nil
 	case "openvpn":
 		return &OpenvpnTunnel{cfg: cfg}, nil
 	case "hysteria2":

@@ -43,14 +43,14 @@ func kernelTunnelWireDown(cfg *Config) {
 }
 
 func tcpTunnelWireUp(cfg *Config) error {
-	if !wireSpoofEnabled(cfg) || cfg.Tunnel.Type != "tcp" {
+	if !wireSpoofEnabled(cfg) || (cfg.Tunnel.Type != "tcp" && cfg.Tunnel.Type != "tcpmux") {
 		return nil
 	}
 	return applyTCPWireMangle(cfg)
 }
 
 func tcpTunnelWireDown(cfg *Config) {
-	if !wireSpoofEnabled(cfg) || cfg.Tunnel.Type != "tcp" {
+	if !wireSpoofEnabled(cfg) || (cfg.Tunnel.Type != "tcp" && cfg.Tunnel.Type != "tcpmux") {
 		return
 	}
 	restoreKernelMangle()
