@@ -100,7 +100,7 @@ func (t *AmneziaWGTunnel) Up() error {
 	}
 
 	step("creating AmneziaWG interface " + dev + "...")
-	if err := applyAmneziaWGConf(dev, awg.Config, conf, c.Tunnel.MTU); err != nil {
+	if err := applyAmneziaWGConf(dev, conf, c.Tunnel.MTU); err != nil {
 		t.doClean()
 		return err
 	}
@@ -146,18 +146,57 @@ func (t *AmneziaWGTunnel) Up() error {
 	return nil
 }
 
-func applyAmneziaWGConf(dev, confPath string, conf *wgConf, mtu int) error {
+func applyAmneziaWGConf(dev string, conf *wgConf, mtu int) error {
 	nlDown(dev)
 
 	if err := run("ip", "link", "add", dev, "type", "amneziawg"); err != nil {
 		return fmt.Errorf("ip link add: %w (try: modprobe amneziawg; install PPA amnezia/ppa)", err)
 	}
 
-	if err := run("awg", "setconf", dev, confPath); err != nil {
+	privKey := conf.iface.kv["privatekey"]
+	if err := wgSetKey(dev, "private-key", privKey, "awg"); err != nil {
 		nlDown(dev)
-		return fmt.Errorf("awg setconf: %w", err)
+		return err
 	}
-	logOK("awg setconf applied (keys, peers, obfuscation params)")
+
+	for _, p := range []struct{ arg, key string }{
+		{"jc", "jc"}, {"jmin", "jmin"}, {"jmax", "jmax"},
+		{"s1", "s1"}, {"s2", "s2"},
+		{"h1", "h1"}, {"h2", "h2"}, {"h3", "h3"}, {"h4", "h4"},
+	} {
+		if v := conf.iface.kv[p.key]; v != "" {
+			if err := run("awg", "set", dev, p.arg, v); err != nil {
+				nlDown(dev)
+				return fmt.Errorf("awg %s: %w", p.arg, err)
+			}
+		}
+	}
+
+	if lp := conf.iface.kv["listenport"]; lp != "" {
+		if err := run("awg", "set", dev, "listen-port", lp); err != nil {
+			nlDown(dev)
+			return fmt.Errorf("awg listen-port: %w", err)
+		}
+		logOK("listen-port " + lp + " UDP")
+	}
+
+	pubKey := conf.peer.kv["publickey"]
+	args := []string{"set", dev, "peer", pubKey}
+	if ips := conf.peer.kv["allowedips"]; ips != "" {
+		args = append(args, "allowed-ips", ips)
+	}
+	if ep := conf.peer.kv["endpoint"]; ep != "" {
+		args = append(args, "endpoint", ep)
+		logOK("peer endpoint " + ep)
+	}
+	if ka := conf.peer.kv["persistentkeepalive"]; ka != "" {
+		args = append(args, "persistent-keepalive", ka)
+	}
+	if err := run("awg", args...); err != nil {
+		nlDown(dev)
+		return fmt.Errorf("awg peer: %w", err)
+	}
+	logOK("awg configured (keys, peer, obfuscation params)")
 
 	if addr := conf.iface.kv["address"]; addr != "" {
 		for _, a := range strings.Split(addr, ",") {
@@ -171,13 +210,6 @@ func applyAmneziaWGConf(dev, confPath string, conf *wgConf, mtu int) error {
 			}
 			logOK("address " + a)
 		}
-	}
-
-	if lp := conf.iface.kv["listenport"]; lp != "" {
-		logOK("listen-port " + lp + " UDP")
-	}
-	if ep := conf.peer.kv["endpoint"]; ep != "" {
-		logOK("peer endpoint " + ep)
 	}
 
 	l, err := netlink.LinkByName(dev)
