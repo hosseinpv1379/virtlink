@@ -39,6 +39,8 @@ func newTunnel(cfg *Config) (Tunnel, error) {
 		return &TcpMuxTunnel{cfg: cfg}, nil
 	case "openvpn":
 		return &OpenvpnTunnel{cfg: cfg}, nil
+	case "openvpnmultu":
+		return &OpenvpnMultuTunnel{cfg: cfg}, nil
 	case "hysteria2":
 		return &Hysteria2Tunnel{cfg: cfg}, nil
 	case "wireguard":

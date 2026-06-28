@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-const version = "2.14.3"
+const version = "2.14.4"
 
 func Main() {
 	cfgFile   := flag.String("c", "", "path to config.toml")
@@ -97,6 +97,7 @@ Tunnel types  ([tunnel] type = "..." in config.toml):
   tcp             User-space TCP tunnel      port 8443
   tcpmux          TCP flow-hash multiplex    port 8443
   openvpn         OpenVPN (openvpn core)     port 1194
+  openvpnmultu    OpenVPN multi-worker ECMP  ports 1194+
   hysteria2       Hysteria2 QUIC tunnel      port 443
   wireguard       WireGuard (kernel WG)      port 51820
   amneziawg       AmneziaWG obfuscated WG     UDP · DPI-resistant

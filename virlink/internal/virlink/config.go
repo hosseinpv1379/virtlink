@@ -105,6 +105,12 @@ type OpenVPNCfg struct {
 	DCO     *bool  `toml:"dco"`     // nil=auto, true=force enable-dco, false=disable
 }
 
+// OpenVPNMultuCfg maps to [openvpnmultu] — N parallel openvpn + ECMP load-balancing.
+type OpenVPNMultuCfg struct {
+	PKIDir  string `toml:"pki_dir"`  // directory with worker-0.conf … worker-N.conf
+	Workers int    `toml:"workers"`  // parallel openvpn instances (2–8)
+}
+
 // Hysteria2Cfg maps to [hysteria2]
 type Hysteria2Cfg struct {
 	Config string `toml:"config"` // path to hysteria2 YAML config
@@ -150,7 +156,8 @@ type Config struct {
 	Obfs      ObfsCfg      `toml:"obfs"`
 	Health    HealthCfg    `toml:"health"`
 	Mangle    MangleCfg    `toml:"mangle"`
-	OpenVPN   OpenVPNCfg   `toml:"openvpn"`
+	OpenVPN       OpenVPNCfg       `toml:"openvpn"`
+	OpenVPNMultu  OpenVPNMultuCfg  `toml:"openvpnmultu"`
 	Hysteria2 Hysteria2Cfg `toml:"hysteria2"`
 	WireGuard WireGuardCfg `toml:"wireguard"`
 	TcpMux    TcpMuxCfg    `toml:"tcpmux"`
@@ -261,10 +268,10 @@ func setDefaults(c *Config) {
 		default:                t.MTU = 1420
 		}
 	}
-	if tr.Proto == "" && (t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard" || t.Type == "amneziawg") {
+	if tr.Proto == "" && (t.Type == "openvpn" || t.Type == "openvpnmultu" || t.Type == "hysteria2" || t.Type == "wireguard" || t.Type == "amneziawg") {
 		tr.Proto = "udp"
 	}
-	if t.MTU == 0 && t.Type == "openvpn" {
+	if t.MTU == 0 && (t.Type == "openvpn" || t.Type == "openvpnmultu") {
 		if tr.Proto == "tcp" {
 			t.MTU = 1400
 		} else {
@@ -280,7 +287,7 @@ func setDefaults(c *Config) {
 		case "l2tpv3":                   tr.Port = 5059
 		case "udp-obfs":                 tr.Port = 443
 		case "tcp", "tcpmux":            tr.Port = 8443
-		case "openvpn":                  tr.Port = 1194
+		case "openvpn", "openvpnmultu": tr.Port = 1194
 		case "hysteria2":                tr.Port = 443
 		case "wireguard":                tr.Port = 51820
 		case "amneziawg":                tr.Port = 51820
@@ -348,7 +355,7 @@ func validate(c *Config) error {
 		"l2tpv3", "gre-fou-ipsec",
 		"udp-obfs",
 		// raw protocol tunnels
-		"gre", "tcp", "tcpmux", "udp", "icmp", "bip", "openvpn", "hysteria2", "wireguard", "amneziawg",
+		"gre", "tcp", "tcpmux", "udp", "icmp", "bip", "openvpn", "openvpnmultu", "hysteria2", "wireguard", "amneziawg",
 	}
 	ok := false
 	for _, v := range valid {
@@ -378,6 +385,14 @@ func validate(c *Config) error {
 	if wireSpoofEnabled(c) {
 		if err := validateWireSpoofTunnel(c.Tunnel.Type); err != nil {
 			return err
+		}
+	}
+	if c.Tunnel.Type == "openvpnmultu" {
+		if c.OpenVPNMultu.PKIDir == "" {
+			return fmt.Errorf("[openvpnmultu] pki_dir is required")
+		}
+		if c.OpenVPNMultu.Workers < 2 || c.OpenVPNMultu.Workers > 8 {
+			return fmt.Errorf("[openvpnmultu] workers must be 2–8, got %d", c.OpenVPNMultu.Workers)
 		}
 	}
 	if c.Tunnel.Type == "openvpn" {
