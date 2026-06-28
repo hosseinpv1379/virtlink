@@ -6,13 +6,13 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.2.3"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
 
 OPENVPN_BUNDLE_PORT="${OPENVPN_BUNDLE_PORT:-8765}"
-OPENVPN_BUNDLE_TTL="${OPENVPN_BUNDLE_TTL:-900}"
+OPENVPN_BUNDLE_TTL="${OPENVPN_BUNDLE_TTL:-1800}"
 
 INSTALL_DIR="/opt/virlink"
 VIRLINK_BIN="${INSTALL_DIR}/virlink"
@@ -1466,13 +1466,20 @@ openvpn_fetch_pki_from_server() {
 
 openvpn_stop_bundle_server() {
   local name="$1"
+  local unit="virlink-bundle-${name}"
   local pidfile="/var/run/virlink/bundle-${name}.pid"
   local metadir="/var/run/virlink/bundle-${name}.meta"
-  [[ -f "$pidfile" ]] || return 0
-  local pid
-  pid=$(cat "$pidfile" 2>/dev/null || true)
-  [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
-  rm -f "$pidfile"
+
+  systemctl stop "$unit" 2>/dev/null || true
+  rm -f "/etc/systemd/system/${unit}.service"
+  systemctl daemon-reload 2>/dev/null || true
+
+  if [[ -f "$pidfile" ]]; then
+    local pid
+    pid=$(cat "$pidfile" 2>/dev/null || true)
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    rm -f "$pidfile"
+  fi
   if [[ -f "${metadir}/serve.dir" ]]; then
     rm -rf "$(cat "${metadir}/serve.dir" 2>/dev/null)" 2>/dev/null || true
   fi
@@ -1482,42 +1489,79 @@ openvpn_stop_bundle_server() {
   rm -rf "$metadir"
 }
 
+openvpn_verify_bundle_local() {
+  local port="$1" token="$2"
+  local url="http://127.0.0.1:${port}/${token}/bundle.tar.gz"
+  sleep 1
+  if curl -fsSL --connect-timeout 5 --max-time 30 "$url" -o /dev/null 2>/dev/null; then
+    ok "Local download test passed (${url})"
+    return 0
+  fi
+  warn "Local HTTP test failed — bundle server may not be running"
+  return 1
+}
+
 openvpn_start_bundle_server() {
   local name="$1" pki_dir="$2" port="${3:-$OPENVPN_BUNDLE_PORT}"
   local export_dir="${pki_dir}/export"
   local token serve_root bundle meta="/var/run/virlink/bundle-${name}.meta"
-  local py_cmd=() pid
+  local unit="virlink-bundle-${name}" unit_file="/etc/systemd/system/${unit}.service"
+  local py_bin log="/var/log/virlink/bundle-${name}.log"
+  local try_port started=0
 
+  require_cmd python3
   openvpn_export_client_bundle "$pki_dir" || die "Cannot create client export bundle"
   openvpn_stop_bundle_server "$name"
-  mkdir -p /var/run/virlink "$meta"
+  mkdir -p /var/run/virlink "$meta" /var/log/virlink
 
   token=$(openssl rand -hex 4 2>/dev/null || tr -dc 'a-f0-9' </dev/urandom | head -c 8)
-  serve_root=$(mktemp -d "/tmp/virlink-serve-${name}.XXXXXX")
-  bundle="${serve_root}/bundle.tar.gz"
-  mkdir -p "${serve_root}/${token}"
-  tar -czf "$bundle" -C "$export_dir" .
-  cp "$bundle" "${serve_root}/${token}/bundle.tar.gz"
+  py_bin=$(command -v python3)
 
-  if command -v python3 &>/dev/null; then
-    py_cmd=(python3 -m http.server "$port" --bind 0.0.0.0)
-  elif command -v python &>/dev/null; then
-    py_cmd=(python -m SimpleHTTPServer "$port")
-  else
+  for try_port in "$port" 8765 8080 8888 9443; do
+    serve_root=$(mktemp -d "/tmp/virlink-serve-${name}.XXXXXX")
+    bundle="${serve_root}/bundle.tar.gz"
+    mkdir -p "${serve_root}/${token}"
+    tar -czf "$bundle" -C "$export_dir" .
+    cp "$bundle" "${serve_root}/${token}/bundle.tar.gz"
+
+    cat > "$unit_file" << EOF
+[Unit]
+Description=virlink OpenVPN credential download (${name})
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${serve_root}
+ExecStart=${py_bin} -m http.server ${try_port} --bind 0.0.0.0
+StandardOutput=append:${log}
+StandardError=append:${log}
+Restart=no
+RuntimeMaxSec=${OPENVPN_BUNDLE_TTL}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    if systemctl start "$unit" 2>/dev/null && systemctl is-active --quiet "$unit"; then
+      if openvpn_verify_bundle_local "$try_port" "$token"; then
+        port="$try_port"
+        started=1
+        break
+      fi
+    fi
+    systemctl stop "$unit" 2>/dev/null || true
+    rm -f "$unit_file"
     rm -rf "$serve_root"
-    die "python3 not found — use SSH or manual copy instead"
-  fi
+    systemctl daemon-reload 2>/dev/null || true
+  done
 
-  (cd "$serve_root" && "${py_cmd[@]}" >/dev/null 2>&1) &
-  pid=$!
-  sleep 0.5
-  kill -0 "$pid" 2>/dev/null || { rm -rf "$serve_root"; die "HTTP server failed to start on port ${port}"; }
+  (( started )) || die "Could not start HTTP download server — use SSH password on client instead"
 
-  echo "$pid" > "/var/run/virlink/bundle-${name}.pid"
-  echo "$serve_root" > "${meta}/serve.dir"
-  echo "$bundle" > "${meta}/bundle.tgz"
   echo "$token" > "${meta}/token"
   echo "$port" > "${meta}/port"
+  echo "$serve_root" > "${meta}/serve.dir"
+  echo "$bundle" > "${meta}/bundle.tgz"
+  systemctl show -p MainPID --value "$unit" > "/var/run/virlink/bundle-${name}.pid" 2>/dev/null || true
 
   (
     sleep "$OPENVPN_BUNDLE_TTL"
@@ -1530,9 +1574,26 @@ openvpn_start_bundle_server() {
 
 openvpn_allow_bundle_firewall() {
   local port="${1:-$OPENVPN_BUNDLE_PORT}"
+  openvpn_allow_bundle_firewall_port "$port"
+}
+
+openvpn_allow_bundle_firewall_port() {
+  local port="${1:-$OPENVPN_BUNDLE_PORT}"
+
   if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-    info "Opening UFW TCP/${port} for credential download..."
+    info "Opening UFW TCP/${port}..."
     ufw allow "${port}/tcp" comment 'virlink openvpn bundle' >/dev/null 2>&1 || true
+  fi
+
+  if command -v firewall-cmd &>/dev/null && systemctl is-active firewalld &>/dev/null; then
+    firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+
+  if command -v iptables &>/dev/null; then
+    if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+      iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+    fi
   fi
 }
 
@@ -1569,7 +1630,12 @@ openvpn_show_bundle_instructions() {
   tty_line -e "  ${DIM}One-liner on client:${NC}"
   tty_line -e "  ${W}curl -fsSL http://${server_ip}:${port}/${token}/bundle.tar.gz | sudo tar -xzf - -C ${INSTALL_DIR}/pki/${name}/${NC}"
   sep_thin
-  info "Token also saved: ${INSTALL_DIR}/pki/${name}/export/COPY_TO_CLIENT.txt"
+  tty_line -e "  ${Y}${BOLD}Hetzner / cloud firewall:${NC} allow inbound ${BOLD}TCP ${port}${NC} from client IP"
+  tty_line -e "  ${DIM}Hetzner: Cloud Console → Firewalls → add rule TCP ${port}${NC}"
+  tty_line -e "  ${DIM}If download fails on client: choose ${C}ssh-password${NC} (uses port 22, no keys needed)"
+  sep_thin
+  info "Token saved: ${INSTALL_DIR}/pki/${name}/export/COPY_TO_CLIENT.txt"
+  info "Download log: /var/log/virlink/bundle-${name}.log"
 }
 
 openvpn_fetch_pki_via_http() {
@@ -1591,14 +1657,26 @@ openvpn_fetch_pki_via_http() {
   [[ -n "$token" ]] || die "Token is required — start download on server first."
 
   info "Downloading from http://${server_host}:${port}/${token}/bundle.tar.gz ..."
-  if ! curl -fsSL --connect-timeout 20 --max-time 120 \
+  if curl -fsSL --connect-timeout 20 --max-time 120 \
       "http://${server_host}:${port}/${token}/bundle.tar.gz" \
-      | tar -xzf - -C "$pki_dir"; then
-    die "Download failed — check token/port, server download still running, and firewall TCP/${port}"
+      | tar -xzf - -C "$pki_dir" 2>/dev/null; then
+    openvpn_strip_server_secrets "$pki_dir"
+    ok "PKI downloaded from server (HTTP)"
+    return 0
   fi
 
-  openvpn_strip_server_secrets "$pki_dir"
-  ok "PKI downloaded from server (HTTP)"
+  blank
+  warn "HTTP download failed (timeout = port ${port} blocked or server link expired)."
+  warn "Hetzner/AWS: open TCP/${port} in cloud firewall, or use SSH password (port 22)."
+  if confirm "Try SSH download with server root password?"; then
+    openvpn_prompt_ssh
+    openvpn_fetch_pki_from_server "$name" "$server_host" "$pki_dir" \
+      "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT" password
+    openvpn_strip_server_secrets "$pki_dir"
+    ok "PKI fetched via SSH password"
+    return 0
+  fi
+  die "Download failed — on server re-run setup for new token, or use ssh-password method"
 }
 
 openvpn_show_manual_copy_help() {
@@ -1631,20 +1709,20 @@ openvpn_acquire_client_pki() {
   info "Choose how to get credentials from the server (client certs only — no server private keys)."
 
   pick method_raw "Get credentials from server" \
-    "easy — HTTP download (recommended, no SSH keys)" \
-    "ssh-password — SSH/SCP (type server password when asked)" \
+    "ssh-password — SSH/SCP (recommended on Hetzner, type server password)" \
+    "easy — HTTP download (needs cloud firewall TCP port open)" \
     "ssh-key — SSH/SCP (automatic, needs ssh-copy-id first)" \
     "manual — files already copied / copy by hand"
   method="$(label_key "$method_raw")"
 
   case "$method" in
-    easy)
-      openvpn_fetch_pki_via_http "$name" "$server_host" "$pki_dir"
-      ;;
     ssh-password)
       openvpn_prompt_ssh
       openvpn_fetch_pki_from_server "$name" "$server_host" "$pki_dir" \
         "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT" password
+      ;;
+    easy)
+      openvpn_fetch_pki_via_http "$name" "$server_host" "$pki_dir"
       ;;
     ssh-key)
       openvpn_prompt_ssh
@@ -1666,8 +1744,8 @@ openvpn_server_send_credentials() {
 
   blank
   info "Starting credential download server for client ${client_host}..."
-  openvpn_allow_bundle_firewall "$OPENVPN_BUNDLE_PORT"
   openvpn_start_bundle_server "$name" "$pki_dir"
+  openvpn_allow_bundle_firewall "$OPENVPN_BUNDLE_PORT"
   openvpn_save_bundle_info "$pki_dir" "$server_ip" "$name"
   ok "Download server running on TCP ${OPENVPN_BUNDLE_PORT}"
   openvpn_show_bundle_instructions "$server_ip" "$name"
