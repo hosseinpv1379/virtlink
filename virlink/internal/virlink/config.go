@@ -117,6 +117,15 @@ type WireGuardCfg struct {
 	Dev    string `toml:"dev"`    // interface name (default wg-virlink0)
 }
 
+// Ikev2Cfg maps to [ikev2] — strongSwan swanctl directory + xfrm interface.
+type Ikev2Cfg struct {
+	SwanctlDir string `toml:"swanctl_dir"` // e.g. /opt/virlink/pki/name/swanctl
+	Dev        string `toml:"dev"`         // xfrm interface (default ipsec0)
+	Conn       string `toml:"conn"`        // swanctl connection name (default virlink)
+	Child      string `toml:"child"`       // child SA name (default net)
+	IfID       int    `toml:"if_id"`       // xfrm if_id (auto from tunnel name if 0)
+}
+
 // MangleCfg maps to [mangle] — optional wire IP spoof (manual config only).
 // Userspace (icmp/udp/bip): IP_HDRINCL  ·  Kernel (gre-fou, gre, …): nftables mangle
 // Client: srcip=1.1.1.1 dstip=2.2.2.2  ·  Server: srcip=2.2.2.2 dstip=1.1.1.1
@@ -142,6 +151,7 @@ type Config struct {
 	OpenVPN   OpenVPNCfg   `toml:"openvpn"`
 	Hysteria2 Hysteria2Cfg `toml:"hysteria2"`
 	WireGuard WireGuardCfg `toml:"wireguard"`
+	Ikev2     Ikev2Cfg     `toml:"ikev2"`
 
 	// Convenience aliases (set after parse, not from TOML)
 	Mode     string `toml:"-"`
@@ -243,10 +253,11 @@ func setDefaults(c *Config) {
 		case "bip":             t.MTU = 1480
 		case "hysteria2":       t.MTU = 1400
 		case "wireguard":       t.MTU = 1420
+		case "ikev2":           t.MTU = 1400
 		default:                t.MTU = 1420
 		}
 	}
-	if tr.Proto == "" && (t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard") {
+	if tr.Proto == "" && (t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard" || t.Type == "ikev2") {
 		tr.Proto = "udp"
 	}
 	if t.MTU == 0 && t.Type == "openvpn" {
@@ -268,6 +279,7 @@ func setDefaults(c *Config) {
 		case "openvpn":                  tr.Port = 1194
 		case "hysteria2":                tr.Port = 443
 		case "wireguard":                tr.Port = 51820
+		case "ikev2":                    tr.Port = 500
 		case "udp":                      tr.Port = 5060
 		// gre, icmp, bip don't use ports (raw protocol tunnels)
 		default:                         tr.Port = 5556
@@ -285,6 +297,15 @@ func setDefaults(c *Config) {
 	if c.WireGuard.Dev == "" && t.Type == "wireguard" {
 		c.WireGuard.Dev = "wg-virlink0"
 	}
+	if c.Ikev2.Dev == "" && t.Type == "ikev2" {
+		c.Ikev2.Dev = "ipsec0"
+	}
+	if c.Ikev2.Conn == "" && t.Type == "ikev2" {
+		c.Ikev2.Conn = ikev2ConnDefault
+	}
+	if c.Ikev2.Child == "" && t.Type == "ikev2" {
+		c.Ikev2.Child = ikev2ChildDefault
+	}
 
 	l := &c.L2TP
 	if l.ClientTunnelID == 0  { l.ClientTunnelID = 1000 }
@@ -301,7 +322,7 @@ func setDefaults(c *Config) {
 	if s.AuthKeyIn == ""  { s.AuthKeyIn = "0xb2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1" }
 
 	if c.Tuning.Mode == "" {
-		if t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard" {
+		if t.Type == "openvpn" || t.Type == "hysteria2" || t.Type == "wireguard" || t.Type == "ikev2" {
 			c.Tuning.Mode = tuningFast
 		} else {
 			c.Tuning.Mode = tuningBalanced
@@ -325,7 +346,7 @@ func validate(c *Config) error {
 		"l2tpv3", "gre-fou-ipsec",
 		"udp-obfs",
 		// raw protocol tunnels
-		"gre", "tcp", "udp", "icmp", "bip", "openvpn", "hysteria2", "wireguard",
+		"gre", "tcp", "udp", "icmp", "bip", "openvpn", "hysteria2", "wireguard", "ikev2",
 	}
 	ok := false
 	for _, v := range valid {
@@ -370,6 +391,11 @@ func validate(c *Config) error {
 	if c.Tunnel.Type == "wireguard" {
 		if c.WireGuard.Config == "" {
 			return fmt.Errorf("[wireguard] config path is required")
+		}
+	}
+	if c.Tunnel.Type == "ikev2" {
+		if c.Ikev2.SwanctlDir == "" {
+			return fmt.Errorf("[ikev2] swanctl_dir is required")
 		}
 	}
 	return nil

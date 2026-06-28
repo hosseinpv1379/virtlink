@@ -729,6 +729,12 @@ tunnel_start() {
       wireguard_allow_firewall_port "$(_cfg_transport_port "$cfg")"
     fi
   fi
+  if [[ "$(_cfg_tunnel_type "$cfg")" == "ikev2" ]]; then
+    ensure_ikev2_deps
+    if [[ "$(_cfg_tunnel_mode "$cfg")" == "server" ]]; then
+      ikev2_allow_firewall
+    fi
+  fi
   write_service_file "$name"
   local svc; svc="$(svc_name "$name")"
   info "Enabling service ${svc}..."
@@ -947,6 +953,7 @@ tcp            — User-space TCP tunnel             auto-reconnect
 openvpn        — OpenVPN core (encrypted link)     UDP/TCP · high throughput
 hysteria2      — Hysteria2 QUIC tunnel             fast · censorship-resistant
 wireguard      — WireGuard (kernel crypto)         UDP · fast site-to-site
+ikev2          — IKEv2 / strongSwan IPsec          UDP 500/4500 · kernel multi-core
 udp-obfs       — Obfuscated UDP (AES-256-GCM)      DPI bypass (Iran)
 EOF
 }
@@ -984,6 +991,7 @@ dispatch_tunnel_generator() {
     openvpn)        gen_openvpn  ;;
     hysteria2)     gen_hysteria2 ;;
     wireguard)     gen_wireguard ;;
+    ikev2)         gen_ikev2 ;;
     udp)            gen_udp      ;;
     icmp)           gen_icmp     ;;
     bip)            gen_bip      ;;
@@ -1115,6 +1123,10 @@ EOF
       return
       ;;
     wireguard)
+      write_openvpn_tuning "$file" "fast"
+      return
+      ;;
+    ikev2)
       write_openvpn_tuning "$file" "fast"
       return
       ;;
@@ -3178,6 +3190,298 @@ EOF
     info "Client overlay: ${client_addr}  ·  Server overlay: ${server_addr}"
   fi
   info "Test: ping peer overlay IP after both sides are up"
+}
+
+# ── IKEv2 / strongSwan helpers ────────────────────────────────────────────────
+
+_ikev2_pkg_names() {
+  case "$(_detect_pkg_mgr)" in
+    dnf|yum|zypper) echo strongswan strongswan-swanctl ;;
+    pacman)         echo strongswan ;;
+    apk)            echo strongswan swanctl ;;
+    *)              echo strongswan strongswan-swanctl strongswan-charon ;;
+  esac
+}
+
+ensure_ikev2_deps() {
+  local -a need=() pkg
+  for c in swanctl ip; do
+    command -v "$c" &>/dev/null || need+=("shell")
+  done
+  if command -v swanctl &>/dev/null && command -v ip &>/dev/null; then
+    ok "IKEv2 ready (strongSwan swanctl)"
+    systemctl enable strongswan 2>/dev/null || systemctl enable strongswan-starter 2>/dev/null || true
+    return 0
+  fi
+  require_root
+  warn "strongSwan missing — installing..."
+  for pkg in $(_ikev2_pkg_names); do
+    _pkg_install "$pkg" 2>/dev/null && break
+  done
+  command -v swanctl &>/dev/null || die "swanctl not found after install"
+  ok "strongSwan installed"
+}
+
+ikev2_allow_firewall() {
+  wireguard_allow_firewall_port 500
+  wireguard_allow_firewall_port 4500
+}
+
+ikev2_default_if_id() {
+  local name="$1" h=0 i c
+  for ((i=0; i<${#name}; i++)); do
+    c=$(printf '%d' "'${name:$i:1}")
+    h=$(( (h * 31 + c) % 60000 + 1 ))
+  done
+  (( h < 2 )) && h=42
+  echo "$h"
+}
+
+ikev2_gen_pki() {
+  local dir="$1"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  if [[ -f "$dir/ca.crt" && -f "$dir/server.crt" && -f "$dir/client.crt" ]]; then
+    ok "IKEv2 PKI already exists in ${dir}"
+    return 0
+  fi
+  info "Generating IKEv2 PKI (ECDSA P-256, CA + server + client)..."
+  openvpn_openssl_extfile "$dir"
+  openssl ecparam -genkey -name prime256v1 -out "$dir/ca.key" \
+    || die "OpenSSL: cannot generate CA key"
+  openvpn_create_ca_cert "$dir"
+  openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" \
+    || die "OpenSSL: cannot generate server key"
+  openvpn_sign_server_cert "$dir"
+  openssl ecparam -genkey -name prime256v1 -out "$dir/client.key" \
+    || die "OpenSSL: cannot generate client key"
+  openvpn_sign_client_cert "$dir"
+  rm -f "$dir/server.csr" "$dir/client.csr"
+  chmod 600 "$dir"/*.key 2>/dev/null || true
+  chmod 644 "$dir"/*.crt 2>/dev/null || true
+  ok "IKEv2 PKI generated"
+}
+
+ikev2_install_swanctl_layout() {
+  local pki_dir="$1" mode="$2"
+  local swanctl="${pki_dir}/swanctl"
+  mkdir -p "${swanctl}/conf.d" "${swanctl}/x509ca" "${swanctl}/x509" "${swanctl}/private"
+  cp -f "${pki_dir}/ca.crt" "${swanctl}/x509ca/"
+  if [[ "$mode" == "server" ]]; then
+    cp -f "${pki_dir}/server.crt" "${swanctl}/x509/"
+    cp -f "${pki_dir}/server.key" "${swanctl}/private/"
+    rm -f "${swanctl}/private/client.key" "${swanctl}/x509/client.crt"
+  else
+    cp -f "${pki_dir}/client.crt" "${swanctl}/x509/"
+    cp -f "${pki_dir}/client.key" "${swanctl}/private/"
+    rm -f "${swanctl}/private/server.key" "${swanctl}/x509/server.crt"
+  fi
+  chmod 600 "${swanctl}/private/"* 2>/dev/null || true
+  chmod 644 "${swanctl}/x509/"* "${swanctl}/x509ca/"* 2>/dev/null || true
+}
+
+ikev2_write_swanctl_conf() {
+  local mode="$1" local_ip="$2" remote_ip="$3" cidr="$4" if_id="$5" swanctl_dir="$6"
+  local start_action local_cert remote_id local_id
+  if [[ "$mode" == "server" ]]; then
+    start_action="trap"
+    local_cert="server.crt"
+    local_id="$local_ip"
+    remote_id="$remote_ip"
+  else
+    start_action="start"
+    local_cert="client.crt"
+    local_id="$local_ip"
+    remote_id="$remote_ip"
+  fi
+  cat > "${swanctl_dir}/conf.d/virlink.conf" << EOF
+connections {
+  virlink {
+    version = 2
+    mobike = no
+    reauth_time = 0
+
+    local_addrs = ${local_ip}
+    remote_addrs = ${remote_ip}
+
+    local {
+      auth = pubkey
+      certs = ${local_cert}
+      id = ${local_id}
+    }
+    remote {
+      auth = pubkey
+      id = ${remote_id}
+    }
+
+    children {
+      net {
+        local_ts = ${cidr}
+        remote_ts = ${cidr}
+        esp_proposals = aes256gcm-modp2048,aes128gcm-modp2048,aes256-sha256-modp2048
+        start_action = ${start_action}
+        close_action = restart
+        dpd_action = restart
+        if_id_in = ${if_id}
+        if_id_out = ${if_id}
+      }
+    }
+  }
+}
+EOF
+}
+
+ikev2_build_client_swanctl() {
+  local pki_dir="$1" server_ip="$2" client_ip="$3" cidr="$4" if_id="$5"
+  local target="${pki_dir}/swanctl-client"
+  mkdir -p "${target}/conf.d" "${target}/x509ca" "${target}/x509" "${target}/private"
+  cp -f "${pki_dir}/ca.crt" "${target}/x509ca/"
+  cp -f "${pki_dir}/client.crt" "${target}/x509/"
+  cp -f "${pki_dir}/client.key" "${target}/private/"
+  chmod 600 "${target}/private/client.key"
+  ikev2_write_swanctl_conf client "$client_ip" "$server_ip" "$cidr" "$if_id" "$target"
+}
+
+ikev2_strip_server_secrets() {
+  local dir="$1"
+  rm -f "$dir/ca.key" "$dir/server.key" "$dir/server.crt"
+  rm -f "$dir/swanctl/private/server.key" "$dir/swanctl/x509/server.crt" 2>/dev/null || true
+}
+
+ikev2_fetch_from_server() {
+  local name="$1" server_host="$2" pki_dir="$3" ssh_user="$4" ssh_port="$5"
+  local remote="${INSTALL_DIR}/pki/${name}"
+  ensure_ssh_deps
+  mkdir -p "$pki_dir"
+  info "Fetching IKEv2 client credentials from ${server_host}..."
+  scp -P "$ssh_port" -o StrictHostKeyChecking=accept-new -r \
+    "${ssh_user}@${server_host}:${remote}/swanctl-client" \
+    "${pki_dir}/swanctl" 2>/dev/null || \
+  scp -P "$ssh_port" -o StrictHostKeyChecking=accept-new -r \
+    "${ssh_user}@${server_host}:${remote}/swanctl" \
+    "$pki_dir/" || die "SCP failed — check SSH access to ${server_host}"
+  ikev2_strip_server_secrets "$pki_dir"
+  ok "IKEv2 swanctl fetched from ${server_host}"
+}
+
+ikev2_acquire_client_pki() {
+  local name="$1" server_host="$2" pki_dir="$3"
+  if [[ -d "${pki_dir}/swanctl/conf.d" && -f "${pki_dir}/swanctl/x509ca/ca.crt" ]]; then
+    ok "IKEv2 client swanctl present"
+    return 0
+  fi
+  blank
+  info "Client needs swanctl/ tree from the server (CA + client cert/key + conf)."
+  if confirm "Fetch from server ${server_host} via SSH?"; then
+    openvpn_prompt_ssh
+    ikev2_fetch_from_server "$name" "$server_host" "$pki_dir" \
+      "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
+    return 0
+  fi
+  die "Missing IKEv2 swanctl in ${pki_dir} — copy from server or use SSH fetch"
+}
+
+ikev2_push_to_client() {
+  local name="$1" client_host="$2" pki_dir="$3" ssh_user="$4" ssh_port="$5"
+  ensure_ssh_deps
+  local remote="${INSTALL_DIR}/pki/${name}"
+  local src="${pki_dir}/swanctl-client"
+  [[ -d "$src" ]] || src="${pki_dir}/swanctl"
+  info "Pushing IKEv2 client swanctl to ${client_host}..."
+  ssh -p "$ssh_port" -o StrictHostKeyChecking=accept-new \
+    "${ssh_user}@${client_host}" "mkdir -p '${remote}' && chmod 700 '${remote}'"
+  scp -P "$ssh_port" -o StrictHostKeyChecking=accept-new -r \
+    "${src}" "${ssh_user}@${client_host}:${remote}/swanctl" || die "SCP push failed"
+  ok "IKEv2 swanctl pushed to ${client_host}:${remote}/swanctl"
+}
+
+gen_ikev2() {
+  local name mode local_ip remote_ip cidr mtu dev pki_dir swanctl_dir cfg hb if_id port
+  collect_base_inputs name mode local_ip remote_ip cidr
+  blank
+  info "IKEv2 site-to-site — strongSwan kernel IPsec (multi-core ESP, single overlay IP)."
+  prompt mtu "Overlay MTU" "1400"
+  dev="ipsec0"
+  port=500
+
+  ensure_ikev2_deps
+  pki_dir="${INSTALL_DIR}/pki/${name}"
+  mkdir -p "$pki_dir"
+
+  if [[ "$mode" == "server" ]]; then
+    ikev2_gen_pki "$pki_dir"
+  else
+    ikev2_acquire_client_pki "$name" "$remote_ip" "$pki_dir"
+  fi
+
+  if_id="$(ikev2_default_if_id "$name")"
+  swanctl_dir="${pki_dir}/swanctl"
+
+  if [[ "$mode" == "server" ]]; then
+    ikev2_install_swanctl_layout "$pki_dir" server
+    ikev2_write_swanctl_conf server "$local_ip" "$remote_ip" "$cidr" "$if_id" "$swanctl_dir"
+    ikev2_build_client_swanctl "$pki_dir" "$local_ip" "$remote_ip" "$cidr" "$if_id"
+    ikev2_allow_firewall
+    ok "Wrote ${swanctl_dir}/conf.d/virlink.conf  if_id=${if_id}"
+  else
+    [[ -d "$swanctl_dir" ]] || die "Missing ${swanctl_dir}"
+    ikev2_install_swanctl_layout "$pki_dir" client
+    ikev2_write_swanctl_conf client "$local_ip" "$remote_ip" "$cidr" "$if_id" "$swanctl_dir"
+    ok "Wrote ${swanctl_dir}/conf.d/virlink.conf  if_id=${if_id}"
+    blank
+    warn "Start the IKEv2 SERVER on ${remote_ip} first."
+    warn "Firewall: allow UDP 500 and 4500 to server (cloud firewall too)."
+  fi
+
+  hb=20
+  cfg="${CONFIGS_DIR}/${name}.toml"
+  cat > "$cfg" << EOF
+# virlink — ${name}  (IKEv2 / strongSwan site-to-site)
+[tunnel]
+type      = "ikev2"
+mode      = "${mode}"
+local_ip  = "${local_ip}"
+remote_ip = "${remote_ip}"
+cidr      = "${cidr}"
+mtu       = ${mtu}
+name      = "${name}"
+
+[transport]
+port               = ${port}
+proto              = "udp"
+heartbeat_interval = ${hb}
+
+[ikev2]
+swanctl_dir = "${swanctl_dir}"
+dev         = "${dev}"
+conn        = "virlink"
+child       = "net"
+if_id       = ${if_id}
+
+[security]
+encryption = true
+EOF
+  write_openvpn_tuning "$cfg" "fast"
+  add_forward_section "$cfg" "$mode"
+  LAST_CFG_PATH="$cfg"
+
+  if [[ "$mode" == "server" ]]; then
+    blank
+    info "Privacy: CA/server private keys stay on this host only."
+    info "Client needs: ${pki_dir}/swanctl/ (client cert layout) — use push or manual copy."
+    if confirm "Push client swanctl to ${remote_ip} via SSH"; then
+      openvpn_prompt_ssh
+      ikev2_push_to_client "$name" "$remote_ip" "$pki_dir" \
+        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
+    fi
+    blank
+    warn "Start this server tunnel before the client: virlink-setup → Start tunnel → ${name}"
+    warn "Firewall: allow UDP 500/4500 from client ${remote_ip}"
+  fi
+
+  blank
+  warn "Firewall: allow UDP 500 and 4500 between ${local_ip} and ${remote_ip}"
+  info "Test: ping peer overlay IP after IKE SA is up (swanctl --list-sas)"
 }
 
 gen_tcp() {

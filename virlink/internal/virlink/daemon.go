@@ -158,6 +158,21 @@ func printHeartbeat(tun Tunnel, fwdRules []ForwardRule, since time.Time, hm *Hea
 			lastProbe = "no wg handshake"
 		}
 	}
+	if ik, ok := tun.(*Ikev2Tunnel); ok {
+		conn := ik.cfg.Ikev2.Conn
+		if conn == "" {
+			conn = ikev2ConnDefault
+		}
+		if ikev2SAEstablished(conn) {
+			if hsState == "" || hsState == "waiting" {
+				hsState = "ike-ok"
+			}
+			lastProbe = "ikev2 SA up"
+		} else if hsState == "" || hsState == "waiting" {
+			hsState = "ike-wait"
+			lastProbe = "no IKE SA"
+		}
+	}
 
 	msg := fmtHeartbeat(dev, linkState, hsState, lastProbe,
 		rxB, txB, rxPkt, txPkt, uptime)

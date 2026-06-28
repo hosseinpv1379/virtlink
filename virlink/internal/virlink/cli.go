@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-const version = "2.11.20"
+const version = "2.12.0"
 
 func Main() {
 	cfgFile  := flag.String("c", "", "path to config.toml")
@@ -89,6 +89,7 @@ Tunnel types  ([tunnel] type = "..." in config.toml):
   openvpn         OpenVPN (openvpn core)     port 1194
   hysteria2       Hysteria2 QUIC tunnel      port 443
   wireguard       WireGuard (kernel WG)      port 51820
+  ikev2           IKEv2 / strongSwan         UDP 500 / 4500
   udp             User-space UDP tunnel      port 5060
   icmp            ICMP Echo tunnel (proto 1) raw
   bip             BIP tunnel (proto 58)      raw
