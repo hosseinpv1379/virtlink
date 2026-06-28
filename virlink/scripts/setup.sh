@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.10"
+SCRIPT_VERSION="1.2.11"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -341,23 +341,7 @@ check_update() {
   fi
 }
 
-do_update_core() {
-  require_root
-  [[ -z "$LATEST_TAG" ]] && { info "Checking latest release..."; check_update; }
-  if (( ! UPDATE_AVAILABLE )); then
-    ok "Core is already up to date."
-    blank; press_enter; return
-  fi
-  info "Downloading virlink ${LATEST_TAG}..."
-  safe_download "https://github.com/${GITHUB_REPO}/releases/latest/download/virlink" \
-    "${VIRLINK_BIN}.new"
-  chmod +x "${VIRLINK_BIN}.new"
-  mv "${VIRLINK_BIN}.new" "$VIRLINK_BIN"
-  ok "Core updated to ${LATEST_TAG}."
-  blank; press_enter
-}
-
-do_update_script() {
+_install_latest_setup_script() {
   require_root
   ensure_deps
   mkdir -p "$INSTALL_DIR"
@@ -368,7 +352,31 @@ do_update_script() {
   _verify_setup_script "${INSTALL_DIR}/setup.sh.new"
   mv "${INSTALL_DIR}/setup.sh.new" "${INSTALL_DIR}/setup.sh"
   ln -sf "${INSTALL_DIR}/setup.sh" /usr/local/bin/virlink-setup 2>/dev/null || true
-  ok "Setup script updated — restarting..."
+  local sv
+  sv=$(grep '^SCRIPT_VERSION=' "${INSTALL_DIR}/setup.sh" | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+  ok "Setup script updated (v${sv})."
+}
+
+do_update_core() {
+  require_root
+  [[ -z "$LATEST_TAG" ]] && { info "Checking latest release..."; check_update; }
+  if (( UPDATE_AVAILABLE )); then
+    info "Downloading virlink ${LATEST_TAG}..."
+    safe_download "https://github.com/${GITHUB_REPO}/releases/latest/download/virlink" \
+      "${VIRLINK_BIN}.new"
+    chmod +x "${VIRLINK_BIN}.new"
+    mv "${VIRLINK_BIN}.new" "$VIRLINK_BIN"
+    ok "Core updated to ${LATEST_TAG}."
+  else
+    ok "Core is already up to date."
+  fi
+  _install_latest_setup_script
+  ensure_openvpn_deps
+  blank; press_enter
+}
+
+do_update_script() {
+  _install_latest_setup_script
   ensure_openvpn_deps
   blank
   exec "${INSTALL_DIR}/setup.sh"
@@ -377,17 +385,20 @@ do_update_script() {
 do_update_all() {
   require_root
   [[ -z "$LATEST_TAG" ]] && { info "Checking latest release..."; check_update; }
-  if (( ! UPDATE_AVAILABLE )); then
-    ok "Already up to date."
-    exit 0
+  if (( UPDATE_AVAILABLE )); then
+    info "Downloading virlink ${LATEST_TAG}..."
+    safe_download "https://github.com/${GITHUB_REPO}/releases/latest/download/virlink" \
+      "${VIRLINK_BIN}.new"
+    chmod +x "${VIRLINK_BIN}.new"
+    mv "${VIRLINK_BIN}.new" "$VIRLINK_BIN"
+    ok "Core updated to ${LATEST_TAG}."
+  else
+    ok "Core is already up to date."
   fi
-  info "Downloading virlink ${LATEST_TAG}..."
-  safe_download "https://github.com/${GITHUB_REPO}/releases/latest/download/virlink" \
-    "${VIRLINK_BIN}.new"
-  chmod +x "${VIRLINK_BIN}.new"
-  mv "${VIRLINK_BIN}.new" "$VIRLINK_BIN"
-  ok "Core updated to ${LATEST_TAG}."
-  do_update_script
+  _install_latest_setup_script
+  ensure_openvpn_deps
+  blank
+  exec "${INSTALL_DIR}/setup.sh"
 }
 
 do_remove_core() {
@@ -2367,12 +2378,16 @@ menu_update_core() {
   echo -e "  Latest    : ${W}${LATEST_TAG}${NC}"
   blank
   if (( UPDATE_AVAILABLE )); then
-    if confirm "Update core to ${LATEST_TAG}"; then
+    if confirm "Update core and setup script to ${LATEST_TAG}"; then
       do_update_core
       return
     fi
   else
     ok "Core is already up to date."
+    if confirm "Sync setup script from latest release anyway"; then
+      do_update_core
+      return
+    fi
   fi
   blank
   press_enter
