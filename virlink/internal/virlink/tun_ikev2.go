@@ -234,15 +234,21 @@ func ikev2DefaultIfID(name string) int {
 }
 
 func ensureCharonRunning() error {
-	for _, svc := range []string{"strongswan", "strongswan-starter", "charon-systemd"} {
+	for _, svc := range []string{"strongswan-starter", "charon-systemd", "strongswan"} {
+		_ = run("systemctl", "enable", svc)
 		_ = run("systemctl", "start", svc)
 	}
-	time.Sleep(500 * time.Millisecond)
-	if out, err := runOut("swanctl", "--version"); err == nil {
-		logInfo(strings.TrimSpace(out))
-		return nil
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat("/var/run/charon.vici"); err == nil {
+			if _, err := runOut("swanctl", "--list-conns"); err == nil {
+				logOK("charon ready (swanctl/vici)")
+				return nil
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("charon not responding — run: systemctl start strongswan && swanctl --version")
+	return fmt.Errorf("charon not running — install strongswan-starter, then: systemctl start strongswan-starter (check: ls /var/run/charon.vici)")
 }
 
 func swanctlLoadAll(dir string) error {

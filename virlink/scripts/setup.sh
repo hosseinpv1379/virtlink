@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -3199,26 +3199,49 @@ _ikev2_pkg_names() {
     dnf|yum|zypper) echo strongswan strongswan-swanctl ;;
     pacman)         echo strongswan ;;
     apk)            echo strongswan swanctl ;;
-    *)              echo strongswan strongswan-swanctl strongswan-charon ;;
+    *)              echo strongswan strongswan-swanctl strongswan-charon strongswan-starter ;;
   esac
 }
 
+ikev2_start_charon() {
+  local svc started=0
+  for svc in strongswan-starter charon-systemd strongswan; do
+    if systemctl list-unit-files "${svc}.service" &>/dev/null 2>&1; then
+      systemctl enable "$svc" 2>/dev/null || true
+      if systemctl start "$svc" 2>/dev/null; then
+        started=1
+      fi
+    fi
+  done
+  local i
+  for ((i=0; i<20; i++)); do
+    [[ -S /var/run/charon.vici ]] && return 0
+    sleep 0.5
+  done
+  (( started )) || return 1
+  warn "charon started but /var/run/charon.vici missing — check: journalctl -u strongswan-starter -n 30"
+  return 1
+}
+
 ensure_ikev2_deps() {
-  if command -v swanctl &>/dev/null && command -v ip &>/dev/null; then
-    ok "IKEv2 ready (strongSwan swanctl)"
-    systemctl enable strongswan 2>/dev/null || systemctl enable strongswan-starter 2>/dev/null || true
+  if command -v swanctl &>/dev/null && command -v ip &>/dev/null && [[ -S /var/run/charon.vici ]]; then
+    ok "IKEv2 ready (strongSwan swanctl + charon)"
     return 0
   fi
   require_root
-  warn "strongSwan missing — installing..."
-  local -a pkgs=()
-  read -ra pkgs <<< "$(_ikev2_pkg_names)"
-  _pkg_install "${pkgs[@]}"
   if ! command -v swanctl &>/dev/null; then
-    die "swanctl not found after install — run: apt install strongswan-swanctl (Debian/Ubuntu) or dnf install strongswan-swanctl"
+    warn "strongSwan missing — installing..."
+    local -a pkgs=()
+    read -ra pkgs <<< "$(_ikev2_pkg_names)"
+    _pkg_install "${pkgs[@]}"
   fi
-  systemctl enable strongswan 2>/dev/null || systemctl enable strongswan-starter 2>/dev/null || true
-  ok "strongSwan installed ($(swanctl --version 2>/dev/null | head -1 || echo swanctl))"
+  if ! command -v swanctl &>/dev/null; then
+    die "swanctl not found — run: apt install strongswan-swanctl strongswan-starter"
+  fi
+  if ! ikev2_start_charon; then
+    die "charon not running — run: apt install strongswan-starter && systemctl start strongswan-starter"
+  fi
+  ok "strongSwan ready ($(swanctl --version 2>/dev/null | head -1 || echo swanctl))"
 }
 
 ikev2_allow_firewall() {
