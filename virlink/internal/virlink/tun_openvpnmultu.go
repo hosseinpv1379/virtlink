@@ -30,10 +30,11 @@ type openvpnMultuWorker struct {
 }
 
 type OpenvpnMultuTunnel struct {
-	cfg     *Config
-	workers []openvpnMultuWorker
-	lockFd  *os.File
-	loAddr  string
+	cfg        *Config
+	workers    []openvpnMultuWorker
+	runtimeDir string
+	lockFd     *os.File
+	loAddr     string
 }
 
 func (t *OpenvpnMultuTunnel) DevName() string {
@@ -80,16 +81,19 @@ func (t *OpenvpnMultuTunnel) Up() error {
 		return err
 	}
 
+	step(fmt.Sprintf("materializing %d worker configs...", n))
+	t.runtimeDir, err = openvpnMultuMaterializeWorkers(c)
+	if err != nil {
+		t.doClean()
+		return err
+	}
+
 	t.workers = make([]openvpnMultuWorker, n)
 	for i := 0; i < n; i++ {
 		w := &t.workers[i]
 		w.index = i
 		w.dev = fmt.Sprintf("ovpnm-w%d", i)
 		w.conf = openvpnMultuWorkerConfPath(c, i)
-		if _, err := os.Stat(w.conf); err != nil {
-			t.doClean()
-			return fmt.Errorf("[openvpnmultu] missing %s — recreate tunnel with virlink-setup", w.conf)
-		}
 		w.logPath = openvpnMultuWorkerLogPath(c, i)
 		w.pidPath = openvpnMultuWorkerPIDPath(c, i)
 		_ = os.MkdirAll(filepath.Dir(w.logPath), 0o755)
@@ -138,7 +142,8 @@ func (t *OpenvpnMultuTunnel) Up() error {
 		fmt.Sprintf("workers   : %d parallel openvpn (no DCO)", n),
 		fmt.Sprintf("transport : OpenVPN %s ports %s", c.Transport.Proto, ports),
 		"routing   : ECMP /32 per-flow hash to peer overlay IP",
-		"config    : "+pkiDir+"/"+openvpnMultuConfBasename(c)+"-{0.."+fmt.Sprint(n-1)+"}.conf",
+		"pki       : "+pkiDir+"  (PKI only — worker configs internal)",
+		"runtime   : workers materialized at "+t.runtimeDir,
 		"bench     : iperf3 -P"+fmt.Sprint(n)+" -c "+peer,
 	)
 	return nil
@@ -208,18 +213,6 @@ func openvpnMultuWorkerLogPath(c *Config, i int) string {
 	return filepath.Join("/var/log/virlink", fmt.Sprintf("%s-w%d-openvpn.log", tunnelInstanceName(c), i))
 }
 
-func openvpnMultuConfBasename(c *Config) string {
-	if c.Mode == "server" {
-		return "server-worker"
-	}
-	return "worker"
-}
-
-func openvpnMultuWorkerConfPath(c *Config, i int) string {
-	return filepath.Join(c.OpenVPNMultu.PKIDir,
-		fmt.Sprintf("%s-%d.conf", openvpnMultuConfBasename(c), i))
-}
-
 func openvpnMultuWorkerPIDPath(c *Config, i int) string {
 	return filepath.Join("/var/run/virlink", fmt.Sprintf("%s-w%d-openvpn.pid", tunnelInstanceName(c), i))
 }
@@ -251,6 +244,10 @@ func (t *OpenvpnMultuTunnel) doClean() {
 	if t.lockFd != nil {
 		releaseTunnelLock(t.lockFd)
 		t.lockFd = nil
+	}
+	if t.runtimeDir != "" {
+		_ = os.RemoveAll(t.runtimeDir)
+		t.runtimeDir = ""
 	}
 	restoreTunnelTuning()
 }
@@ -290,13 +287,14 @@ func (t *OpenvpnMultuTunnel) stopWorker(w *openvpnMultuWorker) {
 
 func (t *OpenvpnMultuTunnel) Status() {
 	fmt.Printf("  overlay: %s  peer: %s\n", t.OverlayIP(), t.PeerIP())
-	fmt.Printf("  workers: %d  ports: %s\n", t.cfg.OpenVPNMultu.Workers, openvpnMultuPortRange(t.cfg))
+	fmt.Printf("  workers: %d  ports: %s  pki: %s\n",
+		t.cfg.OpenVPNMultu.Workers, openvpnMultuPortRange(t.cfg), t.cfg.OpenVPNMultu.PKIDir)
 	for _, w := range t.workers {
 		state := "down"
 		if w.cmd != nil && w.cmd.Process != nil && openvpnProcessAlive(w.cmd) {
 			state = fmt.Sprintf("pid=%d", w.cmd.Process.Pid)
 		}
-		fmt.Printf("  %s: %s  conf=%s\n", w.dev, state, w.conf)
+		fmt.Printf("  %s: %s\n", w.dev, state)
 	}
 	if t.loAddr != "" {
 		fmt.Printf("  lo addr: %s\n", t.loAddr)

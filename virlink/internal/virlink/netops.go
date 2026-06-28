@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // FOU encap type constant (TUNNEL_ENCAP_FOU = 1)
@@ -119,8 +120,7 @@ func nlRouteECMP(dst string, devs ...string) error {
 	}
 	dstNet := &net.IPNet{IP: dstIP.To4(), Mask: net.CIDRMask(32, 32)}
 
-	// remove stale route first
-	_ = netlink.RouteDel(&netlink.Route{Dst: dstNet})
+	nlRouteDelAll(dst)
 
 	route := &netlink.Route{Dst: dstNet}
 	for _, name := range devs {
@@ -133,18 +133,41 @@ func nlRouteECMP(dst string, devs ...string) error {
 			Hops:      0, // Hops=0 means weight 1
 		})
 	}
-	return netlink.RouteAdd(route)
+	return netlink.RouteReplace(route)
 }
 
-// nlRouteDel silently removes a host /32 route (best-effort).
-func nlRouteDel(dst string) {
+// nlRouteDelAll removes every /32 route to dst (single-path or ECMP).
+func nlRouteDelAll(dst string) {
 	dstIP := net.ParseIP(dst)
 	if dstIP == nil {
 		return
 	}
-	_ = netlink.RouteDel(&netlink.Route{
-		Dst: &net.IPNet{IP: dstIP.To4(), Mask: net.CIDRMask(32, 32)},
-	})
+	dstIP = dstIP.To4()
+	routes, err := netlink.RouteList(nil, unix.AF_INET)
+	if err != nil {
+		_ = netlink.RouteDel(&netlink.Route{
+			Dst: &net.IPNet{IP: dstIP, Mask: net.CIDRMask(32, 32)},
+		})
+		return
+	}
+	for _, r := range routes {
+		if routeMatchesHost32(r, dstIP) {
+			_ = netlink.RouteDel(&r)
+		}
+	}
+}
+
+func routeMatchesHost32(r netlink.Route, ip net.IP) bool {
+	if r.Dst == nil {
+		return false
+	}
+	ones, bits := r.Dst.Mask.Size()
+	return bits == 32 && ones == 32 && r.Dst.IP.Equal(ip)
+}
+
+// nlRouteDel silently removes a host /32 route (best-effort).
+func nlRouteDel(dst string) {
+	nlRouteDelAll(dst)
 }
 
 // ── sysctl via /proc/sys ──────────────────────────────────────────────────────

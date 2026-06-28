@@ -107,7 +107,7 @@ type OpenVPNCfg struct {
 
 // OpenVPNMultuCfg maps to [openvpnmultu] — N parallel openvpn + ECMP load-balancing.
 type OpenVPNMultuCfg struct {
-	PKIDir  string `toml:"pki_dir"`  // directory with worker-0.conf … worker-N.conf
+	PKIDir  string `toml:"pki_dir"`  // PKI directory (ca.crt, server.crt, …); worker .conf generated at runtime
 	Workers int    `toml:"workers"`  // parallel openvpn instances (2–8)
 }
 

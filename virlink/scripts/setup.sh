@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.6.4"
+SCRIPT_VERSION="1.6.5"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@mioopython"
 AUTHOR="Hossein"
@@ -2639,39 +2639,7 @@ gen_openvpnmultu() {
   esac
 
   blank
-  info "Generating ${workers} worker configs (internal links 10.20.55.0/24, overlay ${cidr})..."
-  for ((i=0; i<workers; i++)); do
-    openvpnmultu_worker_link_ips "$i" "$mode"
-    link_c="$OPENVPNMULTU_LINK_CLIENT"
-    link_s="$OPENVPNMULTU_LINK_SERVER"
-    wport=$((port + i))
-    wdev="ovpnm-w${i}"
-    if [[ "$mode" == "server" ]]; then
-      wconf="${pki_dir}/server-worker-${i}.conf"
-      cconf="${pki_dir}/worker-${i}.conf"
-      openvpn_write_server_conf "$pki_dir" "$wport" "$proto" \
-        "$link_c" "$link_s" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$wconf" 0
-      openvpnmultu_append_overlay_route "$wconf" "$peer_overlay"
-      openvpn_write_client_conf "$pki_dir" "$wport" "$proto" "$local_ip" \
-        "$link_c" "$link_s" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$cconf" 0
-      openvpnmultu_append_overlay_route "$cconf" "$peer_overlay"
-      ok "worker ${i}: ${wconf}  port ${wport}  dev ${wdev}"
-    else
-      wconf="${pki_dir}/worker-${i}.conf"
-      openvpn_write_client_conf "$pki_dir" "$wport" "$proto" "$remote_ip" \
-        "$link_c" "$link_s" "$mtu" "$wdev" "$perf" "$tun_mtu" "$mssfix" "$wconf" 0
-      openvpnmultu_append_overlay_route "$wconf" "$peer_overlay"
-      ok "worker ${i}: ${wconf}  port ${wport}  dev ${wdev}"
-    fi
-  done
-
-  if [[ "$mode" == "server" ]]; then
-    openvpn_export_client_bundle "$pki_dir" 2>/dev/null || true
-    mkdir -p "${pki_dir}/export"
-    for ((i=0; i<workers; i++)); do
-      cp -f "${pki_dir}/worker-${i}.conf" "${pki_dir}/export/worker-${i}.conf"
-    done
-  fi
+  info "PKI only in ${pki_dir} — ${workers} OpenVPN workers are created at tunnel start by virlink."
 
   cfg="${CONFIGS_DIR}/${name}.toml"
   cat > "$cfg" << EOF
@@ -2709,10 +2677,6 @@ EOF
       "${pki}/client.crt" "${pki_dir}/client.crt" 644 \
       "${pki}/client.key" "${pki_dir}/client.key" 600 \
       "${pki}/${tls_key}" "${pki_dir}/${tls_key}" 600
-    for ((i=0; i<workers; i++)); do
-      virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "openvpnmultu" "$((port + i))" \
-        "${pki}/worker-${i}.conf" "${pki_dir}/worker-${i}.conf" 644
-    done
     blank
     info "Privacy: CA/server private keys remain on this host only."
     openvpn_server_send_credentials "$name" "$remote_ip" "$pki_dir" "$local_ip"
@@ -2724,6 +2688,7 @@ EOF
     blank
     warn "Start the OpenVPN MULTU SERVER on ${remote_ip} first."
     warn "Firewall: allow ${proto} ports ${port}–$((port + workers - 1)) to server."
+    info "Workers materialized at tunnel start: /var/run/virlink/${name}/w*.conf"
     info "Logs: /var/log/virlink/${name}-w*-openvpn.log"
   fi
 
