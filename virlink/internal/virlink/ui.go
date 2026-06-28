@@ -109,6 +109,19 @@ a{color:var(--blue);text-decoration:none}
 .bench-note{font-size:.68rem;color:var(--muted);text-align:center;margin-top:10px}
 .err{color:var(--red);font-size:.75rem;margin-top:10px;min-height:1.2em}
 
+/* ── interface picker ── */
+.iface-bar{display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+.iface-bar label{font-size:.72rem;color:var(--muted)}
+.iface-select{background:var(--surface2);border:1px solid var(--border);border-radius:6px;
+             color:var(--text);font-family:var(--font);font-size:.78rem;padding:7px 10px;
+             min-width:180px}
+.iface-table{width:100%;border-collapse:collapse;font-size:.72rem;margin-top:8px}
+.iface-table th,.iface-table td{padding:6px 8px;text-align:left;border-bottom:1px solid var(--surface2)}
+.iface-table th{color:var(--muted);font-weight:500;text-transform:uppercase;font-size:.6rem;letter-spacing:.08em}
+.iface-table td.num{text-align:right;font-variant-numeric:tabular-nums}
+.iface-up{color:var(--green)}.iface-down{color:var(--red)}
+.iface-kind{font-size:.62rem;color:var(--cyan)}
+
 /* ── spinner ── */
 .spin{width:10px;height:10px;border:1.5px solid var(--muted);
       border-top-color:var(--blue);border-radius:50%;
@@ -147,6 +160,23 @@ a{color:var(--blue);text-decoration:none}
       <div class="info-row"><span class="ik">uptime</span><span class="iv" id="uptime">—</span></div>
       <div class="info-row"><span class="ik">last probe</span><span class="iv" id="last-seen">—</span></div>
     </div>
+  </div>
+
+  <!-- INTERFACES -->
+  <div class="card" id="iface-card">
+    <div class="card-title">Tunnel Interfaces <span class="badge">panel :6543</span></div>
+    <div class="iface-bar">
+      <label for="iface-select">test via</label>
+      <select class="iface-select" id="iface-select" onchange="onIfaceChange()">
+        <option value="">all (ECMP)</option>
+      </select>
+    </div>
+    <table class="iface-table" id="iface-table" style="display:none">
+      <thead><tr>
+        <th>interface</th><th>state</th><th>rx</th><th>tx</th>
+      </tr></thead>
+      <tbody id="iface-tbody"></tbody>
+    </table>
   </div>
 
   <!-- PROBES -->
@@ -215,7 +245,7 @@ a{color:var(--blue);text-decoration:none}
     <div id="bench-err" class="err"></div>
     <div class="bench-note">
       Traffic flows through the tunnel overlay — measures real link throughput.
-      Results cached 2 min.
+      Pick an interface above to bench a single worker. Results cached 2 min.
     </div>
   </div>
 
@@ -228,15 +258,88 @@ a{color:var(--blue);text-decoration:none}
 
 <script>
 let maxMbps = 1000;
+let selectedIface = '';
+
+function benchQuery() {
+  const sel = document.getElementById('iface-select');
+  const v = sel ? sel.value : '';
+  if (!v) return '';
+  return '?iface=' + encodeURIComponent(v);
+}
+
+function healthQuery() {
+  const q = benchQuery();
+  return q ? '/health' + q : '/health';
+}
+
+function onIfaceChange() {
+  const sel = document.getElementById('iface-select');
+  selectedIface = sel ? sel.value : '';
+  fetchHealth();
+}
+
+function populateIfaceSelect(ifaces) {
+  const sel = document.getElementById('iface-select');
+  if (!sel || !ifaces || !ifaces.length) return;
+  const workers = ifaces.filter(i => i.kind === 'worker' || i.kind === 'tunnel');
+  if (workers.length <= 1) {
+    sel.innerHTML = '<option value="">default</option>';
+    workers.forEach(i => {
+      const o = document.createElement('option');
+      o.value = i.name; o.textContent = i.name;
+      sel.appendChild(o);
+    });
+    return;
+  }
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">all (ECMP)</option><option value="all">each worker</option>';
+  workers.forEach(i => {
+    const o = document.createElement('option');
+    o.value = i.name; o.textContent = i.name;
+    sel.appendChild(o);
+  });
+  if (cur) sel.value = cur;
+}
+
+function fmtBytes(n) {
+  n = +n || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n/1024).toFixed(1) + ' KB';
+  if (n < 1073741824) return (n/1048576).toFixed(2) + ' MB';
+  return (n/1073741824).toFixed(2) + ' GB';
+}
+
+function renderIfaceTable(ifaces) {
+  const tbl = document.getElementById('iface-table');
+  const body = document.getElementById('iface-tbody');
+  if (!tbl || !body || !ifaces || !ifaces.length) {
+    if (tbl) tbl.style.display = 'none';
+    return;
+  }
+  body.innerHTML = '';
+  ifaces.forEach(i => {
+    const tr = document.createElement('tr');
+    const st = i.link_up ? '<span class="iface-up">up</span>' : '<span class="iface-down">down</span>';
+    const label = i.label || i.name;
+    tr.innerHTML = '<td>' + label + ' <span class="iface-kind">' + (i.kind||'') + '</span></td>'
+      + '<td>' + st + '</td>'
+      + '<td class="num">' + fmtBytes(i.rx_bytes) + '</td>'
+      + '<td class="num">' + fmtBytes(i.tx_bytes) + '</td>';
+    body.appendChild(tr);
+  });
+  tbl.style.display = '';
+}
 
 async function fetchHealth() {
   const rs = document.getElementById('rs');
   rs.innerHTML = '<span class="spin"></span> refreshing...';
   try {
-    const r = await fetch('/health');
+    const r = await fetch(healthQuery());
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
     applyHealth(d);
+    populateIfaceSelect(d.interfaces);
+    renderIfaceTable(d.interfaces);
     rs.textContent = '✓ ' + new Date().toLocaleTimeString();
     if (d.last_bench) applyBench(d.last_bench, false);
   } catch(e) {
@@ -272,10 +375,20 @@ async function runBench() {
   btn.childNodes[1].textContent = ' Running test (~10 s)...';
   err.textContent = '';
   try {
-    const r = await fetch('/bench');
+    const r = await fetch('/bench' + benchQuery());
     const d = await r.json();
-    if (d.error) { err.textContent = '✗ ' + d.error; }
-    else { applyBench(d, true); }
+    if (d.mode === 'all' && d.workers) {
+      const lines = d.workers.map(w =>
+        w.interface + ': ↓' + (w.download_mbps||0).toFixed(1) + ' ↑' + (w.upload_mbps||0).toFixed(1) + ' Mbps'
+        + (w.error ? ' (' + w.error + ')' : '')
+      );
+      err.textContent = lines.join('  ·  ');
+      if (d.workers.length) applyBench(d.workers[0], true);
+    } else if (d.error) {
+      err.textContent = '✗ ' + d.error;
+    } else {
+      applyBench(d, true);
+    }
   } catch(e) {
     err.textContent = '✗ ' + e.message;
   } finally {

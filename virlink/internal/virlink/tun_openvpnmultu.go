@@ -267,6 +267,24 @@ func openvpnMultuWorkerPIDPath(c *Config, i int) string {
 	return filepath.Join("/var/run/virlink", fmt.Sprintf("%s-w%d-openvpn.pid", tunnelInstanceName(c), i))
 }
 
+func (t *OpenvpnMultuTunnel) MonitorDevs() []string {
+	devs := make([]string, len(t.workers))
+	for i := range t.workers {
+		devs[i] = t.workers[i].dev
+	}
+	return devs
+}
+
+func (t *OpenvpnMultuTunnel) BenchIsolate(dev string) (func(), error) {
+	peer := t.PeerIP()
+	local := plainIP(t.OverlayIP())
+	if _, err := nlRouteECMPWithSrc(peer, local, dev); err != nil {
+		return nil, err
+	}
+	restore := func() { openvpnMultuSyncPeerRoutes(t.workers, local, peer) }
+	return restore, nil
+}
+
 func (t *OpenvpnMultuTunnel) Down() error {
 	t.doClean()
 	logOK("openvpnmultu torn down")

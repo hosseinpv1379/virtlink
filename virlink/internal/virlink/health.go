@@ -207,44 +207,99 @@ type healthJSON struct {
 	LastSeen     string       `json:"last_seen"`
 	Uptime       string       `json:"uptime"`
 	Interface    string       `json:"interface"`
+	Selected     string       `json:"selected_interface,omitempty"`
 	OverlayIP    string       `json:"overlay_ip"`
 	PeerIP       string       `json:"peer_ip"`
+	ProbePort    int          `json:"probe_port"`
+	HTTPPort     int          `json:"http_port"`
+	BenchPort    int          `json:"bench_port"`
+	PanelURL     string       `json:"panel_url,omitempty"`
 	TxProbes     uint64       `json:"tx_probes"`
 	RxProbes     uint64       `json:"rx_probes"`
+	Interfaces   []ifaceJSON  `json:"interfaces,omitempty"`
 	LastBench    *BenchResult `json:"last_bench,omitempty"`
 	BenchHint    string       `json:"bench_hint,omitempty"`
 }
 
-func (h *HealthMgr) runHTTPServer(overlayIP string, port int, tun Tunnel, bm *BenchMgr) {
+func (h *HealthMgr) buildHealthJSON(tun Tunnel, bm *BenchMgr, probePort, httpPort int, selected string) healthJSON {
+	hs := h.Handshake()
+	httpStatus := "ok"
+	if hs == "dead" {
+		httpStatus = "degraded"
+	}
+	overlayPlain := plainIP(tun.OverlayIP())
+	iface := tun.DevName()
+	if selected != "" && selected != "all" {
+		iface = selected
+	}
+	devs := tunnelMonitorDevs(tun)
+	ifaces := collectIfaceStats(devs, overlayPlain)
+
+	resp := healthJSON{
+		Status:     httpStatus,
+		Handshake:  hs,
+		LastSeen:   h.LastSeenStr(),
+		Uptime:     time.Since(h.startedAt).Round(time.Second).String(),
+		Interface:  iface,
+		Selected:   selected,
+		OverlayIP:  overlayPlain,
+		PeerIP:     tun.PeerIP(),
+		ProbePort:  probePort,
+		HTTPPort:   httpPort,
+		BenchPort:  httpPort + 1,
+		PanelURL:   fmtPanelURL(overlayPlain, httpPort),
+		TxProbes:   h.txCount.Load(),
+		RxProbes:   h.rxCount.Load(),
+		Interfaces: ifaces,
+	}
+	if sel := pickIfaceStats(ifaces, selected); sel != nil && selected != "" && selected != "all" {
+		resp.Interface = sel.Name
+	}
+	if bm != nil {
+		bm.mu.Lock()
+		resp.LastBench = bm.lastResult
+		bm.mu.Unlock()
+		if resp.LastBench == nil {
+			resp.BenchHint = fmt.Sprintf("GET /bench  or  /bench?iface=worker-name  (TCP data :%d)", httpPort+1)
+		}
+	}
+	return resp
+}
+
+func (h *HealthMgr) runHTTPServer(overlayIP string, httpPort, probePort int, tun Tunnel, bm *BenchMgr) {
 	mux := http.NewServeMux()
 
-	// GET /health  — probe state + last bench result if available
+	mux.HandleFunc("/api/interfaces", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		devs := tunnelMonitorDevs(tun)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"overlay_ip": plainIP(tun.OverlayIP()),
+			"peer_ip":    tun.PeerIP(),
+			"http_port":  httpPort,
+			"probe_port": probePort,
+			"bench_port": httpPort + 1,
+			"interfaces": collectIfaceStats(devs, plainIP(tun.OverlayIP())),
+		})
+	})
+
+	// GET /health  — probe state + per-interface stats
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		hs := h.Handshake()
+		selected := r.URL.Query().Get("iface")
+		if selected == "" {
+			selected = r.URL.Query().Get("interface")
+		}
+		if selected != "" && !validPanelIface(selected, tun) {
+			http.Error(w, "unknown interface", http.StatusBadRequest)
+			return
+		}
+		resp := h.buildHealthJSON(tun, bm, probePort, httpPort, selected)
 		code := http.StatusOK
-		httpStatus := "ok"
-		if hs == "dead" {
+		if resp.Handshake == "dead" {
 			code = http.StatusServiceUnavailable
-			httpStatus = "degraded"
-		}
-		resp := healthJSON{
-			Status:    httpStatus,
-			Handshake: hs,
-			LastSeen:  h.LastSeenStr(),
-			Uptime:    time.Since(h.startedAt).Round(time.Second).String(),
-			Interface: tun.DevName(),
-			OverlayIP: tun.OverlayIP(),
-			PeerIP:    tun.PeerIP(),
-			TxProbes:  h.txCount.Load(),
-			RxProbes:  h.rxCount.Load(),
-		}
-		if bm != nil {
-			bm.mu.Lock()
-			resp.LastBench = bm.lastResult
-			bm.mu.Unlock()
-			if resp.LastBench == nil {
-				resp.BenchHint = fmt.Sprintf("GET :%d/bench to run bandwidth test", port)
-			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
@@ -258,7 +313,6 @@ func (h *HealthMgr) runHTTPServer(overlayIP string, port int, tun Tunnel, bm *Be
 	mux.HandleFunc("/profile", handleProfileHTTP)
 
 	// GET /bench  — run upload+download test through the tunnel overlay
-	// Blocks until complete (up to ~60s), then returns and caches for 2min.
 	mux.HandleFunc("/bench", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if bm == nil {
@@ -266,16 +320,27 @@ func (h *HealthMgr) runHTTPServer(overlayIP string, port int, tun Tunnel, bm *Be
 			_, _ = fmt.Fprintln(w, `{"error":"bench disabled"}`)
 			return
 		}
-		// For non-GET requests return method not allowed
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		// Use a longer write timeout for bench (may take up to 60s)
-		if rw, ok := w.(http.ResponseWriter); ok {
-			_ = rw
+		via := r.URL.Query().Get("iface")
+		if via == "" {
+			via = r.URL.Query().Get("interface")
 		}
-		res := bm.RunBench()
+		if via != "" && via != "all" && !validPanelIface(via, tun) {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unknown interface: " + via})
+			return
+		}
+		devs := tunnelMonitorDevs(tun)
+		if via == "all" && len(devs) > 1 {
+			out := bm.RunBenchAllWorkers(devs)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(out)
+			return
+		}
+		res := bm.RunBenchVia(via)
 		code := http.StatusOK
 		if res != nil && res.Error != "" {
 			code = http.StatusInternalServerError
@@ -294,18 +359,19 @@ func (h *HealthMgr) runHTTPServer(overlayIP string, port int, tun Tunnel, bm *Be
 		_, _ = w.Write([]byte(dashboardHTML))
 	})
 
-	addr := fmt.Sprintf("%s:%d", overlayIP, port)
+	addr := fmt.Sprintf("%s:%d", overlayIP, httpPort)
 	srv := &http.Server{
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 120 * time.Second, // bench can take up to 60s
+		WriteTimeout: 120 * time.Second,
 	}
 	ln, err := listenTCPReuseAddr(addr)
 	if err != nil {
 		logWarn(fmt.Sprintf("health HTTP: listen %s: %v", addr, err))
 		return
 	}
-	logInfo(fmt.Sprintf("health HTTP  listen=%s  /health  /profile  /bench(port %d)", addr, port+1))
+	logInfo(fmt.Sprintf("panel HTTP  listen=%s  /  /health  /bench  probe_udp=:%d  bench_tcp=:%d",
+		addr, probePort, httpPort+1))
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		logWarn(fmt.Sprintf("health HTTP: %v", err))
 	}
@@ -316,10 +382,10 @@ func (h *HealthMgr) runHTTPServer(overlayIP string, port int, tun Tunnel, bm *Be
 // Start begins the probe server, probe sender, bench server, and HTTP server.
 // overlayIP must be the plain IP (no /prefix).
 // peerIP must be the plain peer overlay IP.
-func (h *HealthMgr) Start(overlayIP, peerIP string, port int, tun Tunnel) {
-	bm := NewBenchMgr(port, peerIP, overlayIP)
-	go h.runProbeServer(overlayIP, port)
-	go h.runProbeSender(overlayIP, peerIP, port)
+func (h *HealthMgr) Start(overlayIP, peerIP string, probePort, httpPort int, tun Tunnel) {
+	bm := NewBenchMgr(httpPort, peerIP, overlayIP, tun)
+	go h.runProbeServer(overlayIP, probePort)
+	go h.runProbeSender(overlayIP, peerIP, probePort)
 	go bm.runServer()
-	go h.runHTTPServer(overlayIP, port, tun, bm)
+	go h.runHTTPServer(overlayIP, httpPort, probePort, tun, bm)
 }

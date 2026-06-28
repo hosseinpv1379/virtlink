@@ -103,7 +103,7 @@ func levelSym(level string) string {
 // ── startup banner ────────────────────────────────────────────────────────────
 
 func printBanner(tunnelType, mode, localIP, remoteIP, overlay, peer, iface string,
-	healthPort, benchPort int) {
+	probePort, httpPort, benchPort int) {
 
 	if isatty() {
 		line := strings.Repeat("━", 54)
@@ -123,8 +123,9 @@ func printBanner(tunnelType, mode, localIP, remoteIP, overlay, peer, iface strin
 		row("peer", remoteIP)
 		row("overlay", cCyan+overlay+cReset+" → "+cGreen+peer+cReset)
 		row("device", cBold+iface+cReset)
-		row("health", fmt.Sprintf("http://0.0.0.0:%d/health", healthPort))
-		row("bench", fmt.Sprintf("0.0.0.0:%d  profile=:%d/profile", benchPort, healthPort))
+		row("panel", fmt.Sprintf("http://%s:%d/  (health /health  bench /bench)", plainIP(overlay), httpPort))
+		row("probe", fmt.Sprintf("UDP :%d  (handshake)", probePort))
+		row("bench", fmt.Sprintf("TCP :%d  profile=:%d/profile", benchPort, httpPort))
 		fmt.Printf("%s\n\n", cBlue+line+cReset)
 	} else {
 		ts := time.Now().Format("2006-01-02 15:04:05")
@@ -132,7 +133,7 @@ func printBanner(tunnelType, mode, localIP, remoteIP, overlay, peer, iface strin
 			fmt.Sprintf("type=%s  mode=%s", tunnelType, mode),
 			fmt.Sprintf("local=%s  peer=%s", localIP, remoteIP),
 			fmt.Sprintf("overlay=%s  peer_overlay=%s  dev=%s", overlay, peer, iface),
-			fmt.Sprintf("health=:%d  bench=:%d  profile=:%d/profile", healthPort, benchPort, healthPort),
+			fmt.Sprintf("panel=:%d  probe_udp=:%d  bench_tcp=:%d  profile=:%d/profile", httpPort, probePort, benchPort, httpPort),
 		}
 		for _, f := range fields {
 			fmt.Printf("%s  INF  [start] %s\n", ts, f)

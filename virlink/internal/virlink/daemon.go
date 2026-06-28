@@ -53,16 +53,16 @@ func runDaemon(cfg *Config, tun Tunnel) int {
 	var hm *HealthMgr
 	if !cfg.Health.Disabled {
 		hm = NewHealthMgr(startedAt, ivDur)
-		hm.Start(plainIP(tun.OverlayIP()), tun.PeerIP(), cfg.Health.Port, tun)
+		hm.Start(plainIP(tun.OverlayIP()), tun.PeerIP(), cfg.Health.Port, cfg.Health.HTTPPort, tun)
 	}
 
 	// ── 4. startup banner ─────────────────────────────────────────────────────
-	hp := cfg.Health.Port
+	hp := cfg.Health.HTTPPort
 	printBanner(
 		cfg.Tunnel.Type, cfg.Tunnel.Mode,
 		cfg.LocalIP, cfg.RemoteIP,
 		tun.OverlayIP(), tun.PeerIP(), tun.DevName(),
-		hp, hp+1,
+		cfg.Health.Port, hp, hp+1,
 	)
 
 	if len(fwdRules) > 0 {

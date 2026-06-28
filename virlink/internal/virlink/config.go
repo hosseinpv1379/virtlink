@@ -96,7 +96,8 @@ type ForwardCfg struct {
 // UDP probe + HTTP endpoint to verify real end-to-end connectivity.
 type HealthCfg struct {
 	Disabled bool `toml:"disabled"` // set to true to disable (default: enabled)
-	Port     int  `toml:"port"`     // default 6543
+	Port     int  `toml:"port"`     // UDP probe port (default 6543 + per-tunnel offset)
+	HTTPPort int  `toml:"http_port"` // web panel + /health /bench API (default 6543 on overlay IP)
 }
 
 // OpenVPNCfg maps to [openvpn]
@@ -348,6 +349,7 @@ func setDefaults(c *Config) {
 	if c.Tuning.ChannelSize == 0 { c.Tuning.ChannelSize = 10_000 }
 	if c.Logging.Level == ""     { c.Logging.Level = "info" }
 	applyHealthPort(c)
+	applyHealthHTTPPort(c)
 	if t.Type == "hysteria2"     { c.Health.Disabled = true }
 }
 

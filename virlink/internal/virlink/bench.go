@@ -44,6 +44,7 @@ type BenchResult struct {
 	TestDuration  string  `json:"test_duration"`
 	TotalDuration string  `json:"total_duration"`
 	TestedAt      string  `json:"tested_at"`
+	Interface     string  `json:"interface,omitempty"`
 	Error         string  `json:"error,omitempty"`
 }
 
@@ -52,15 +53,17 @@ type BenchMgr struct {
 	port      int
 	peerIP    string
 	overlayIP string
+	tun       Tunnel
 
 	mu         sync.Mutex
 	running    bool
 	lastResult *BenchResult
 	lastRun    time.Time
+	lastVia    string
 }
 
-func NewBenchMgr(healthPort int, peerIP, overlayIP string) *BenchMgr {
-	return &BenchMgr{port: healthPort + 1, peerIP: peerIP, overlayIP: overlayIP}
+func NewBenchMgr(httpPort int, peerIP, overlayIP string, tun Tunnel) *BenchMgr {
+	return &BenchMgr{port: httpPort + 1, peerIP: peerIP, overlayIP: overlayIP, tun: tun}
 }
 
 func tuneBenchConn(conn net.Conn) {
@@ -84,7 +87,7 @@ func (b *BenchMgr) runServer() {
 		logWarn(fmt.Sprintf("bench server: listen %s: %v", addr, err))
 		return
 	}
-	logInfo(fmt.Sprintf("bench  server   listen=%s  (healthPort+1)", addr))
+	logInfo(fmt.Sprintf("bench  server   listen=%s  (http_port+1)", addr))
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -286,9 +289,42 @@ func (b *BenchMgr) measureUpload() (mbPerSec float64, err error) {
 
 // ── RunBench ──────────────────────────────────────────────────────────────────
 
+// RunBench runs the full download+upload test (all ECMP paths unless via set).
 func (b *BenchMgr) RunBench() *BenchResult {
+	return b.RunBenchVia("")
+}
+
+// RunBenchVia runs bench traffic via a single tunnel interface (openvpnmultu worker).
+func (b *BenchMgr) RunBenchVia(via string) *BenchResult {
+	if via != "" && via != "all" {
+		if ctl, ok := b.tun.(BenchRouteCtl); ok {
+			restore, err := ctl.BenchIsolate(via)
+			if err != nil {
+				return &BenchResult{Error: "route via " + via + ": " + err.Error()}
+			}
+			defer restore()
+		}
+	}
+	res := b.runBenchInner(via)
+	if res != nil && via != "" && via != "all" {
+		res.Interface = via
+	}
+	if res != nil && via != "" && res.Error != "" {
+		res.Error = prefixBenchVia(res.Error, via)
+	}
+	return res
+}
+
+func prefixBenchVia(err, via string) string {
+	if err == "" {
+		return ""
+	}
+	return fmt.Sprintf("[%s] %s", via, err)
+}
+
+func (b *BenchMgr) runBenchInner(via string) *BenchResult {
 	b.mu.Lock()
-	if !b.lastRun.IsZero() && time.Since(b.lastRun) < benchCacheTTL && b.lastResult != nil {
+	if !b.lastRun.IsZero() && time.Since(b.lastRun) < benchCacheTTL && b.lastResult != nil && b.lastVia == via {
 		res := b.lastResult
 		b.mu.Unlock()
 		return res
@@ -346,12 +382,29 @@ done:
 	b.mu.Lock()
 	b.lastResult = res
 	b.lastRun = time.Now()
+	b.lastVia = via
 	b.running = false
 	b.mu.Unlock()
 
 	logInfo(fmt.Sprintf("bench  done  ↓download=%.2f Mbps  ↑upload=%.2f Mbps  total=%s",
 		res.DownloadMbps, res.UploadMbps, res.TotalDuration))
 	return res
+}
+
+// RunBenchAllWorkers runs an isolated bench on each worker interface sequentially.
+func (b *BenchMgr) RunBenchAllWorkers(devs []string) map[string]any {
+	rows := make([]BenchResult, 0, len(devs))
+	for _, dev := range devs {
+		r := b.RunBenchVia(dev)
+		if r == nil {
+			r = &BenchResult{Interface: dev, Error: "timeout"}
+		}
+		rows = append(rows, *r)
+	}
+	return map[string]any{
+		"mode":    "all",
+		"workers": rows,
+	}
 }
 
 func round2(f float64) float64 {
