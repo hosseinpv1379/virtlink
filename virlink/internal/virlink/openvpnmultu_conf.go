@@ -33,6 +33,7 @@ func openvpnMultuMaterializeWorkers(c *Config) (string, error) {
 	}
 
 	tunMTU, mssfix := openvpnMultuTunMTU(c)
+	peerOverlay := peerAddr(c, openvpnMultuSubnet)
 	perf := openvpnMultuPerfMode(c)
 	proto := c.Transport.Proto
 	if proto == "" {
@@ -61,6 +62,7 @@ func openvpnMultuMaterializeWorkers(c *Config) (string, error) {
 			_ = os.RemoveAll(runtimeDir)
 			return "", fmt.Errorf("[openvpnmultu] worker %d: %w", i, err)
 		}
+		body += openvpnMultuOverlayRouteBlock(peerOverlay)
 		if err := os.WriteFile(confPath, []byte(body), 0o644); err != nil {
 			_ = os.RemoveAll(runtimeDir)
 			return "", fmt.Errorf("[openvpnmultu] write %s: %w", confPath, err)
@@ -75,6 +77,12 @@ func openvpnMultuWorkerLinkIPs(idx int, mode string) (client, server string) {
 		return fmt.Sprintf("10.20.55.%d", base), fmt.Sprintf("10.20.55.%d", base+1)
 	}
 	return fmt.Sprintf("10.20.55.%d", base+1), fmt.Sprintf("10.20.55.%d", base)
+}
+
+// openvpnMultuOverlayRouteBlock installs the overlay peer route when a worker session
+// comes up. Multiple workers → multiple /32 nexthops → kernel ECMP (no upfront ECMP).
+func openvpnMultuOverlayRouteBlock(peerOverlay string) string {
+	return fmt.Sprintf("\n# virlink openvpnmultu — overlay peer via this worker (ECMP when all workers up)\nroute %s 255.255.255.255 vpn_gateway\n", peerOverlay)
 }
 
 func openvpnMultuPerfMode(c *Config) string {
@@ -150,6 +158,7 @@ user nobody
 group nogroup
 %s
 tls-server
+duplicate-cn
 ifconfig %s %s
 `, perf, proto, port, ovpnProto, dev,
 		filepath.Join(pkiDir, "ca.crt"),

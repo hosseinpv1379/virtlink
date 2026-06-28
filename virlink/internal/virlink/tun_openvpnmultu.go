@@ -120,7 +120,7 @@ func (t *OpenvpnMultuTunnel) Up() error {
 	peer := t.PeerIP()
 	localPlain := plainIP(overlay)
 
-	step("overlay on lo + ECMP route to peer...")
+	step("overlay on lo (peer routes via workers when sessions connect)...")
 	if err := t.setupOverlayRouting(localPlain, peer); err != nil {
 		t.doClean()
 		return err
@@ -141,7 +141,7 @@ func (t *OpenvpnMultuTunnel) Up() error {
 	done(t.DevName(), overlay, peer,
 		fmt.Sprintf("workers   : %d parallel openvpn (no DCO)", n),
 		fmt.Sprintf("transport : OpenVPN %s ports %s", c.Transport.Proto, ports),
-		"routing   : ECMP /32 per-flow hash to peer overlay IP",
+		"routing   : per-worker overlay routes → kernel ECMP when all sessions up",
 		"pki       : "+pkiDir+"  (PKI only — worker configs internal)",
 		"runtime   : workers materialized at "+t.runtimeDir,
 		"bench     : iperf3 -P"+fmt.Sprint(n)+" -c "+peer,
@@ -190,10 +190,10 @@ func (t *OpenvpnMultuTunnel) setupOverlayRouting(localPlain, peer string) error 
 	for i := range t.workers {
 		devs[i] = t.workers[i].dev
 	}
-	if err := nlRouteECMP(peer, devs...); err != nil {
-		return fmt.Errorf("ecmp route %s: %w", peer, err)
-	}
-	logOK(fmt.Sprintf("lo %s  route %s/32 → %v (ECMP)", t.loAddr, peer, devs))
+	// Do not install kernel ECMP before OpenVPN sessions exist — traffic would be
+	// hashed to workers with no peer. Each worker adds route peer/32 on connect;
+	// the kernel load-balances once multiple worker routes are present.
+	logOK(fmt.Sprintf("lo %s  peer %s/32 via workers %v (routes appear per session)", t.loAddr, peer, devs))
 	return nil
 }
 
