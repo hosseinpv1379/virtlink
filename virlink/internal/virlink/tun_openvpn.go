@@ -238,29 +238,82 @@ func waitForLink(name string, timeout time.Duration) error {
 }
 
 func waitForOpenVPN(dev, logPath string, cmd *exec.Cmd, timeout time.Duration) error {
+	return waitForOpenVPNWorker(dev, logPath, cmd, false, timeout)
+}
+
+// waitForOpenVPNWorker waits for a worker TUN. Server mode accepts earlier log lines and
+// fails fast on bind/tun errors instead of sitting until timeout.
+func waitForOpenVPNWorker(dev, logPath string, cmd *exec.Cmd, serverMode bool, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	fatalNeedles := []string{
+		"BIND failed",
+		"Cannot ioctl TUNSETIFF",
+		"Failed to open tun/tap interface",
+		"Exiting due to fatal error",
+	}
 	for time.Now().Before(deadline) {
 		if linkUp(dev) {
 			return nil
 		}
-		if logPath != "" && openvpnLogContains(logPath, "Initialization Sequence Completed") {
-			time.Sleep(500 * time.Millisecond)
-			if linkUp(dev) {
-				return nil
+		if logPath != "" {
+			if openvpnLogContains(logPath, "Initialization Sequence Completed") {
+				time.Sleep(300 * time.Millisecond)
+				if linkUp(dev) {
+					return nil
+				}
+			}
+			if serverMode {
+				if openvpnLogContains(logPath, "TUN/TAP device "+dev+" opened") ||
+					openvpnLogContains(logPath, "Listening for incoming") {
+					time.Sleep(300 * time.Millisecond)
+					if linkUp(dev) {
+						return nil
+					}
+				}
+				for _, needle := range fatalNeedles {
+					if openvpnLogContains(logPath, needle) {
+						return fmt.Errorf("openvpn failed on %s:\n%s", dev, openvpnLogTail(logPath, 30))
+					}
+				}
 			}
 		}
 		if cmd != nil && !openvpnProcessAlive(cmd) {
 			return fmt.Errorf("openvpn exited before %s came up:\n%s",
-				dev, openvpnLogTail(logPath, 20))
+				dev, openvpnLogTail(logPath, 25))
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
 	hint := "start OpenVPN server first; match port/proto/PKI; open firewall; for multi-core bandwidth install ovpn-dco (DCO)"
+	if serverMode {
+		hint = "check port not in use (ss -ulnp); stale worker: kill openvpn / ip link del " + dev
+	}
 	if logPath != "" {
 		return fmt.Errorf("timeout waiting for %s (%s):\n%s\nlog: %s",
 			dev, hint, openvpnLogTail(logPath, 25), logPath)
 	}
 	return fmt.Errorf("timeout waiting for interface %s", dev)
+}
+
+// openvpnKillStalePID stops a leftover openvpn from a prior virlink run (pid file).
+func openvpnKillStalePID(pidPath string) {
+	b, err := os.ReadFile(pidPath)
+	if err != nil {
+		_ = os.Remove(pidPath)
+		return
+	}
+	var pid int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &pid); err != nil || pid <= 1 {
+		_ = os.Remove(pidPath)
+		return
+	}
+	if p, err := os.FindProcess(pid); err == nil {
+		_ = p.Signal(syscall.SIGINT)
+		time.Sleep(300 * time.Millisecond)
+		if p.Signal(syscall.Signal(0)) == nil {
+			_ = p.Kill()
+		}
+	}
+	_ = os.Remove(pidPath)
 }
 
 func linkUp(name string) bool {

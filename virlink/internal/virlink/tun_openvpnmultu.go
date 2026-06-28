@@ -73,7 +73,7 @@ func (t *OpenvpnMultuTunnel) Up() error {
 
 	applyPerfFromConfig(c)
 	step("cleanup...")
-	t.doClean()
+	t.doClean() // kills stale worker PIDs / TUNs even when t.workers is empty (restart)
 
 	var err error
 	t.lockFd, err = acquireTunnelLock("ovpnm-" + tunnelInstanceName(c))
@@ -104,7 +104,11 @@ func (t *OpenvpnMultuTunnel) Up() error {
 			t.doClean()
 			return err
 		}
-		if err := waitForOpenVPN(w.dev, w.logPath, w.cmd, 120*time.Second); err != nil {
+		waitTimeout := 120 * time.Second
+		if c.Mode == "server" {
+			waitTimeout = 45 * time.Second
+		}
+		if err := waitForOpenVPNWorker(w.dev, w.logPath, w.cmd, c.Mode == "server", waitTimeout); err != nil {
 			t.doClean()
 			return fmt.Errorf("worker %d: %w", i, err)
 		}
@@ -149,8 +153,24 @@ func (t *OpenvpnMultuTunnel) Up() error {
 	return nil
 }
 
+func openvpnMultuPreclean(c *Config) {
+	if c == nil {
+		return
+	}
+	n := c.OpenVPNMultu.Workers
+	if peer := peerAddr(c, openvpnMultuSubnet); peer != "" {
+		nlRouteDelAll(peer)
+	}
+	for i := 0; i < n; i++ {
+		dev := fmt.Sprintf("ovpnm-w%d", i)
+		openvpnKillStalePID(openvpnMultuWorkerPIDPath(c, i))
+		delMSS(dev)
+		nlDown(dev)
+	}
+}
+
 func (t *OpenvpnMultuTunnel) startWorker(w *openvpnMultuWorker) error {
-	logFile, err := os.OpenFile(w.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logFile, err := os.OpenFile(w.logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("openvpn log: %w", err)
 	}
@@ -224,6 +244,9 @@ func (t *OpenvpnMultuTunnel) Down() error {
 }
 
 func (t *OpenvpnMultuTunnel) doClean() {
+	if t.cfg != nil {
+		openvpnMultuPreclean(t.cfg)
+	}
 	peer := t.PeerIP()
 	nlRouteDel(peer)
 
@@ -271,13 +294,7 @@ func (t *OpenvpnMultuTunnel) stopWorker(w *openvpnMultuWorker) {
 	}
 	w.cmd = nil
 	if w.pidPath != "" {
-		if b, err := os.ReadFile(w.pidPath); err == nil {
-			var pid int
-			if _, err := fmt.Sscanf(string(b), "%d", &pid); err == nil && pid > 1 {
-				try("kill", fmt.Sprint(pid))
-			}
-		}
-		_ = os.Remove(w.pidPath)
+		openvpnKillStalePID(w.pidPath)
 	}
 	if w.dev != "" {
 		delMSS(w.dev)
