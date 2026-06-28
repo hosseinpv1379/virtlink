@@ -1,0 +1,21 @@
+# virlink — Hysteria2 server example (generate via virlink-setup)
+[tunnel]
+type      = "hysteria2"
+mode      = "server"
+local_ip  = "203.0.113.10"
+remote_ip = "198.51.100.20"
+cidr      = "10.20.10.0/24"
+mtu       = 1400
+name      = "site1"
+
+[transport]
+port               = 443
+proto              = "udp"
+heartbeat_interval = 20
+
+[hysteria2]
+config = "/opt/virlink/pki/site1/server.yaml"
+dev    = "hy2-tun0"
+
+[security]
+encryption = true

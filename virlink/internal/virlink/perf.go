@@ -52,7 +52,7 @@ func initPerfDefaults() {
 
 func isUserspaceTunnel(typ string) bool {
 	switch typ {
-	case "icmp", "udp", "tcp", "bip", "udp-obfs", "openvpn":
+	case "icmp", "udp", "tcp", "bip", "udp-obfs", "openvpn", "hysteria2":
 		return true
 	}
 	return false
@@ -113,6 +113,9 @@ func initUserspacePerfDefaults(c *Config) {
 		default:
 			perf.pollMs = 50
 		}
+	case "hysteria2":
+		perf.tunQueues = 1
+		perf.pollMs = 50
 	}
 }
 

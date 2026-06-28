@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.14"
+SCRIPT_VERSION="1.3.0"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -31,7 +31,7 @@ readonly -a KERNEL_TUNNEL_KEYS=(
   gre-fou ipip-fou bonded-gre-fou l2tpv3 gre-fou-ipsec gre
 )
 readonly -a USERSPACE_TUNNEL_KEYS=(
-  icmp udp bip tcp udp-obfs openvpn
+  icmp udp bip tcp udp-obfs openvpn hysteria2
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -539,6 +539,33 @@ ensure_openvpn_deps() {
   ok "OpenVPN core installed"
 }
 
+ensure_hysteria2_deps() {
+  if command -v hysteria &>/dev/null; then
+    ok "Hysteria2 ready ($(hysteria version 2>/dev/null | head -1 || echo hysteria))"
+    return 0
+  fi
+  require_root
+  ensure_cmd curl
+  local arch="" os="linux" ver url dest="/usr/local/bin/hysteria"
+  case "$(uname -m)" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) die "Unsupported CPU for Hysteria2: $(uname -m)" ;;
+  esac
+  ver=$(curl -fsSL --connect-timeout 8 --max-time 15 \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+  [[ -n "$ver" ]] || die "Cannot fetch Hysteria2 release — check network"
+  url="https://github.com/apernet/hysteria/releases/download/${ver}/hysteria-${os}-${arch}"
+  info "Downloading Hysteria2 ${ver}..."
+  safe_download "$url" "${dest}.new"
+  chmod +x "${dest}.new"
+  mv "${dest}.new" "$dest"
+  command -v hysteria &>/dev/null || die "Hysteria2 install failed"
+  ok "Hysteria2 installed (${ver})"
+}
+
 ensure_ssh_deps() {
   local -a need=() c
   for c in ssh scp; do
@@ -599,6 +626,9 @@ tunnel_start() {
   [[ -f "$cfg" ]] || die "Config not found: $cfg"
   if [[ "$(_cfg_tunnel_type "$cfg")" == "openvpn" ]]; then
     ensure_openvpn_deps
+  fi
+  if [[ "$(_cfg_tunnel_type "$cfg")" == "hysteria2" ]]; then
+    ensure_hysteria2_deps
   fi
   write_service_file "$name"
   local svc; svc="$(svc_name "$name")"
@@ -816,6 +846,7 @@ udp            — User-space UDP tunnel             plain UDP
 bip            — BIP tunnel (proto 58)             DPI bypass
 tcp            — User-space TCP tunnel             auto-reconnect
 openvpn        — OpenVPN core (encrypted link)     UDP/TCP · high throughput
+hysteria2      — Hysteria2 QUIC tunnel             fast · censorship-resistant
 udp-obfs       — Obfuscated UDP (AES-256-GCM)      DPI bypass (Iran)
 EOF
 }
@@ -851,6 +882,7 @@ dispatch_tunnel_generator() {
     gre)            gen_gre      ;;
     tcp)            gen_tcp      ;;
     openvpn)        gen_openvpn  ;;
+    hysteria2)     gen_hysteria2 ;;
     udp)            gen_udp      ;;
     icmp)           gen_icmp     ;;
     bip)            gen_bip      ;;
@@ -961,6 +993,21 @@ EOF
     openvpn)
       write_openvpn_tuning "$file" "fast"
       return
+      ;;
+    hysteria2)
+      cat >> "$file" << EOF
+
+[tuning]
+enabled      = true
+mode         = "fast"
+poll_ms      = 50
+tx_queue_len = 10000
+
+[logging]
+level            = "info"
+profile          = true
+profile_interval = 30
+EOF
       ;;
     *)
       write_tuning "$file"
@@ -2139,6 +2186,280 @@ EOF
     info "Client overlay IP: ${client_ip}  ·  Server overlay IP: ${server_ip}"
   fi
   info "OpenVPN: tun-mtu ${tun_mtu}  mssfix ${mssfix}  profile ${perf}"
+}
+
+# ── Hysteria2 helpers ──────────────────────────────────────────────────────────
+
+hysteria2_overlay_ips() {
+  openvpn_overlay_ips "$@"
+}
+
+hysteria2_gen_credentials() {
+  local dir="$1"
+  mkdir -p "$dir/export"
+  chmod 700 "$dir"
+  if [[ -f "$dir/password" && -f "$dir/server.crt" ]]; then
+    ok "Hysteria2 credentials already exist in ${dir}"
+    return 0
+  fi
+  info "Generating Hysteria2 TLS cert + password..."
+  openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" \
+    || die "OpenSSL: cannot generate server key"
+  openssl req -new -x509 -days 3650 -key "$dir/server.key" -out "$dir/server.crt" \
+    -subj "/CN=hy2-local" \
+    || die "OpenSSL: cannot create server certificate"
+  openssl rand -hex 16 > "$dir/password"
+  chmod 600 "$dir/server.key" "$dir/password"
+  chmod 644 "$dir/server.crt"
+  ok "Hysteria2 credentials generated"
+}
+
+hysteria2_write_server_yaml() {
+  local dir="$1" port="$2" server_ip="$3" mtu="$4" dev="$5" obfs="$6"
+  local pass; pass="$(tr -d '\n' < "${dir}/password")"
+  cat > "${dir}/server.yaml" << EOF
+# virlink Hysteria2 — server (QUIC masquerade)
+listen: :${port}
+
+tls:
+  cert: server.crt
+  key: server.key
+
+auth:
+  type: password
+  password: ${pass}
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.bing.com
+    rewriteHost: true
+
+bandwidth:
+  up: 1 gbps
+  down: 1 gbps
+EOF
+  if [[ -n "$obfs" ]]; then
+    cat >> "${dir}/server.yaml" << EOF
+
+obfs:
+  type: salamander
+  salamander:
+    password: ${obfs}
+EOF
+  fi
+}
+
+hysteria2_write_client_yaml() {
+  local dir="$1" port="$2" remote_ip="$3" client_ip="$4" cidr="$5" mtu="$6" dev="$7" obfs="$8"
+  local pass prefix; pass="$(tr -d '\n' < "${dir}/password")"
+  prefix="${cidr#*/}"
+  cat > "${dir}/client.yaml" << EOF
+# virlink Hysteria2 — client (site-to-site TUN)
+server: ${remote_ip}:${port}
+
+auth: ${pass}
+
+tls:
+  ca: server.crt
+
+bandwidth:
+  up: 200 mbps
+  down: 200 mbps
+
+tun:
+  name: ${dev}
+  mtu: ${mtu}
+  address:
+    ipv4: ${client_ip}/${prefix}
+  route:
+    ipv4: ["${cidr}"]
+    ipv4Exclude: ["${remote_ip}/32"]
+EOF
+  if [[ -n "$obfs" ]]; then
+    cat >> "${dir}/client.yaml" << EOF
+
+obfs:
+  type: salamander
+  salamander:
+    password: ${obfs}
+EOF
+  fi
+}
+
+hysteria2_export_client_bundle() {
+  local dir="$1"
+  local export_dir="${dir}/export"
+  mkdir -p "$export_dir"
+  cp -f "${dir}/server.crt" "${export_dir}/server.crt"
+  cp -f "${dir}/password" "${export_dir}/password"
+  cp -f "${dir}/client.yaml" "${export_dir}/client.yaml"
+  chmod 600 "${export_dir}/password"
+  ok "Client export: ${export_dir}"
+}
+
+hysteria2_show_fingerprint() {
+  local dir="$1"
+  blank
+  info "Credential fingerprint — must match on client:"
+  md5sum "${dir}/server.crt" "${dir}/password" 2>/dev/null | sed 's/^/    /'
+}
+
+hysteria2_fetch_from_server() {
+  local name="$1" server_host="$2" pki_dir="$3"
+  local ssh_user="${4:-root}" ssh_port="${5:-22}"
+  local remote="${INSTALL_DIR}/pki/${name}/export"
+  local -a ssh_opts=(-p "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
+  local -a scp_opts=(-P "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
+  ensure_ssh_deps
+  mkdir -p "$pki_dir"
+  chmod 700 "$pki_dir"
+  info "Fetching Hysteria2 credentials from ${server_host}..."
+  scp "${scp_opts[@]}" -r "${ssh_user}@${server_host}:${remote}/." "${pki_dir}/" \
+    || die "SCP failed — run Hysteria2 setup on server first"
+  [[ -f "${pki_dir}/client.yaml" && -f "${pki_dir}/password" && -f "${pki_dir}/server.crt" ]] \
+    || die "Incomplete bundle from server"
+  cp -f "${pki_dir}/server.crt" "${pki_dir}/server.crt"
+  cp -f "${pki_dir}/password" "${pki_dir}/password"
+  ok "Credentials copied to ${pki_dir}"
+}
+
+hysteria2_acquire_client() {
+  local name="$1" server_host="$2" pki_dir="$3"
+  if [[ -f "${pki_dir}/client.yaml" ]]; then
+    hysteria2_show_fingerprint "$pki_dir"
+    return 0
+  fi
+  blank
+  warn "Hysteria2 credentials not found locally."
+  pick method "Get credentials from server" \
+    "ssh-password — SCP from server (recommended)" \
+    "manual — copy export/ by hand"
+  method="$(label_key "$method")"
+  case "$method" in
+    ssh-password)
+      openvpn_prompt_ssh
+      hysteria2_fetch_from_server "$name" "$server_host" "$pki_dir" \
+        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
+      ;;
+    manual)
+      echo -e "  Copy from server:"
+      echo -e "    ${W}${INSTALL_DIR}/pki/${name}/export/${NC}"
+      echo -e "  To client:"
+      echo -e "    ${W}${pki_dir}/${NC}"
+      press_enter
+      [[ -f "${pki_dir}/client.yaml" ]] || die "client.yaml missing in ${pki_dir}"
+      ;;
+    *) die "Unknown method: $method" ;;
+  esac
+  hysteria2_show_fingerprint "$pki_dir"
+}
+
+hysteria2_push_to_client() {
+  local name="$1" client_host="$2" pki_dir="$3"
+  local ssh_user="${4:-root}" ssh_port="${5:-22}"
+  local export_dir="${pki_dir}/export"
+  local remote_dir="${INSTALL_DIR}/pki/${name}"
+  local -a ssh_opts=(-p "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
+  local -a scp_opts=(-P "$ssh_port" -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new)
+  hysteria2_export_client_bundle "$pki_dir"
+  ensure_ssh_deps
+  ssh "${ssh_opts[@]}" "${ssh_user}@${client_host}" "mkdir -p '${remote_dir}' && chmod 700 '${remote_dir}'" \
+    || die "SSH to client failed"
+  scp "${scp_opts[@]}" -r "${export_dir}/." "${ssh_user}@${client_host}:${remote_dir}/" \
+    || die "SCP to client failed"
+  ok "Credentials pushed to ${client_host}:${remote_dir}"
+}
+
+gen_hysteria2() {
+  local name mode local_ip remote_ip cidr port mtu dev pki_dir hy_conf cfg
+  local client_ip server_ip prefix obfs_raw obfs="" hb
+  collect_base_inputs name mode local_ip remote_ip cidr
+  blank
+  info "Hysteria2 uses QUIC/UDP — fast and resistant to many filters."
+  prompt port "Hysteria2 port (QUIC)" "443"
+  prompt mtu "TUN MTU (overlay)" "1400"
+  pick obfs_raw "Salamander obfuscation (optional)" \
+    "no — standard HTTP/3 masquerade" \
+    "yes — salamander (extra obfuscation password)"
+  if [[ "$(label_key "$obfs_raw")" == "yes" ]]; then
+    obfs="$(openssl rand -hex 8)"
+    info "Obfuscation password: ${obfs}"
+  fi
+  dev="hy2-tun0"
+
+  ensure_hysteria2_deps
+  pki_dir="${INSTALL_DIR}/pki/${name}"
+  mkdir -p "$pki_dir"
+
+  if [[ "$mode" == "server" ]]; then
+    hysteria2_gen_credentials "$pki_dir"
+  else
+    hysteria2_acquire_client "$name" "$remote_ip" "$pki_dir"
+    [[ -f "${pki_dir}/password" ]] || cp -f "${pki_dir}/export/password" "${pki_dir}/password" 2>/dev/null || true
+  fi
+
+  hysteria2_overlay_ips "$cidr" "$mode"
+  client_ip="$OPENVPN_CLIENT_IP"
+  server_ip="$OPENVPN_SERVER_IP"
+  prefix="${cidr#*/}"
+
+  if [[ "$mode" == "server" ]]; then
+    hysteria2_write_server_yaml "$pki_dir" "$port" "$server_ip" "$mtu" "$dev" "$obfs"
+    hysteria2_write_client_yaml "$pki_dir" "$port" "$local_ip" "$client_ip" "$cidr" "$mtu" "$dev" "$obfs"
+    hysteria2_export_client_bundle "$pki_dir"
+    hy_conf="${pki_dir}/server.yaml"
+    ok "Wrote ${hy_conf}"
+    blank
+    if confirm "Push credentials to client ${remote_ip} via SSH password"; then
+      openvpn_prompt_ssh
+      hysteria2_push_to_client "$name" "$remote_ip" "$pki_dir" \
+        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
+    else
+      info "Copy ${pki_dir}/export/ to client, then run setup there (client mode)."
+    fi
+    hysteria2_show_fingerprint "$pki_dir"
+    warn "Start SERVER first. Firewall: allow UDP/${port} (QUIC) to this host."
+  else
+    [[ -f "${pki_dir}/client.yaml" ]] || die "Missing client.yaml"
+    cp -f "${pki_dir}/server.crt" "${pki_dir}/server.crt" 2>/dev/null || true
+    hy_conf="${pki_dir}/client.yaml"
+    ok "Using ${hy_conf}"
+    warn "Start the Hysteria2 SERVER on ${remote_ip} first."
+    warn "Firewall: allow outbound UDP/${port} to server (Hetzner cloud firewall too)."
+  fi
+
+  hb=20
+  cfg="${CONFIGS_DIR}/${name}.toml"
+  cat > "$cfg" << EOF
+# virlink — ${name}  (Hysteria2 site-to-site · QUIC)
+[tunnel]
+type      = "hysteria2"
+mode      = "${mode}"
+local_ip  = "${local_ip}"
+remote_ip = "${remote_ip}"
+cidr      = "${cidr}"
+mtu       = ${mtu}
+name      = "${name}"
+
+[transport]
+port               = ${port}
+proto              = "udp"
+heartbeat_interval = ${hb}
+
+[hysteria2]
+config = "${hy_conf}"
+dev    = "${dev}"
+
+[security]
+encryption = true
+EOF
+  write_userspace_tuning "$cfg" "hysteria2"
+  add_forward_section "$cfg" "$mode"
+  LAST_CFG_PATH="$cfg"
+  blank
+  info "Overlay: client ${client_ip}  ·  server ${server_ip}  ·  health uses UDP probes"
+  info "Log: /var/log/virlink/${name}-hysteria2.log"
 }
 
 gen_tcp() {
