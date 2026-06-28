@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.6.6"
+SCRIPT_VERSION="1.6.7"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@mioopython"
 AUTHOR="Hossein"
@@ -2222,6 +2222,34 @@ openvpn_fetch_pki_via_http() {
   die "Download failed — on server re-run setup for new token, or use ssh-password method"
 }
 
+openvpnmultu_export_client_toml() {
+  local name="$1" server_cfg="$2" client_pub="$3" server_pub="$4" pki_dir="$5"
+  local export_dir="${pki_dir}/export"
+  local out="${export_dir}/${name}-client.toml"
+  mkdir -p "$export_dir"
+  virlink_make_client_toml "$server_cfg" "$out" "$client_pub" "$server_pub"
+  ok "Client virlink config: ${out} (copy to ${CONFIGS_DIR}/${name}.toml on client)"
+}
+
+openvpnmultu_install_client_toml() {
+  local name="$1" pki_dir="$2"
+  local src="" candidate
+  for candidate in \
+    "${pki_dir}/export/${name}-client.toml" \
+    "${pki_dir}/${name}-client.toml" \
+    "${pki_dir}/export/client.toml"; do
+    if [[ -f "$candidate" ]]; then
+      src="$candidate"
+      break
+    fi
+  done
+  [[ -n "$src" ]] || return 0
+  mkdir -p "$CONFIGS_DIR"
+  cp "$src" "${CONFIGS_DIR}/${name}.toml"
+  ok "Installed virlink config: ${CONFIGS_DIR}/${name}.toml"
+  info "openvpnmultu: ${name}-client.toml — N worker openvpn configs are created at tunnel start (no client.conf in PKI)"
+}
+
 openvpn_show_manual_copy_help() {
   local name="$1" server_host="$2" pki_dir="$3"
   blank
@@ -2231,6 +2259,10 @@ openvpn_show_manual_copy_help() {
   echo -e "    ${W}${INSTALL_DIR}/pki/${name}/export/${NC}"
   echo -e "  Copy ${W}ca.crt client.crt client.key tc.key${NC} to client:"
   echo -e "    ${W}${pki_dir}/${NC}"
+  if [[ -f "${pki_dir}/export/${name}-client.toml" ]]; then
+    echo -e "  Also copy virlink client config:"
+    echo -e "    ${W}${pki_dir}/export/${name}-client.toml${NC}  →  ${W}${CONFIGS_DIR}/${name}.toml${NC}"
+  fi
   echo
   echo -e "  ${DIM}Example (enter password when asked):${NC}"
   echo -e "    scp -r root@${server_host}:${INSTALL_DIR}/pki/${name}/export/* ${pki_dir}/"
@@ -2245,6 +2277,10 @@ openvpn_acquire_client_pki() {
   if [[ -f "${pki_dir}/ca.crt" ]]; then
     openvpn_require_client_pki "$pki_dir"
     openvpn_show_pki_fingerprint "$pki_dir"
+    openvpnmultu_install_client_toml "$name" "$pki_dir"
+    if [[ ! -f "${CONFIGS_DIR}/${name}.toml" ]]; then
+      warn "PKI found but no ${CONFIGS_DIR}/${name}.toml — run client setup wizard or copy ${name}-client.toml from server export/"
+    fi
     return 0
   fi
 
@@ -2282,6 +2318,7 @@ openvpn_acquire_client_pki() {
   esac
   openvpn_require_client_pki "$pki_dir"
   openvpn_show_pki_fingerprint "$pki_dir"
+  openvpnmultu_install_client_toml "$name" "$pki_dir"
 }
 
 openvpn_server_send_credentials() {
@@ -2351,6 +2388,15 @@ openvpn_push_client_bundle() {
 
   scp "${scp_opts[@]}" -r "${export_dir}/." "${ssh_user}@${client_host}:${remote_dir}/" \
     || die "SCP to client failed"
+
+  if [[ -f "${export_dir}/${name}-client.toml" ]]; then
+    ssh "${ssh_opts[@]}" "${ssh_user}@${client_host}" "mkdir -p '${CONFIGS_DIR}'" \
+      || die "SSH to client failed"
+    scp "${scp_opts[@]}" "${export_dir}/${name}-client.toml" \
+      "${ssh_user}@${client_host}:${CONFIGS_DIR}/${name}.toml" \
+      || die "SCP client config to client failed"
+    ok "Client virlink config pushed to ${CONFIGS_DIR}/${name}.toml"
+  fi
 
   ok "Client credentials pushed to ${client_host}:${remote_dir}"
   info "On client: run setup again (same tunnel name) or start the tunnel"
@@ -2721,6 +2767,8 @@ EOF
   if [[ "$mode" == "server" ]]; then
     local pki="${INSTALL_DIR}/pki/${name}" tls_key="tc.key"
     [[ -f "${pki_dir}/tc.key" ]] || tls_key="ta.key"
+    openvpn_export_client_bundle "$pki_dir" 2>/dev/null || true
+    openvpnmultu_export_client_toml "$name" "$cfg" "$remote_ip" "$local_ip" "$pki_dir"
     virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "openvpnmultu" "$port" \
       "${pki}/ca.crt" "${pki_dir}/ca.crt" 644 \
       "${pki}/client.crt" "${pki_dir}/client.crt" 644 \
@@ -2735,10 +2783,15 @@ EOF
     warn "Firewall: allow ${proto} ports ${port}–$((port + workers - 1)) from client ${remote_ip}"
   else
     blank
+    openvpnmultu_install_client_toml "$name" "$pki_dir"
+    if [[ ! -f "${CONFIGS_DIR}/${name}.toml" ]]; then
+      warn "Missing ${CONFIGS_DIR}/${name}.toml — this wizard creates it; PKI files alone are not enough."
+    fi
     warn "Start the OpenVPN MULTU SERVER on ${remote_ip} first."
     warn "Firewall: allow ${proto} ports ${port}–$((port + workers - 1)) to server."
     info "Workers materialized at tunnel start: /var/run/virlink/${name}/w*.conf"
     info "Logs: /var/log/virlink/${name}-w*-openvpn.log"
+    info "Then: virlink-setup → ${name} → start"
   fi
 
   blank
