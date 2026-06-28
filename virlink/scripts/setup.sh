@@ -3204,10 +3204,6 @@ _ikev2_pkg_names() {
 }
 
 ensure_ikev2_deps() {
-  local -a need=() pkg
-  for c in swanctl ip; do
-    command -v "$c" &>/dev/null || need+=("shell")
-  done
   if command -v swanctl &>/dev/null && command -v ip &>/dev/null; then
     ok "IKEv2 ready (strongSwan swanctl)"
     systemctl enable strongswan 2>/dev/null || systemctl enable strongswan-starter 2>/dev/null || true
@@ -3215,11 +3211,14 @@ ensure_ikev2_deps() {
   fi
   require_root
   warn "strongSwan missing — installing..."
-  for pkg in $(_ikev2_pkg_names); do
-    _pkg_install "$pkg" 2>/dev/null && break
-  done
-  command -v swanctl &>/dev/null || die "swanctl not found after install"
-  ok "strongSwan installed"
+  local -a pkgs=()
+  read -ra pkgs <<< "$(_ikev2_pkg_names)"
+  _pkg_install "${pkgs[@]}"
+  if ! command -v swanctl &>/dev/null; then
+    die "swanctl not found after install — run: apt install strongswan-swanctl (Debian/Ubuntu) or dnf install strongswan-swanctl"
+  fi
+  systemctl enable strongswan 2>/dev/null || systemctl enable strongswan-starter 2>/dev/null || true
+  ok "strongSwan installed ($(swanctl --version 2>/dev/null | head -1 || echo swanctl))"
 }
 
 ikev2_allow_firewall() {
