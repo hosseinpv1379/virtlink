@@ -48,13 +48,13 @@ Overlay (همه تست‌ها)
 ------------------
   Kernel (+ nftables mangle):
     gre-fou, ipip-fou, bonded-gre-fou, gre, l2tpv3,
-    gre-fou-ipsec, gre-wg, vxlan-wg
+    gre-fou-ipsec
 
-  Userspace (+ IP_HDRINCL):
-    icmp, udp, bip
+  Userspace (+ IPPROTO_RAW):
+    icmp, udp, bip, tcp
 
   بدون [mangle]:
-    tcp, udp-obfs  ← در این پوشه نیست
+    udp-obfs  ← در این پوشه نیست
 
 پورت‌ها (جلوگیری از تداخل بین تست‌ها)
 ------------------------------------
@@ -63,14 +63,7 @@ Overlay (همه تست‌ها)
   bonded         5703 + 5704
   gre-fou-ipsec  5706
   l2tpv3         5705
-  gre-wg         5710
-  vxlan-wg       5711
   udp            5720
-
-WireGuard (gre-wg / vxlan-wg)
------------------------------
-  ۱. روی یک ماشین:  ./virlink keygen
-  ۲. کلیدها را در client/gre-wg.toml و server/gre-wg.toml (و vxlan-wg) جایگزین کن
 
 IPsec (gre-fou-ipsec)
 ---------------------

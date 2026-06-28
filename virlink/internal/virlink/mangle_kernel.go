@@ -20,8 +20,8 @@ var kernelMangleMu sync.Mutex
 
 func isKernelTunnel(typ string) bool {
 	switch typ {
-	case "gre-fou", "ipip-fou", "bonded-gre-fou", "l2tpv3",
-		"gre-wg", "vxlan-wg", "gre-fou-ipsec", "gre":
+	case 		"gre-fou", "ipip-fou", "bonded-gre-fou", "l2tpv3",
+		"gre-fou-ipsec", "gre":
 		return true
 	default:
 		return false

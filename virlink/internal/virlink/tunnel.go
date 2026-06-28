@@ -27,10 +27,6 @@ func newTunnel(cfg *Config) (Tunnel, error) {
 		return &BondedTunnel{cfg: cfg}, nil
 	case "l2tpv3":
 		return &L2tpv3Tunnel{cfg: cfg}, nil
-	case "gre-wg":
-		return &GreWgTunnel{cfg: cfg}, nil
-	case "vxlan-wg":
-		return &VxlanWgTunnel{cfg: cfg}, nil
 	case "gre-fou-ipsec":
 		return &IpsecTunnel{cfg: cfg}, nil
 	case "udp-obfs":

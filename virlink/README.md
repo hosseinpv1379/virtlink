@@ -1,6 +1,6 @@
 # virlink
 
-**Kernel-native virtual tunnel manager** — GRE, IPIP, L2TP, WireGuard, obfuscated UDP, raw ICMP/TCP/UDP/BIP tunnels, all managed through a single binary and interactive setup script.
+**Kernel-native virtual tunnel manager** — GRE, IPIP, L2TP, IPsec, obfuscated UDP, raw ICMP/TCP/UDP/BIP tunnels, all managed through a single binary and interactive setup script.
 
 [![Release](https://img.shields.io/github/v/release/hosseinpv1379/virtlink-install)](https://github.com/hosseinpv1379/virtlink-install/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-linux%20amd64-blue)](https://github.com/hosseinpv1379/virtlink-install/releases/latest)
@@ -35,7 +35,6 @@ sudo virlink-setup
 | `ipip-fou` | UDP | IPIP wrapped in UDP | ✗ | Minimal overhead |
 | `bonded-gre-fou` | UDP | Dual GRE-FOU ECMP | ✗ | 2× bandwidth |
 | `l2tpv3` | UDP | L2TPv3 over UDP | ✗ | Layer-2 bridge |
-| `gre-wg` | UDP | GRE inside WireGuard | ✓ | Encrypted routing |
 | `udp-obfs` | UDP | AES-256-GCM + fake headers | ✓ | **DPI bypass / Iran** |
 | `gre-fou-ipsec` | UDP | GRE-FOU + IPsec ESP | ✓ | Encrypted FOU |
 | `gre` | IP/47 | Plain kernel GRE | ✗ | No UDP wrapper |

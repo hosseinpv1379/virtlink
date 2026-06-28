@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-const version = "2.9.5"
+const version = "2.9.6"
 
 func Main() {
 	cfgFile  := flag.String("c", "", "path to config.toml")
@@ -19,12 +19,6 @@ func Main() {
 
 	if *doVer {
 		fmt.Printf("virlink v%s\n", version)
-		return
-	}
-
-	// keygen sub-command
-	if flag.NArg() > 0 && flag.Arg(0) == "keygen" {
-		keygen()
 		return
 	}
 
@@ -81,7 +75,6 @@ Usage:
   sudo ./virlink -c config.toml            run (tunnel up, blocks, Ctrl+C removes)
   sudo ./virlink -c config.toml --down     tear down tunnel
   sudo ./virlink -c config.toml --status   show tunnel status
-       ./virlink keygen                    generate WireGuard keypair
        ./virlink --version
 
 Tunnel types  ([tunnel] type = "..." in config.toml):
@@ -89,7 +82,6 @@ Tunnel types  ([tunnel] type = "..." in config.toml):
   ipip-fou        IPIP in UDP (FOU)          port 5055
   bonded-gre-fou  dual GRE-FOU ECMP 2×BW    port 5557/5558
   l2tpv3          L2TPv3 over UDP            port 5059
-  gre-wg          GRE inside WireGuard       wg 51820
   gre-fou-ipsec   GRE-FOU + IPsec ESP        port 5556
   udp-obfs        AES-256-GCM obfuscated UDP port 443
   gre             Kernel GRE (proto 47)      raw

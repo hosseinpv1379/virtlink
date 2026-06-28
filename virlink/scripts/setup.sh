@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.7"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -24,9 +24,8 @@ PICKED_TUNNEL_TYPE=""  # set by pick_tunnel_type (never capture pick UI via $())
 PRESELECTED_MODE=""  # set during create flow (client/server chosen upfront)
 
 # Kernel vs userspace tunnel classification
-# Note: vxlan-wg is supported by the binary but has no setup.sh generator yet.
 readonly -a KERNEL_TUNNEL_KEYS=(
-  gre-fou ipip-fou bonded-gre-fou l2tpv3 gre-wg gre-fou-ipsec gre
+  gre-fou ipip-fou bonded-gre-fou l2tpv3 gre-fou-ipsec gre
 )
 readonly -a USERSPACE_TUNNEL_KEYS=(
   icmp udp bip tcp udp-obfs
@@ -667,7 +666,6 @@ gre-fou        — GRE in UDP (FOU)                  fast, no encryption
 ipip-fou       — IPIP in UDP (FOU)                 minimal overhead
 bonded-gre-fou — Dual GRE-FOU ECMP                 2× bandwidth
 l2tpv3         — L2TPv3 over UDP                   Layer-2 tunnel
-gre-wg         — GRE inside WireGuard              encrypted
 gre-fou-ipsec  — GRE-FOU + IPsec ESP               encrypted + FOU
 gre            — Kernel GRE (proto 47)             no UDP wrapper
 EOF
@@ -709,7 +707,6 @@ dispatch_tunnel_generator() {
     ipip-fou)       gen_ipip_fou ;;
     bonded-gre-fou) gen_bonded   ;;
     l2tpv3)         gen_l2tpv3   ;;
-    gre-wg)         gen_gre_wg   ;;
     udp-obfs)       gen_udp_obfs ;;
     gre-fou-ipsec)  gen_ipsec    ;;
     gre)            gen_gre      ;;
@@ -984,48 +981,6 @@ EOF
   LAST_CFG_PATH="$cfg"
 }
 
-gen_gre_wg() {
-  local name mode local_ip remote_ip cidr port mtu cfg
-  local cpriv cpub spriv spub
-  collect_base_inputs name mode local_ip remote_ip cidr
-  prompt port "WireGuard port" "51820"
-  prompt mtu  "MTU"            "1380"
-  blank
-  warn "Run 'virlink keygen' to generate WireGuard key pairs."
-  prompt cpriv "Client private key" ""
-  prompt cpub  "Client public key"  ""
-  prompt spriv "Server private key" ""
-  prompt spub  "Server public key"  ""
-  cfg="${CONFIGS_DIR}/${name}.toml"
-  cat > "$cfg" << EOF
-# virlink — ${name}
-[tunnel]
-type      = "gre-wg"
-mode      = "${mode}"
-local_ip  = "${local_ip}"
-remote_ip = "${remote_ip}"
-cidr      = "${cidr}"
-mtu       = ${mtu}
-
-[transport]
-port               = ${port}
-proto              = "wireguard"
-heartbeat_interval = 10
-
-[wireguard]
-client_private_key = "${cpriv}"
-client_public_key  = "${cpub}"
-server_private_key = "${spriv}"
-server_public_key  = "${spub}"
-
-[security]
-encryption = true
-EOF
-  write_tuning "$cfg"
-  add_forward_section "$cfg" "$mode"
-  LAST_CFG_PATH="$cfg"
-}
-
 gen_udp_obfs() {
   local name mode local_ip remote_ip cidr port mtu key mask_val mask padding cfg
   collect_base_inputs name mode local_ip remote_ip cidr
@@ -1251,7 +1206,7 @@ menu_create_tunnel() {
 
   blank
   pick category_raw "Select tunnel category" \
-    "kernel     — Kernel datapath (GRE, FOU, WireGuard, IPsec...)" \
+    "kernel     — Kernel datapath (GRE, FOU, IPsec, L2TP...)" \
     "userspace  — Userspace transport (ICMP, UDP, TCP, BIP, obfs)"
   local category
   category="$(label_key "$category_raw")"
@@ -1306,7 +1261,6 @@ menu_tunnel_management() {
     "edit      — open config in editor" \
     "logs      — tail / follow / search logs" \
     "forward   — add port forwarding rule" \
-    "keygen    — generate WireGuard keypair" \
     "remove    — delete tunnel + service"
   action="$(label_key "$action")"
 
@@ -1350,9 +1304,6 @@ menu_tunnel_management() {
       ;;
     forward)
       _manage_forward "$name"
-      ;;
-    keygen)
-      _manage_keygen
       ;;
   esac
   blank
@@ -1529,15 +1480,6 @@ _manage_logs() {
       sep_thin
       ;;
   esac
-}
-
-_manage_keygen() {
-  blank
-  echo -e "  ${BOLD}Generate WireGuard Keypair${NC}"
-  sep_thin
-  require_bin
-  blank
-  "$VIRLINK_BIN" keygen
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

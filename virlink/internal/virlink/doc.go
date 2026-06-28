@@ -26,7 +26,6 @@
 //	  health.go     UDP probe + HTTP /health + dashboard data
 //	  forward.go    iptables port forwarding (client mode)
 //	  tuning.go     scoped server sysctl tuning
-//	  keygen.go     WireGuard keypair helper
 //
 //	Performance & diagnostics
 //	  perf.go       [tuning] runtime knobs (queues, batch, poll)
@@ -47,7 +46,7 @@
 //
 //	Kernel tunnels (netlink)
 //	  tun_gre_fou.go  tun_ipip_fou.go  tun_bonded.go  tun_l2tpv3.go
-//	  tun_gre_wg.go   tun_vxlan_wg.go  tun_ipsec.go   tun_gre.go
+//	  tun_ipsec.go   tun_gre.go
 //
 //	Userspace tunnels (TUN + raw/UDP/TCP)
 //	  tun_icmp.go  tun_udp.go  tun_tcp.go  tun_bip.go  tun_udp_obfs.go

@@ -13,7 +13,7 @@ import (
 
 // TunnelCfg maps to [tunnel] in config.toml
 type TunnelCfg struct {
-	Type     string `toml:"type"`      // gre-fou | ipip-fou | bonded-gre-fou | l2tpv3 | gre-wg | vxlan-wg | gre-fou-ipsec
+	Type     string `toml:"type"`      // gre-fou | ipip-fou | bonded-gre-fou | l2tpv3 | gre-fou-ipsec | ...
 	Mode     string `toml:"mode"`      // server | client
 	LocalIP  string `toml:"local_ip"`  // this host's public IP
 	RemoteIP string `toml:"remote_ip"` // peer's public IP
@@ -27,17 +27,8 @@ type TunnelCfg struct {
 type TransportCfg struct {
 	Port              int    `toml:"port"`               // primary UDP port
 	Port2             int    `toml:"port2"`              // secondary port (bonded only)
-	Proto             string `toml:"proto"`              // informational: fou | wireguard | l2tp
+	Proto             string `toml:"proto"`              // informational: fou | l2tp
 	HeartbeatInterval int    `toml:"heartbeat_interval"` // seconds between status logs (default 10)
-}
-
-// WireGuardCfg maps to [wireguard]
-type WireGuardCfg struct {
-	ClientPrivKey string `toml:"client_private_key"`
-	ClientPubKey  string `toml:"client_public_key"`
-	ServerPrivKey string `toml:"server_private_key"`
-	ServerPubKey  string `toml:"server_public_key"`
-	VNI           int    `toml:"vni"` // VXLAN Network Identifier (vxlan-wg)
 }
 
 // L2TPCfg maps to [l2tp]
@@ -120,7 +111,6 @@ type Config struct {
 	// TOML sections
 	Tunnel    TunnelCfg    `toml:"tunnel"`
 	Transport TransportCfg `toml:"transport"`
-	WireGuard WireGuardCfg `toml:"wireguard"`
 	L2TP      L2TPCfg      `toml:"l2tp"`
 	Security  SecurityCfg  `toml:"security"`
 	Tuning    TuningCfg    `toml:"tuning"`
@@ -141,8 +131,6 @@ type Config struct {
 	IpipFou ipipFouCfg `toml:"-"`
 	Bonded  bondedCfg  `toml:"-"`
 	L2tpv3  l2tpv3Cfg  `toml:"-"`
-	GreWg   greWgCfg   `toml:"-"`
-	VxlanWg vxlanWgCfg `toml:"-"`
 	Ipsec   ipsecCfg   `toml:"-"`
 }
 
@@ -157,20 +145,6 @@ type l2tpv3Cfg struct {
 	ClientTunnelID, ServerTunnelID                  int
 	ClientSessionID, ServerSessionID                int
 	MTU                                             int
-}
-
-type greWgCfg struct {
-	WgPort                                          int
-	MTU                                             int
-	ClientPrivKey, ClientPubKey                     string
-	ServerPrivKey, ServerPubKey                     string
-}
-
-type vxlanWgCfg struct {
-	WgPort                                          int
-	VNI, MTU                                        int
-	ClientPrivKey, ClientPubKey                     string
-	ServerPrivKey, ServerPubKey                     string
 }
 
 type ipsecCfg struct {
@@ -207,7 +181,7 @@ func loadConfig(path string) (*Config, error) {
 
 // shim copies unified config sections into the per-tunnel shim structs.
 func (c *Config) shim() {
-	t, tr, wg, l, s := c.Tunnel, c.Transport, c.WireGuard, c.L2TP, c.Security
+	t, tr, l, s := c.Tunnel, c.Transport, c.L2TP, c.Security
 
 	c.GreFou  = greFouCfg{Port: tr.Port, MTU: t.MTU}
 	c.IpipFou = ipipFouCfg{Port: tr.Port, MTU: t.MTU}
@@ -216,16 +190,6 @@ func (c *Config) shim() {
 		Port: tr.Port, MTU: t.MTU,
 		ClientTunnelID: l.ClientTunnelID, ServerTunnelID: l.ServerTunnelID,
 		ClientSessionID: l.ClientSessionID, ServerSessionID: l.ServerSessionID,
-	}
-	c.GreWg = greWgCfg{
-		WgPort: tr.Port, MTU: t.MTU,
-		ClientPrivKey: wg.ClientPrivKey, ClientPubKey: wg.ClientPubKey,
-		ServerPrivKey: wg.ServerPrivKey, ServerPubKey: wg.ServerPubKey,
-	}
-	c.VxlanWg = vxlanWgCfg{
-		WgPort: tr.Port, VNI: wg.VNI, MTU: t.MTU,
-		ClientPrivKey: wg.ClientPrivKey, ClientPubKey: wg.ClientPubKey,
-		ServerPrivKey: wg.ServerPrivKey, ServerPubKey: wg.ServerPubKey,
 	}
 	c.Ipsec = ipsecCfg{
 		Port: tr.Port, MTU: t.MTU,
@@ -247,8 +211,6 @@ func setDefaults(c *Config) {
 		case "ipip-fou":        t.MTU = 1440
 		case "bonded-gre-fou":  t.MTU = 1400
 		case "l2tpv3":          t.MTU = 1464
-		case "gre-wg":          t.MTU = 1380
-		case "vxlan-wg":        t.MTU = 1360
 		case "gre-fou-ipsec":   t.MTU = 1380
 		case "udp-obfs":        t.MTU = 1400
 		case "gre":             t.MTU = 1476
@@ -266,8 +228,6 @@ func setDefaults(c *Config) {
 		case "ipip-fou":                 tr.Port = 5055
 		case "bonded-gre-fou":           tr.Port = 5557
 		case "l2tpv3":                   tr.Port = 5059
-		case "gre-wg":                   tr.Port = 51820
-		case "vxlan-wg":                 tr.Port = 51821
 		case "udp-obfs":                 tr.Port = 443
 		case "tcp":                      tr.Port = 8443
 		case "udp":                      tr.Port = 5060
@@ -277,10 +237,6 @@ func setDefaults(c *Config) {
 	}
 	if tr.Port2 == 0 && t.Type == "bonded-gre-fou" {
 		tr.Port2 = tr.Port + 1
-	}
-
-	if c.WireGuard.VNI == 0 {
-		c.WireGuard.VNI = 100
 	}
 
 	l := &c.L2TP
@@ -314,7 +270,7 @@ func validate(c *Config) error {
 	}
 	valid := []string{
 		"gre-fou", "ipip-fou", "bonded-gre-fou",
-		"l2tpv3", "gre-wg", "vxlan-wg", "gre-fou-ipsec",
+		"l2tpv3", "gre-fou-ipsec",
 		"udp-obfs",
 		// raw protocol tunnels
 		"gre", "tcp", "udp", "icmp", "bip",
