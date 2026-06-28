@@ -88,7 +88,7 @@ func (t *OpenvpnTunnel) Up() error {
 	_ = os.MkdirAll(filepath.Dir(t.pidPath), 0o755)
 
 	step(fmt.Sprintf("starting openvpn (%s)...", filepath.Base(ov.Config)))
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("openvpn log: %w", err)
 	}
@@ -114,7 +114,7 @@ func (t *OpenvpnTunnel) Up() error {
 	go func() { _ = logFile.Close() }()
 
 	step("waiting for TUN device " + dev + "...")
-	if err := waitForOpenVPN(dev, logPath, t.cmd, 120*time.Second); err != nil {
+	if err := waitForOpenVPNWorker(dev, logPath, t.cmd, c.Tunnel.Mode == "server", 120*time.Second); err != nil {
 		t.stopProcess()
 		return err
 	}
