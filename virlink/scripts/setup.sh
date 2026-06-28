@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.11"
+SCRIPT_VERSION="1.2.12"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -1981,7 +1981,6 @@ key server.key
 EOF
   openvpn_write_crypto_block "$dir" server >> "${dir}/server.conf"
   cat >> "${dir}/server.conf" << EOF
-mode server
 tls-server
 ifconfig ${server_ip} ${client_ip}
 EOF
