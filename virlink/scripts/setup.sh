@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.5.3"
+SCRIPT_VERSION="1.5.4"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -2537,6 +2537,7 @@ virlink_make_client_toml() {
     -e 's|/server\.conf|/client.conf|g' \
     -e 's|/server\.yaml|/client.yaml|g' \
     -e 's|/wg-server\.conf|/wg-client.conf|g' \
+    -e 's|/awg-server\.conf|/awg-client.conf|g' \
     "$out"
   if ! grep -q '^\[forward\]' "$out"; then
     add_forward_section "$out" client
@@ -3317,20 +3318,29 @@ EOF
 
 ensure_amneziawg_module() {
   modprobe amneziawg 2>/dev/null || true
-  [[ -d /sys/module/amneziawg ]] && return 0
-  require_root
-  warn "amneziawg kernel module not loaded — run ensure_amneziawg_deps or install PPA amnezia/ppa"
+  if [[ -d /sys/module/amneziawg ]]; then
+    vinfo "kernel module amneziawg loaded"
+    return 0
+  fi
+  die "amneziawg kernel module not loaded — try: apt install amneziawg && modprobe amneziawg"
 }
 
 ensure_amneziawg_deps() {
   if command -v awg &>/dev/null && [[ -d /sys/module/amneziawg || -f /sys/module/amneziawg/refcnt ]]; then
+    if ! awg genkey >/dev/null 2>&1; then
+      die "awg genkey failed — reinstall: apt install amneziawg amneziawg-tools"
+    fi
     ok "AmneziaWG ready (awg + kernel module)"
-    vinfo "awg=$(command -v awg)  module=$(ls /sys/module/amneziawg 2>/dev/null | head -1 || echo loaded)"
+    vinfo "awg=$(command -v awg)  module=loaded"
     return 0
   fi
   if command -v awg &>/dev/null; then
     ensure_amneziawg_module
-    command -v awg &>/dev/null && { ok "AmneziaWG ready (awg)"; return 0; }
+    if awg genkey >/dev/null 2>&1; then
+      ok "AmneziaWG ready (awg + kernel module)"
+      return 0
+    fi
+    die "awg found but genkey failed — install amneziawg-tools"
   fi
   require_root
   warn "AmneziaWG missing — installing (Ubuntu/Debian: PPA amnezia/ppa)..."
@@ -3351,6 +3361,7 @@ ensure_amneziawg_deps() {
   esac
   ensure_amneziawg_module
   command -v awg &>/dev/null || die "awg not found after install — try: apt install amneziawg amneziawg-tools"
+  awg genkey >/dev/null 2>&1 || die "awg genkey failed after install — check amneziawg-tools"
   ok "AmneziaWG installed ($(awg --version 2>/dev/null | head -1 || echo awg))"
 }
 
@@ -3416,6 +3427,7 @@ amneziawg_pubkey() {
 
 amneziawg_gen_keys() {
   local dir="$1"
+  local sk ck sp cp
   mkdir -p "$dir"
   chmod 700 "$dir"
   if [[ -f "$dir/server.key" && -f "$dir/client.key" ]]; then
@@ -3425,14 +3437,19 @@ amneziawg_gen_keys() {
       amneziawg_gen_obfs_params
     return 0
   fi
-  ensure_amneziawg_deps
   info "Generating AmneziaWG keys (awg genkey)..."
   amneziawg_gen_obfs_params
-  amneziawg_keygen awg | tee "$dir/server.key" | amneziawg_pubkey awg > "$dir/server.pub"
-  amneziawg_keygen awg | tee "$dir/client.key" | amneziawg_pubkey awg > "$dir/client.pub"
+  sk=$(amneziawg_keygen awg) || die "awg genkey failed — install: apt install amneziawg amneziawg-tools"
+  ck=$(amneziawg_keygen awg) || die "awg genkey failed (client key)"
+  sp=$(printf '%s' "$sk" | amneziawg_pubkey awg) || die "awg pubkey failed (server)"
+  cp=$(printf '%s' "$ck" | amneziawg_pubkey awg) || die "awg pubkey failed (client)"
+  printf '%s\n' "$sk" > "$dir/server.key"
+  printf '%s\n' "$ck" > "$dir/client.key"
+  printf '%s\n' "$sp" > "$dir/server.pub"
+  printf '%s\n' "$cp" > "$dir/client.pub"
   chmod 600 "$dir"/*.key 2>/dev/null || true
   chmod 644 "$dir"/*.pub 2>/dev/null || true
-  ok "AmneziaWG keys generated (save obfs params — embedded in awg conf)"
+  ok "AmneziaWG keys generated (obfs params embedded in awg conf)"
 }
 
 amneziawg_write_server_conf() {
@@ -3538,6 +3555,7 @@ gen_amneziawg() {
   ensure_amneziawg_module
   pki_dir="${INSTALL_DIR}/pki/${name}"
   mkdir -p "$pki_dir"
+  info "PKI directory: ${pki_dir}"
 
   if [[ "$mode" == "server" ]]; then
     amneziawg_gen_keys "$pki_dir"
