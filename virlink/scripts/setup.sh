@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -1290,7 +1290,7 @@ reneg-sec 3600
 keepalive 10 60
 verb 1
 EOF
-      [[ "$proto" == "tcp" ]] && echo "tcp-nodelay"
+      [[ "$proto" == "tcp" ]] && echo "tcp-nodelay" || true
       ;;
     fast|*)
       cat << EOF
@@ -1299,7 +1299,7 @@ reneg-sec 0
 keepalive 20 90
 verb 1
 EOF
-      [[ "$proto" == "tcp" ]] && echo "tcp-nodelay"
+      [[ "$proto" == "tcp" ]] && echo "tcp-nodelay" || true
       ;;
   esac
 }
@@ -1330,7 +1330,6 @@ EOF
 
 openvpn_gen_pki() {
   local dir="$1"
-  ensure_openvpn_deps
   mkdir -p "$dir"
   chmod 700 "$dir"
 
@@ -1529,24 +1528,48 @@ openvpn_start_bundle_server() {
   OPENVPN_BUNDLE_PORT="$port"
 }
 
+openvpn_allow_bundle_firewall() {
+  local port="${1:-$OPENVPN_BUNDLE_PORT}"
+  if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    info "Opening UFW TCP/${port} for credential download..."
+    ufw allow "${port}/tcp" comment 'virlink openvpn bundle' >/dev/null 2>&1 || true
+  fi
+}
+
+openvpn_save_bundle_info() {
+  local pki_dir="$1" server_ip="$2" name="$3"
+  local port="${OPENVPN_BUNDLE_PORT:-8765}"
+  local token="${OPENVPN_BUNDLE_TOKEN:-}"
+  local f="${pki_dir}/export/COPY_TO_CLIENT.txt"
+  [[ -n "$token" ]] || return 0
+  cat > "$f" << EOF
+# virlink OpenVPN — copy these values on the CLIENT (easy HTTP download)
+server_ip=${server_ip}
+port=${port}
+token=${token}
+url=http://${server_ip}:${port}/${token}/bundle.tar.gz
+expires_minutes=$(( OPENVPN_BUNDLE_TTL / 60 ))
+tunnel_name=${name}
+EOF
+  chmod 600 "$f"
+}
+
 openvpn_show_bundle_instructions() {
   local server_ip="$1" name="$2"
   local port="${OPENVPN_BUNDLE_PORT:-8765}"
   local token="${OPENVPN_BUNDLE_TOKEN:-????????}"
   blank
-  echo -e "  ${BOLD}${G}Easy copy — no SSH keys needed${NC}"
+  tty_line -e "  ${BOLD}${G}━━━━━━━━━━ COPY TO CLIENT ━━━━━━━━━━${NC}"
+  tty_line -e "  ${BOLD}Server IP${NC}  ${W}${server_ip}${NC}"
+  tty_line -e "  ${BOLD}Port${NC}       ${W}${port}${NC}"
+  tty_line -e "  ${BOLD}Token${NC}      ${W}${token}${NC}  ${DIM}(enter exactly on client)${NC}"
+  tty_line -e "  ${BOLD}Expires${NC}    ${W}$(( OPENVPN_BUNDLE_TTL / 60 )) minutes${NC}"
   sep_thin
-  echo -e "  On the ${BOLD}client${NC}, run virlink-setup → Create tunnel → openvpn → client"
-  echo -e "  Choose: ${C}easy — HTTP download${NC}"
-  echo
-  echo -e "  ${DIM}Server IP${NC}   ${W}${server_ip}${NC}"
-  echo -e "  ${DIM}Port${NC}        ${W}${port}${NC}  ${DIM}(allow TCP on firewall)${NC}"
-  echo -e "  ${DIM}Token${NC}       ${W}${token}${NC}"
-  echo -e "  ${DIM}Expires${NC}     ${W}$(( OPENVPN_BUNDLE_TTL / 60 )) minutes${NC}"
-  echo
-  echo -e "  ${DIM}Or on client (one line):${NC}"
-  echo -e "  ${W}curl -fsSL http://${server_ip}:${port}/${token}/bundle.tar.gz | sudo tar -xzf - -C ${INSTALL_DIR}/pki/${name}/${NC}"
+  tty_line -e "  On ${BOLD}client${NC}: virlink-setup → openvpn → client → ${C}easy HTTP download${NC}"
+  tty_line -e "  ${DIM}One-liner on client:${NC}"
+  tty_line -e "  ${W}curl -fsSL http://${server_ip}:${port}/${token}/bundle.tar.gz | sudo tar -xzf - -C ${INSTALL_DIR}/pki/${name}/${NC}"
   sep_thin
+  info "Token also saved: ${INSTALL_DIR}/pki/${name}/export/COPY_TO_CLIENT.txt"
 }
 
 openvpn_fetch_pki_via_http() {
@@ -1559,9 +1582,10 @@ openvpn_fetch_pki_via_http() {
   chmod 700 "$pki_dir"
 
   blank
-  info "Easy download — copy Port + Token from the server screen."
+  info "Easy download — copy ${BOLD}Port${NC} and ${BOLD}Token${NC} from the server screen."
+  info "Server must show ${C}COPY TO CLIENT${NC} after you run setup there (option easy starts automatically)."
   prompt _p "Server download port" "$OPENVPN_BUNDLE_PORT"
-  prompt _t "Download token (8 characters from server)" ""
+  prompt _t "Download token (8 chars from server — not a placeholder)" ""
   port="$_p"
   token="$_t"
   [[ -n "$token" ]] || die "Token is required — start download on server first."
@@ -1639,41 +1663,43 @@ openvpn_acquire_client_pki() {
 
 openvpn_server_send_credentials() {
   local name="$1" client_host="$2" pki_dir="$3" server_ip="$4"
-  local method_raw method
 
   blank
-  pick method_raw "Send credentials to client" \
-    "easy — start HTTP download (recommended, no SSH keys)" \
-    "ssh-password — push via SSH (type client password when asked)" \
-    "ssh-key — push via SSH (automatic, needs ssh-copy-id)" \
-    "skip — show instructions only"
-  method="$(label_key "$method_raw")"
+  info "Starting credential download server for client ${client_host}..."
+  openvpn_allow_bundle_firewall "$OPENVPN_BUNDLE_PORT"
+  openvpn_start_bundle_server "$name" "$pki_dir"
+  openvpn_save_bundle_info "$pki_dir" "$server_ip" "$name"
+  ok "Download server running on TCP ${OPENVPN_BUNDLE_PORT}"
+  openvpn_show_bundle_instructions "$server_ip" "$name"
+  warn "If download fails: allow TCP ${OPENVPN_BUNDLE_PORT} on cloud firewall (Hetzner/AWS security group)"
 
-  case "$method" in
-    easy)
-      info "Starting temporary download server (port ${OPENVPN_BUNDLE_PORT})..."
-      openvpn_start_bundle_server "$name" "$pki_dir"
-      ok "Download server running"
-      openvpn_show_bundle_instructions "$server_ip" "$name"
-      warn "Allow TCP ${OPENVPN_BUNDLE_PORT} from client IP on this server's firewall"
-      ;;
-    ssh-password)
-      openvpn_prompt_ssh
-      openvpn_push_client_bundle "$name" "$client_host" "$pki_dir" \
-        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT" password
-      ;;
-    ssh-key)
-      openvpn_prompt_ssh
-      openvpn_push_client_bundle "$name" "$client_host" "$pki_dir" \
-        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT" key
-      ;;
-    skip|*)
-      openvpn_export_client_bundle "$pki_dir" || true
-      info "Client bundle: ${pki_dir}/export/"
-      info "On client: virlink-setup → openvpn → choose ${C}easy HTTP download${NC}"
-      info "Or start easy download here by re-running and picking that option."
-      ;;
-  esac
+  if confirm "Use SSH or manual copy instead?"; then
+    local method_raw method
+    pick method_raw "Alternative transfer" \
+      "ssh-password — push via SSH (password prompt)" \
+      "ssh-key — push via SSH (needs ssh-copy-id)" \
+      "manual — show scp commands only"
+    method="$(label_key "$method_raw")"
+    case "$method" in
+      ssh-password)
+        openvpn_prompt_ssh
+        openvpn_push_client_bundle "$name" "$client_host" "$pki_dir" \
+          "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT" password
+        ;;
+      ssh-key)
+        openvpn_prompt_ssh
+        openvpn_push_client_bundle "$name" "$client_host" "$pki_dir" \
+          "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT" key
+        ;;
+      manual)
+        openvpn_show_manual_copy_help "$name" "$client_host" "$pki_dir"
+        ;;
+    esac
+  fi
+
+  blank
+  info "Keep this session open until the client downloads (or within $(( OPENVPN_BUNDLE_TTL / 60 )) min)."
+  press_enter
 }
 
 openvpn_push_client_bundle() {
