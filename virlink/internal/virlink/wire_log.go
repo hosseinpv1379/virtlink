@@ -14,7 +14,7 @@ type wirePathKind string
 const (
 	wirePathUserspace wirePathKind = "userspace"
 	wirePathKernel    wirePathKind = "kernel"
-	wirePathTCPSock   wirePathKind = "tcp-socket"
+	wirePathTCP       wirePathKind = "tcp-nft"
 )
 
 type wirePeerVerdict int
@@ -84,17 +84,9 @@ func initWireMonitor(cfg *Config, path wirePathKind) {
 	expect := cfg.Mangle.DstIP
 	var txDesc string
 	switch path {
-	case wirePathTCPSock:
-		if cfg.Mode == "server" {
-			port := cfg.Transport.Port
-			if port == 0 {
-				port = 8443
-			}
-			txDesc = fmt.Sprintf("listen :%d  expect client wire src=%s", port, cfg.Mangle.DstIP)
-		} else {
-			txDesc = fmt.Sprintf("bind src=%s  dial dst=%s (real remote)",
-				cfg.Mangle.SrcIP, cfg.RemoteIP)
-		}
+	case wirePathTCP:
+		txDesc = fmt.Sprintf("src=%s dst=%s  RX wire src %s→real %s",
+			cfg.Mangle.SrcIP, cfg.RemoteIP, cfg.Mangle.DstIP, cfg.RemoteIP)
 	default:
 		txDesc = fmt.Sprintf("src=%s dst=%s (real remote %s)",
 			cfg.Mangle.SrcIP, cfg.RemoteIP, cfg.RemoteIP)
@@ -109,7 +101,7 @@ func initWireMonitor(cfg *Config, path wirePathKind) {
 	logInfo(fmt.Sprintf("[wire] RX expect outer src=%s (peer [mangle] srcip)", expect))
 	logInfo(fmt.Sprintf("[wire] verify on server: tcpdump -ni any host %s or host %s -vv",
 		cfg.LocalIP, cfg.RemoteIP))
-	if path == wirePathKernel {
+	if path == wirePathKernel || path == wirePathTCP {
 		logInfo("[wire] nft counters: nft list table ip " + nftMangleTable)
 	}
 	warnWireSpoofPrereqs()
@@ -240,7 +232,7 @@ func wireLogHeartbeat() {
 
 	if nftIn, nftOut, ok := readWireNFTCounters(); ok {
 		line += fmt.Sprintf("  nft_in=%d nft_out=%d", nftIn, nftOut)
-		if path == wirePathKernel {
+		if path == wirePathKernel || path == wirePathTCP {
 			if nftOut > 0 && nftIn == 0 {
 				line += "  ⚠ mangle OUT hits but IN=0 — peer packets not reaching host IP layer"
 			}

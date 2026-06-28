@@ -67,10 +67,8 @@ func listenTCPWire(cfg *Config, port int) (net.Listener, error) {
 	}
 	// Bind real local_ip — client SYN arrives with daddr=local_ip, not wire srcip.
 	bind := net.JoinHostPort(cfg.LocalIP, strconv.Itoa(port))
-	logInfo(fmt.Sprintf("[wire] tcp listen %s  |  expect client wire src=%s",
+	logInfo(fmt.Sprintf("[wire] tcp listen %s  |  client wire src=%s → tunnel",
 		bind, cfg.Mangle.DstIP))
-	logWarn(fmt.Sprintf("[wire] firewall: allow TCP %d from wire src %s (outer IP, not real peer %s)",
-		port, cfg.Mangle.DstIP, cfg.RemoteIP))
 
 	lc := net.ListenConfig{Control: tcpWireReuseControl}
 	return lc.Listen(context.Background(), "tcp4", bind)
