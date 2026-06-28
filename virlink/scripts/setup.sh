@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.6.1"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -682,6 +682,12 @@ write_service_file() {
   local cfg="${CONFIGS_DIR}/${name}.toml"
   local log; log="$(svc_log "$name")"
   local svc; svc="$(svc_unit "$name")"
+  local tunnel_type; tunnel_type="$(_cfg_tunnel_type "$cfg")"
+  local modprobe_line=""
+  case "$tunnel_type" in
+    wireguard)  modprobe_line="ExecStartPre=-/sbin/modprobe wireguard" ;;
+    amneziawg)  modprobe_line="ExecStartPre=-/sbin/modprobe amneziawg" ;;
+  esac
   mkdir -p "$LOGS_DIR"
   cat > "$svc" << EOF
 [Unit]
@@ -691,6 +697,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+${modprobe_line}
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=${VIRLINK_BIN} -c ${cfg}
 Restart=on-failure
 RestartSec=10
@@ -700,7 +708,10 @@ StandardError=append:${log}
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
+  if ! systemctl daemon-reload; then
+    err "systemctl daemon-reload failed after writing ${svc}"
+    return 1
+  fi
 }
 
 _cfg_tunnel_type() {
@@ -720,7 +731,8 @@ _cfg_transport_port() {
 tunnel_start() {
   local name="$1"
   local cfg="${CONFIGS_DIR}/${name}.toml"
-  [[ -f "$cfg" ]] || die "Config not found: $cfg"
+  local svc
+  [[ -f "$cfg" ]] || { err "Config not found: $cfg"; return 1; }
   if [[ "$(_cfg_tunnel_type "$cfg")" == "openvpn" ]]; then
     ensure_openvpn_deps
     ensure_openvpn_dco || true
@@ -742,21 +754,34 @@ tunnel_start() {
       wireguard_allow_firewall_port "$(_cfg_transport_port "$cfg")"
     fi
   fi
-  write_service_file "$name"
-  local svc; svc="$(svc_name "$name")"
+  if ! write_service_file "$name"; then
+    return 1
+  fi
+  svc="$(svc_name "$name")"
   info "Enabling service ${svc}..."
-  systemctl enable "$svc" 2>/dev/null
+  if ! systemctl enable "$svc"; then
+    err "systemctl enable ${svc} failed"
+    journalctl -u "$svc" -n 20 --no-pager 2>/dev/null | sed 's/^/  /' || true
+    return 1
+  fi
   info "Starting ${svc}..."
-  systemctl start "$svc"
+  if ! systemctl start "$svc"; then
+    err "systemctl start ${svc} failed"
+    journalctl -u "$svc" -n 20 --no-pager 2>/dev/null | sed 's/^/  /' || \
+      tail -20 "$(svc_log "$name")" 2>/dev/null | sed 's/^/  /' || true
+    return 1
+  fi
   sleep 1
   if tunnel_is_running "$name"; then
     ok "Tunnel '${name}' running  (service: ${svc})"
     ok "Log: $(svc_log "$name")"
     ok "Control: systemctl {start|stop|restart|status} ${svc}"
-  else
-    err "Failed to start '${name}'. Check log:"
-    journalctl -u "$svc" -n 20 --no-pager 2>/dev/null || tail -20 "$(svc_log "$name")" 2>/dev/null || true
+    return 0
   fi
+  err "Failed to start '${name}'. Check log:"
+  journalctl -u "$svc" -n 20 --no-pager 2>/dev/null | sed 's/^/  /' || \
+    tail -20 "$(svc_log "$name")" 2>/dev/null | sed 's/^/  /' || true
+  return 1
 }
 
 tunnel_remove() {
@@ -3318,9 +3343,13 @@ EOF
 
 # ── AmneziaWG helpers ─────────────────────────────────────────────────────────
 
+_amneziawg_module_loaded() {
+  [[ -d /sys/module/amneziawg || -f /sys/module/amneziawg/refcnt ]]
+}
+
 ensure_amneziawg_module() {
   modprobe amneziawg 2>/dev/null || true
-  if [[ -d /sys/module/amneziawg ]]; then
+  if _amneziawg_module_loaded; then
     vinfo "kernel module amneziawg loaded"
     return 0
   fi
@@ -3328,7 +3357,7 @@ ensure_amneziawg_module() {
 }
 
 ensure_amneziawg_deps() {
-  if command -v awg &>/dev/null && [[ -d /sys/module/amneziawg || -f /sys/module/amneziawg/refcnt ]]; then
+  if command -v awg &>/dev/null && _amneziawg_module_loaded; then
     ok "AmneziaWG ready (awg + kernel module)"
     vinfo "awg=$(command -v awg)  module=loaded"
     return 0
@@ -3851,7 +3880,7 @@ menu_create_tunnel() {
   ensure_dirs
   local name; name=$(basename "${LAST_CFG_PATH}" .toml)
   info "Installing as systemd service and starting..."
-  tunnel_start "$name"
+  tunnel_start "$name" || true
 
   blank
   press_enter
@@ -3893,7 +3922,7 @@ menu_tunnel_management() {
       require_root
       case "$action" in
         start)
-          tunnel_start "$name"
+          tunnel_start "$name" || true
           ;;
         stop)
           tunnel_stop "$name"
