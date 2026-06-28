@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.2.9"
+SCRIPT_VERSION="1.2.10"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -1339,11 +1339,6 @@ openvpn_openssl_extfile() {
   local dir="$1"
   local f="${dir}/openssl-ext.cnf"
   cat > "$f" << 'EOF'
-[ v3_ca ]
-basicConstraints = critical,CA:TRUE
-keyUsage = critical,keyCertSign,cRLSign
-subjectKeyIdentifier = hash
-
 [ v3_server ]
 basicConstraints = CA:FALSE
 keyUsage = digitalSignature
@@ -1357,6 +1352,37 @@ extendedKeyUsage = clientAuth
 subjectKeyIdentifier = hash
 EOF
   chmod 600 "$f"
+}
+
+# CA: OpenSSL 3 accepts -addext on req; 1.1.x needs a full -config with [req] x509_extensions.
+openvpn_create_ca_cert() {
+  local dir="$1"
+  if openssl req -new -x509 -days 3650 -key "$dir/ca.key" -out "$dir/ca.crt" \
+      -subj "/CN=vl-ca" \
+      -addext "basicConstraints=critical,CA:TRUE" \
+      -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null; then
+    return 0
+  fi
+  cat > "${dir}/openssl-ca.cnf" << 'EOF'
+[ req ]
+default_bits = 256
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3_ca
+
+[ dn ]
+CN = vl-ca
+
+[ v3_ca ]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+EOF
+  chmod 600 "${dir}/openssl-ca.cnf"
+  openssl req -new -x509 -days 3650 -key "$dir/ca.key" -out "$dir/ca.crt" \
+    -config "${dir}/openssl-ca.cnf" \
+    || die "OpenSSL: cannot create CA certificate"
 }
 
 openvpn_sign_server_cert() {
@@ -1416,10 +1442,7 @@ openvpn_gen_pki() {
   openvpn_openssl_extfile "$dir"
   openssl ecparam -genkey -name prime256v1 -out "$dir/ca.key" \
     || die "OpenSSL: cannot generate CA key (install openssl)"
-  openssl req -new -x509 -days 3650 -key "$dir/ca.key" -out "$dir/ca.crt" \
-    -subj "/CN=vl-ca" \
-    -extensions v3_ca -extfile "${dir}/openssl-ext.cnf" \
-    || die "OpenSSL: cannot create CA certificate"
+  openvpn_create_ca_cert "$dir"
 
   openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" \
     || die "OpenSSL: cannot generate server key"
