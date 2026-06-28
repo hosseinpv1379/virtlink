@@ -4,7 +4,7 @@ type      = "hysteria2"
 mode      = "server"
 local_ip  = "203.0.113.10"
 remote_ip = "198.51.100.20"
-cidr      = "10.20.10.0/24"
+cidr      = "10.20.10.0/30"
 mtu       = 1400
 name      = "site1"
 

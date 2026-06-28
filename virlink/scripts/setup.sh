@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.3.6"
+SCRIPT_VERSION="1.4.0"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -18,6 +18,7 @@ INSTALL_DIR="/opt/virlink"
 VIRLINK_BIN="${INSTALL_DIR}/virlink"
 CONFIGS_DIR="${INSTALL_DIR}/configs"
 LOGS_DIR="/var/log/virlink"
+MANUAL_CLIENT_CONF_DIR="/root/manual-client-conf"
 
 UPDATE_AVAILABLE=0
 LATEST_TAG=""
@@ -1007,7 +1008,11 @@ tx_queue_len = 10000
 level            = "info"
 profile          = true
 profile_interval = 30
+
+[health]
+disabled = true
 EOF
+      return
       ;;
     *)
       write_tuning "$file"
@@ -1088,6 +1093,7 @@ EOF
   write_tuning    "$cfg"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "gre-fou" "$port"
 }
 
 gen_ipip_fou() {
@@ -1110,6 +1116,7 @@ EOF
   write_tuning    "$cfg"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "ipip-fou" "$port"
 }
 
 gen_bonded() {
@@ -1138,6 +1145,7 @@ EOF
   write_tuning "$cfg" "true"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "bonded-gre-fou" "$port1"
 }
 
 gen_l2tpv3() {
@@ -1170,6 +1178,7 @@ EOF
   write_tuning "$cfg"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "l2tpv3" "$port"
 }
 
 gen_udp_obfs() {
@@ -1219,6 +1228,7 @@ EOF
   write_tuning "$cfg"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "udp-obfs" "$port"
 }
 
 gen_ipsec() {
@@ -1268,6 +1278,7 @@ EOF
   write_tuning "$cfg"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "gre-fou-ipsec" "$port"
 }
 
 gen_gre() {
@@ -1289,6 +1300,7 @@ EOF
   write_tuning "$cfg"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "gre" "0"
 }
 
 # ── OpenVPN PKI + config helpers ─────────────────────────────────────────────
@@ -2135,14 +2147,8 @@ gen_openvpn() {
   if [[ "$mode" == "server" ]]; then
     ovpn_conf="${pki_dir}/server.conf"
     openvpn_write_server_conf "$pki_dir" "$port" "$proto" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"
+    openvpn_write_client_conf "$pki_dir" "$port" "$proto" "$local_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"
     ok "Wrote ${ovpn_conf} (${perf}, ${proto})"
-    blank
-    info "Privacy: CA/server private keys remain on this host only."
-    openvpn_server_send_credentials "$name" "$remote_ip" "$pki_dir" "$local_ip"
-    openvpn_show_pki_fingerprint "$pki_dir"
-    blank
-    warn "Start this server tunnel before the client: virlink-setup → Start tunnel → ${name}"
-    warn "Firewall: allow ${proto}/${port} from client ${remote_ip}"
   else
     ovpn_conf="${pki_dir}/client.conf"
     openvpn_write_client_conf "$pki_dir" "$port" "$proto" "$remote_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$perf" "$tun_mtu" "$mssfix"
@@ -2180,12 +2186,199 @@ EOF
   write_openvpn_tuning "$cfg" "$perf"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+
+  if [[ "$mode" == "server" ]]; then
+    local pki="${INSTALL_DIR}/pki/${name}" tls_key="tc.key"
+    [[ -f "${pki_dir}/tc.key" ]] || tls_key="ta.key"
+    virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "openvpn" "$port" \
+      "${pki}/ca.crt" "${pki_dir}/ca.crt" 644 \
+      "${pki}/client.crt" "${pki_dir}/client.crt" 644 \
+      "${pki}/client.key" "${pki_dir}/client.key" 600 \
+      "${pki}/${tls_key}" "${pki_dir}/${tls_key}" 600 \
+      "${pki}/client.conf" "${pki_dir}/client.conf" 644
+    blank
+    info "Privacy: CA/server private keys remain on this host only."
+    info "Client install: ${W}${MANUAL_CLIENT_CONF_DIR}/${remote_ip}-openvpn-${port}.txt${NC} or export/ bundle."
+    openvpn_server_send_credentials "$name" "$remote_ip" "$pki_dir" "$local_ip"
+    openvpn_show_pki_fingerprint "$pki_dir"
+    blank
+    warn "Start this server tunnel before the client: virlink-setup → Start tunnel → ${name}"
+    warn "Firewall: allow ${proto}/${port} from client ${remote_ip}"
+  fi
+
   blank
   warn "Firewall: allow ${proto}/${port} between ${local_ip} and ${remote_ip}"
   if [[ "$mode" == "server" ]]; then
     info "Client overlay IP: ${client_ip}  ·  Server overlay IP: ${server_ip}"
   fi
   info "OpenVPN: tun-mtu ${tun_mtu}  mssfix ${mssfix}  profile ${perf}"
+}
+
+# ── Client install scripts (/root/manual-client-conf/) ────────────────────────
+
+virlink_manual_client_basename() {
+  local client_ip="$1" protocol="$2" port_num="$3"
+  echo "${client_ip}-${protocol}-${port_num}.txt"
+}
+
+virlink_manual_client_script_path() {
+  echo "${MANUAL_CLIENT_CONF_DIR}/$(virlink_manual_client_basename "$1" "$2" "$3")"
+}
+
+virlink_script_cat_file() {
+  local script="$1" dest="$2" src="$3" mode="${4:-644}"
+  {
+    echo ""
+    echo "cat << 'EOF' > ${dest}"
+    cat "$src"
+    # Source may lack trailing newline (e.g. pin.sha256) — keep heredoc terminator on its own line.
+    echo ""
+    echo "EOF"
+    echo "chmod ${mode} ${dest}"
+  } >> "$script"
+}
+
+virlink_make_client_toml() {
+  local server_cfg="$1" out="$2" client_pub="$3" server_pub="$4"
+  cp "$server_cfg" "$out"
+  sed -i \
+    -e 's/mode      = "server"/mode      = "client"/' \
+    -e "s|^local_ip  = .*|local_ip  = \"${client_pub}\"|" \
+    -e "s|^remote_ip = .*|remote_ip = \"${server_pub}\"|" \
+    -e 's|/server\.conf|/client.conf|g' \
+    -e 's|/server\.yaml|/client.yaml|g' \
+    "$out"
+  if ! grep -q '^\[forward\]' "$out"; then
+    add_forward_section "$out" client
+  fi
+}
+
+virlink_client_install_script_begin() {
+  local out="$1" client_ip="$2" title="$3" name="$4" script_basename="$5"
+  cat > "$out" << EOF
+#!/bin/bash
+# virlink ${title} — run on client ${client_ip}
+# Tunnel: ${name}
+# Copy to client, then: bash manual-client-conf/${script_basename}
+
+set -euo pipefail
+mkdir -p '${CONFIGS_DIR}'
+mkdir -p '${INSTALL_DIR}/pki/${name}'
+chmod 700 '${INSTALL_DIR}/pki/${name}' 2>/dev/null || true
+EOF
+}
+
+virlink_client_install_script_finish() {
+  local script="$1" name="$2" client_cfg="$3" server_ip="$4" title="$5"
+  cat >> "$script" << EOF
+
+echo "✓ virlink ${title} client files installed for tunnel '${name}'"
+echo "  Start server on ${server_ip} first."
+
+TUNNEL_NAME='${name}'
+CLIENT_CFG='${client_cfg}'
+SVC='virlink-${name}'
+VIRLINK_BIN='${VIRLINK_BIN}'
+SETUP_BIN='/usr/local/bin/virlink-setup'
+LOGS_DIR='${LOGS_DIR}'
+
+if [[ ! -f "\$CLIENT_CFG" ]]; then
+  echo "✗ Expected config missing: \$CLIENT_CFG"
+  exit 1
+fi
+
+svc_exists=0
+if [[ -f "/etc/systemd/system/\${SVC}.service" ]]; then
+  svc_exists=1
+elif systemctl list-unit-files "\${SVC}.service" &>/dev/null; then
+  systemctl list-unit-files "\${SVC}.service" 2>/dev/null | grep -q "^\${SVC}.service" && svc_exists=1
+fi
+
+if [[ \$svc_exists -eq 0 ]]; then
+  echo ""
+  read -r -p "? Config found (\${CLIENT_CFG}) but no systemd service (\${SVC}). Create and start tunnel? [y/N]: " _ans
+  if [[ "\${_ans,,}" == "y" ]]; then
+    if [[ -x "\$SETUP_BIN" ]]; then
+      "\$SETUP_BIN" start "\$TUNNEL_NAME"
+    elif [[ -x "\$VIRLINK_BIN" ]]; then
+      mkdir -p "\$LOGS_DIR"
+      cat > "/etc/systemd/system/\${SVC}.service" << SVC_EOF
+[Unit]
+Description=virlink tunnel — \${TUNNEL_NAME}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=\${VIRLINK_BIN} -c \${CLIENT_CFG}
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:\${LOGS_DIR}/\${TUNNEL_NAME}.log
+StandardError=append:\${LOGS_DIR}/\${TUNNEL_NAME}.log
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+      systemctl daemon-reload
+      systemctl enable "\$SVC"
+      systemctl start "\$SVC"
+      sleep 1
+      if systemctl is-active "\$SVC" &>/dev/null; then
+        echo "✓ Tunnel '\$TUNNEL_NAME' running (service: \$SVC)"
+      else
+        echo "✗ Failed to start — check: journalctl -u \$SVC -n 30"
+        exit 1
+      fi
+    else
+      echo "✗ virlink not installed — run setup.sh first, then: virlink -c \$CLIENT_CFG"
+      exit 1
+    fi
+  else
+    echo "  Skipped. Start manually: virlink -c \$CLIENT_CFG"
+    echo "  Or after install: virlink-setup start \$TUNNEL_NAME"
+  fi
+else
+  echo "  Service \$SVC already exists — start with: systemctl start \$SVC"
+fi
+EOF
+}
+
+virlink_emit_manual_client_install() {
+  local name="$1" client_ip="$2" server_ip="$3" tunnel_type="$4" port_num="$5"
+  local client_toml_src="$6"
+  shift 6
+
+  mkdir -p "$MANUAL_CLIENT_CONF_DIR"
+  local basename script_path client_toml_dest
+  basename="$(virlink_manual_client_basename "$client_ip" "$tunnel_type" "$port_num")"
+  script_path="$(virlink_manual_client_script_path "$client_ip" "$tunnel_type" "$port_num")"
+  client_toml_dest="${CONFIGS_DIR}/${name}.toml"
+
+  virlink_client_install_script_begin "$script_path" "$client_ip" "$tunnel_type" "$name" "$basename"
+  virlink_script_cat_file "$script_path" "$client_toml_dest" "$client_toml_src" 644
+  while (($# >= 3)); do
+    virlink_script_cat_file "$script_path" "$1" "$2" "${3:-644}"
+    shift 3
+  done
+  virlink_client_install_script_finish "$script_path" "$name" "$client_toml_dest" "$server_ip" "$tunnel_type"
+
+  chmod 644 "$script_path"
+  ok "Client install script: ${script_path}"
+  info "On client: bash manual-client-conf/${basename}"
+}
+
+virlink_server_write_manual_client() {
+  local name="$1" mode="$2" client_ip="$3" server_ip="$4" server_cfg="$5"
+  local tunnel_type="$6" port_num="${7:-0}"
+  shift 7
+  [[ "$mode" == "server" ]] || return 0
+
+  local staging="${MANUAL_CLIENT_CONF_DIR}/.build/${name}"
+  local client_toml="${staging}/client.toml"
+  mkdir -p "$staging"
+  virlink_make_client_toml "$server_cfg" "$client_toml" "$client_ip" "$server_ip"
+  virlink_emit_manual_client_install "$name" "$client_ip" "$server_ip" "$tunnel_type" "$port_num" \
+    "$client_toml" "$@"
 }
 
 # ── Hysteria2 helpers ──────────────────────────────────────────────────────────
@@ -2196,11 +2389,10 @@ hysteria2_overlay_ips() {
 
 hysteria2_gen_tls_cert() {
   local dir="$1" server_ip="$2"
-  local san="DNS:www.bing.com"
-  [[ -n "$server_ip" ]] && san="${san},IP:${server_ip}"
+  [[ -n "$server_ip" ]] || die "server IP required for TLS certificate"
   if openssl req -new -x509 -days 3650 -key "$dir/server.key" -out "$dir/server.crt" \
-      -subj "/CN=www.bing.com" \
-      -addext "subjectAltName=${san}" 2>/dev/null; then
+      -subj "/CN=${server_ip}" \
+      -addext "subjectAltName=IP:${server_ip}" 2>/dev/null; then
     return 0
   fi
   cat > "${dir}/openssl-hy2.cnf" << EOF
@@ -2212,14 +2404,23 @@ distinguished_name = dn
 x509_extensions = v3
 
 [ dn ]
-CN = www.bing.com
+CN = ${server_ip}
 
 [ v3 ]
-subjectAltName = ${san}
+subjectAltName = IP:${server_ip}
 EOF
   openssl req -new -x509 -days 3650 -key "$dir/server.key" -out "$dir/server.crt" \
     -config "${dir}/openssl-hy2.cnf" \
     || die "OpenSSL: cannot create server certificate"
+}
+
+hysteria2_compute_pin() {
+  local dir="$1"
+  [[ -f "${dir}/server.crt" ]] || return 0
+  openssl x509 -noout -fingerprint -sha256 -in "${dir}/server.crt" 2>/dev/null \
+    | sed 's/^sha256 Fingerprint=//' | tr -d '\n' > "${dir}/pin.sha256"
+  printf '\n' >> "${dir}/pin.sha256"
+  chmod 644 "${dir}/pin.sha256"
 }
 
 hysteria2_ensure_server_tls() {
@@ -2236,9 +2437,11 @@ hysteria2_ensure_server_tls() {
     openssl ecparam -genkey -name prime256v1 -out "$dir/server.key" \
       || die "OpenSSL: cannot generate server key"
     hysteria2_gen_tls_cert "$dir" "$server_ip"
+    hysteria2_compute_pin "$dir"
     chmod 600 "$dir/server.key"
     chmod 644 "$dir/server.crt"
   fi
+  hysteria2_compute_pin "$dir"
 }
 
 hysteria2_gen_credentials() {
@@ -2259,17 +2462,24 @@ hysteria2_save_export_info() {
   local dir="$1" server_ip="$2" port="$3" name="$4"
   local f="${dir}/export/COPY_TO_CLIENT.txt"
   cat > "$f" << EOF
-# virlink Hysteria2 — copy to CLIENT (password only, no TLS cert)
+# virlink Hysteria2 — copy to CLIENT
 # Server: ${server_ip}:${port}  ·  tunnel: ${name}
 
 Copy to ${INSTALL_DIR}/pki/${name}/ on the client:
   password
+  pin.sha256
   obfs.password   (only if server uses salamander obfs)
+
+Optional (instead of pinSHA256): server.crt for tls.ca pinning
 
 Then run: virlink-setup → client → hysteria2 → same tunnel name
 
+Or use the install script on the server:
+  ${MANUAL_CLIENT_CONF_DIR}/<client_ip>-hysteria2-<port>.txt
+
 Or scp:
   scp root@${server_ip}:${dir}/export/password ${INSTALL_DIR}/pki/${name}/
+  scp root@${server_ip}:${dir}/export/pin.sha256 ${INSTALL_DIR}/pki/${name}/
   scp root@${server_ip}:${dir}/export/obfs.password ${INSTALL_DIR}/pki/${name}/   # if present
 EOF
   chmod 644 "$f"
@@ -2280,12 +2490,11 @@ hysteria2_write_server_yaml() {
   local pass; pass="$(tr -d '\n' < "${dir}/password")"
   cat > "${dir}/server.yaml" << EOF
 # virlink Hysteria2 — server (QUIC masquerade)
-listen: :${port}
+listen: 0.0.0.0:${port}
 
 tls:
   cert: server.crt
   key: server.key
-  sniGuard: disable
 
 auth:
   type: password
@@ -2315,9 +2524,15 @@ EOF
 }
 
 hysteria2_write_client_yaml() {
-  local dir="$1" port="$2" remote_ip="$3" client_ip="$4" cidr="$5" mtu="$6" dev="$7" obfs="$8"
-  local pass prefix; pass="$(tr -d '\n' < "${dir}/password")"
-  prefix="${cidr#*/}"
+  local dir="$1" port="$2" remote_ip="$3" client_ip="$4" server_ip="$5" mtu="$6" dev="$7" obfs="$8"
+  local pass pin=""
+  pass="$(tr -d '\n' < "${dir}/password")"
+  if [[ -f "${dir}/pin.sha256" ]]; then
+    pin="$(tr -d '\n' < "${dir}/pin.sha256")"
+  elif [[ -f "${dir}/export/pin.sha256" ]]; then
+    pin="$(tr -d '\n' < "${dir}/export/pin.sha256")"
+  fi
+  [[ -n "$pin" ]] || die "Missing pin.sha256 — re-run server setup or copy export bundle"
   cat > "${dir}/client.yaml" << EOF
 # virlink Hysteria2 — client (site-to-site TUN)
 server: ${remote_ip}:${port}
@@ -2326,6 +2541,7 @@ auth: ${pass}
 
 tls:
   insecure: true
+  pinSHA256: ${pin}
 
 bandwidth:
   up: 200 mbps
@@ -2335,9 +2551,9 @@ tun:
   name: ${dev}
   mtu: ${mtu}
   address:
-    ipv4: ${client_ip}/${prefix}
+    ipv4: ${client_ip}/30
   route:
-    ipv4: ["${cidr}"]
+    ipv4: ["${server_ip}/32"]
     ipv4Exclude: ["${remote_ip}/32"]
 EOF
   if [[ -n "$obfs" ]]; then
@@ -2355,13 +2571,16 @@ hysteria2_export_client_bundle() {
   local dir="$1" server_ip="$2" port="$3" name="$4"
   local export_dir="${dir}/export"
   mkdir -p "$export_dir"
+  hysteria2_compute_pin "$dir"
   cp -f "${dir}/password" "${export_dir}/password"
+  [[ -f "${dir}/pin.sha256" ]] && cp -f "${dir}/pin.sha256" "${export_dir}/pin.sha256"
   [[ -f "${dir}/obfs.password" ]] && cp -f "${dir}/obfs.password" "${export_dir}/obfs.password"
   chmod 600 "${export_dir}/password"
+  [[ -f "${export_dir}/pin.sha256" ]] && chmod 644 "${export_dir}/pin.sha256"
   [[ -f "${export_dir}/obfs.password" ]] && chmod 600 "${export_dir}/obfs.password"
-  rm -f "${export_dir}/server.crt" "${export_dir}/client.yaml"
+  rm -f "${export_dir}/client.yaml"
   hysteria2_save_export_info "$dir" "$server_ip" "$port" "$name"
-  ok "Client export: ${export_dir} (password only — no TLS cert)"
+  ok "Client export: ${export_dir} (password + pin.sha256)"
 }
 
 hysteria2_show_fingerprint() {
@@ -2370,6 +2589,13 @@ hysteria2_show_fingerprint() {
   info "Auth fingerprint — must match on client:"
   md5sum "${dir}/password" 2>/dev/null | sed 's/^/    /'
   [[ -f "${dir}/obfs.password" ]] && md5sum "${dir}/obfs.password" 2>/dev/null | sed 's/^/    /'
+  if [[ -f "${dir}/pin.sha256" ]]; then
+    info "TLS pinSHA256:"
+    sed 's/^/    /' "${dir}/pin.sha256"
+  elif [[ -f "${dir}/export/pin.sha256" ]]; then
+    info "TLS pinSHA256:"
+    sed 's/^/    /' "${dir}/export/pin.sha256"
+  fi
 }
 
 hysteria2_fetch_from_server() {
@@ -2384,8 +2610,8 @@ hysteria2_fetch_from_server() {
   scp "${scp_opts[@]}" -r "${ssh_user}@${server_host}:${remote}/." "${pki_dir}/" \
     || die "SCP failed — run Hysteria2 setup on server first"
   [[ -f "${pki_dir}/password" ]] || die "Missing password — re-run server setup"
-  rm -f "${pki_dir}/server.crt"
-  ok "Password copied to ${pki_dir}"
+  [[ -f "${pki_dir}/pin.sha256" ]] || die "Missing pin.sha256 — re-run server setup"
+  ok "Credentials copied to ${pki_dir}"
 }
 
 hysteria2_acquire_client() {
@@ -2396,7 +2622,7 @@ hysteria2_acquire_client() {
   fi
   blank
   warn "Hysteria2 password not found locally."
-  info "Client needs only ${W}password${NC} (+ obfs.password if enabled) — no TLS cert."
+  info "Client needs ${W}password${NC} + ${W}pin.sha256${NC} (+ obfs.password if enabled)."
   pick method "Get credentials from server" \
     "ssh-password — SCP from server (recommended)" \
     "manual — copy export/ by hand"
@@ -2411,17 +2637,18 @@ hysteria2_acquire_client() {
       mkdir -p "$pki_dir"
       chmod 700 "$pki_dir"
       blank
-      info "Copy from server → client (password only):"
+      info "Copy from server → client:"
       tty_line -e "  ${W}scp root@${server_host}:${INSTALL_DIR}/pki/${name}/export/password ${pki_dir}/${NC}"
+      tty_line -e "  ${W}scp root@${server_host}:${INSTALL_DIR}/pki/${name}/export/pin.sha256 ${pki_dir}/${NC}"
       tty_line -e "  ${W}scp root@${server_host}:${INSTALL_DIR}/pki/${name}/export/obfs.password ${pki_dir}/${NC}  ${DIM}(if obfs enabled)${NC}"
       blank
-      while [[ ! -f "${pki_dir}/password" ]]; do
-        warn "Missing: ${pki_dir}/password"
-        if ! confirm "Copied password — check again"; then
-          die "Need password file in ${pki_dir}"
+      while [[ ! -f "${pki_dir}/password" || ! -f "${pki_dir}/pin.sha256" ]]; do
+        warn "Missing: ${pki_dir}/password and/or ${pki_dir}/pin.sha256"
+        if ! confirm "Copied credentials — check again"; then
+          die "Need password + pin.sha256 in ${pki_dir}"
         fi
       done
-      ok "Password found in ${pki_dir}"
+      ok "Credentials found in ${pki_dir}"
       ;;
     *) die "Unknown method: $method" ;;
   esac
@@ -2446,7 +2673,7 @@ hysteria2_push_to_client() {
 
 gen_hysteria2() {
   local name mode local_ip remote_ip cidr port mtu dev pki_dir hy_conf cfg
-  local client_ip server_ip prefix obfs_raw obfs="" hb
+  local client_ip server_ip obfs_raw obfs="" hb
   collect_base_inputs name mode local_ip remote_ip cidr
   blank
   info "Hysteria2 uses QUIC/UDP — fast and resistant to many filters."
@@ -2470,6 +2697,7 @@ gen_hysteria2() {
   else
     hysteria2_acquire_client "$name" "$remote_ip" "$pki_dir"
     [[ -f "${pki_dir}/password" ]] || cp -f "${pki_dir}/export/password" "${pki_dir}/password" 2>/dev/null || true
+    [[ -f "${pki_dir}/pin.sha256" ]] || cp -f "${pki_dir}/export/pin.sha256" "${pki_dir}/pin.sha256" 2>/dev/null || true
     [[ -f "${pki_dir}/obfs.password" ]] || cp -f "${pki_dir}/export/obfs.password" "${pki_dir}/obfs.password" 2>/dev/null || true
     [[ -f "${pki_dir}/obfs.password" ]] && obfs="$(tr -d '\n' < "${pki_dir}/obfs.password")"
   fi
@@ -2477,35 +2705,25 @@ gen_hysteria2() {
   hysteria2_overlay_ips "$cidr" "$mode"
   client_ip="$OPENVPN_CLIENT_IP"
   server_ip="$OPENVPN_SERVER_IP"
-  prefix="${cidr#*/}"
+
+  hb=20
+  cfg="${CONFIGS_DIR}/${name}.toml"
 
   if [[ "$mode" == "server" ]]; then
     hysteria2_write_server_yaml "$pki_dir" "$port" "$server_ip" "$mtu" "$dev" "$obfs"
     hysteria2_export_client_bundle "$pki_dir" "$local_ip" "$port" "$name"
+    hysteria2_write_client_yaml "$pki_dir" "$port" "$local_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$obfs"
     hy_conf="${pki_dir}/server.yaml"
     ok "Wrote ${hy_conf}"
-    blank
-    info "Client only needs ${W}password${NC} file — TLS cert stays on server."
-    if confirm "Push credentials to client ${remote_ip} via SSH password"; then
-      openvpn_prompt_ssh
-      hysteria2_push_to_client "$name" "$remote_ip" "$pki_dir" "$local_ip" "$port" \
-        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
-    else
-      info "Copy ${pki_dir}/export/ to client, then run setup there (client mode)."
-    fi
-    hysteria2_show_fingerprint "$pki_dir"
-    warn "Start SERVER first. Firewall: allow UDP/${port} (QUIC) to this host."
   else
     [[ -f "${pki_dir}/password" ]] || die "Missing password in ${pki_dir}"
-    hysteria2_write_client_yaml "$pki_dir" "$port" "$remote_ip" "$client_ip" "$cidr" "$mtu" "$dev" "$obfs"
+    hysteria2_write_client_yaml "$pki_dir" "$port" "$remote_ip" "$client_ip" "$server_ip" "$mtu" "$dev" "$obfs"
     hy_conf="${pki_dir}/client.yaml"
     ok "Wrote ${hy_conf}"
     warn "Start the Hysteria2 SERVER on ${remote_ip} first."
     warn "Firewall: allow outbound UDP/${port} to server (Hetzner cloud firewall too)."
   fi
 
-  hb=20
-  cfg="${CONFIGS_DIR}/${name}.toml"
   cat > "$cfg" << EOF
 # virlink — ${name}  (Hysteria2 site-to-site · QUIC)
 [tunnel]
@@ -2532,8 +2750,35 @@ EOF
   write_userspace_tuning "$cfg" "hysteria2"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+
+  if [[ "$mode" == "server" ]]; then
+    local pki="${INSTALL_DIR}/pki/${name}" hy_extra=()
+    hy_extra=(
+      "${pki}/password" "${pki_dir}/password" 600
+      "${pki}/pin.sha256" "${pki_dir}/pin.sha256" 644
+      "${pki}/client.yaml" "${pki_dir}/client.yaml" 644
+    )
+    [[ -f "${pki_dir}/obfs.password" ]] && hy_extra+=(
+      "${pki}/obfs.password" "${pki_dir}/obfs.password" 600
+    )
+    virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "hysteria2" "$port" \
+      "${hy_extra[@]}"
+    blank
+    info "Client needs ${W}password${NC} + ${W}pin.sha256${NC} from export/ or ${W}${MANUAL_CLIENT_CONF_DIR}/${remote_ip}-hysteria2-${port}.txt${NC}."
+    if confirm "Push credentials to client ${remote_ip} via SSH password"; then
+      openvpn_prompt_ssh
+      hysteria2_push_to_client "$name" "$remote_ip" "$pki_dir" "$local_ip" "$port" \
+        "$OPENVPN_SSH_USER" "$OPENVPN_SSH_PORT"
+    else
+      info "Copy ${pki_dir}/export/ or paste ${W}${MANUAL_CLIENT_CONF_DIR}/${remote_ip}-hysteria2-${port}.txt${NC} on client."
+    fi
+    hysteria2_show_fingerprint "$pki_dir"
+    warn "Start SERVER first. Firewall: allow UDP/${port} (QUIC) to this host."
+  fi
+
   blank
-  info "Overlay: client ${client_ip}  ·  server ${server_ip}  ·  health uses UDP probes"
+  info "Overlay TUN: client ${client_ip}/30  ·  server ${server_ip}/30"
+  info "Health/bench disabled for hysteria2 — use nc/iperf3 to test overlay (ping RTT is misleading)"
   info "Log: /var/log/virlink/${name}-hysteria2.log"
 }
 
@@ -2557,6 +2802,7 @@ EOF
   write_userspace_tuning "$cfg" "tcp"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "tcp" "$port"
 }
 
 gen_udp() {
@@ -2579,6 +2825,7 @@ EOF
   write_userspace_tuning "$cfg" "udp"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "udp" "$port"
 }
 
 gen_icmp() {
@@ -2602,6 +2849,7 @@ EOF
   write_userspace_tuning "$cfg" "icmp"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "icmp" "0"
 }
 
 gen_bip() {
@@ -2625,6 +2873,7 @@ EOF
   write_userspace_tuning "$cfg" "bip"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "bip" "0"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

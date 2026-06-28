@@ -17,14 +17,15 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-const hysteria2Subnet = "10.20.52.0/24"
+const hysteria2Subnet = "10.20.52.0/30"
 
 type Hysteria2Tunnel struct {
-	cfg     *Config
-	cmd     *exec.Cmd
-	lockFd  *os.File
-	tunFd   *os.File // server: keeps overlay TUN up
-	pidPath string
+	cfg           *Config
+	cmd           *exec.Cmd
+	lockFd        *os.File
+	tunFd         *os.File // server: keeps overlay TUN up
+	pidPath       string
+	savedRpFilter []savedSysctl
 }
 
 func (t *Hysteria2Tunnel) DevName() string {
@@ -36,6 +37,11 @@ func (t *Hysteria2Tunnel) DevName() string {
 
 func (t *Hysteria2Tunnel) OverlayIP() string { return overlayAddr(t.cfg, hysteria2Subnet) }
 func (t *Hysteria2Tunnel) PeerIP() string    { return peerAddr(t.cfg, hysteria2Subnet) }
+
+// hysteria2TunCIDR returns the /30 address Hysteria2 TUN requires (docs mandate /30).
+func hysteria2TunCIDR(cfg *Config) string {
+	return plainIP(overlayAddr(cfg, hysteria2Subnet)) + "/30"
+}
 
 func (t *Hysteria2Tunnel) Up() error {
 	c := t.cfg
@@ -51,7 +57,7 @@ func (t *Hysteria2Tunnel) Up() error {
 	}
 
 	dev := t.DevName()
-	addr := t.OverlayIP()
+	addr := hysteria2TunCIDR(c)
 	peer := t.PeerIP()
 	port := c.Transport.Port
 	if port == 0 {
@@ -111,6 +117,11 @@ func (t *Hysteria2Tunnel) Up() error {
 		_ = netlink.LinkSetMTU(l, c.Tunnel.MTU)
 	}
 
+	if c.Mode == "client" {
+		step("rp_filter=2 (Hysteria2 TUN)...")
+		t.applyHysteria2ClientRpFilter()
+	}
+
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)
 	addMSS(dev)
@@ -122,7 +133,8 @@ func (t *Hysteria2Tunnel) Up() error {
 		fmt.Sprintf("transport : Hysteria2 QUIC :%d", port),
 		"config    : "+hy.Config,
 		"log       : "+logPath,
-		"test      : ping -c3 "+peer+"  (UDP health probe; ICMP may not traverse hy2 TUN)",
+		"test      : echo test | nc -u -w2 "+peer+" 9999  (on peer: nc -ul 9999)",
+		"note      : ping RTT is NOT valid on hy2 TUN — use nc/iperf3 for real latency",
 	)
 	return nil
 }
@@ -161,8 +173,33 @@ func (t *Hysteria2Tunnel) Down() error {
 	return nil
 }
 
+func (t *Hysteria2Tunnel) applyHysteria2ClientRpFilter() {
+	for _, k := range []string{"net.ipv4.conf.default.rp_filter", "net.ipv4.conf.all.rp_filter"} {
+		prev, err := readSysctl(k)
+		entry := savedSysctl{key: k, ok: err == nil}
+		if entry.ok {
+			entry.val = prev
+		}
+		t.savedRpFilter = append(t.savedRpFilter, entry)
+		if err := nlSysctl(k, "2"); err != nil {
+			logWarn(fmt.Sprintf("rp_filter %s: %v", k, err))
+		}
+	}
+}
+
+func (t *Hysteria2Tunnel) restoreHysteria2ClientRpFilter() {
+	for i := len(t.savedRpFilter) - 1; i >= 0; i-- {
+		s := t.savedRpFilter[i]
+		if s.ok {
+			_ = nlSysctl(s.key, s.val)
+		}
+	}
+	t.savedRpFilter = nil
+}
+
 func (t *Hysteria2Tunnel) doClean() {
 	t.stopProcess()
+	t.restoreHysteria2ClientRpFilter()
 	if t.tunFd != nil {
 		_ = t.tunFd.Close()
 		t.tunFd = nil
@@ -219,12 +256,11 @@ func waitForHysteria2(dev, logPath string, cmd *exec.Cmd, mode string, timeout t
 			return fmt.Errorf("hysteria failed (see %s):\n%s", logPath, hysteria2LogTail(logPath, 30))
 		}
 		if mode == "server" {
-			if logPath != "" && hysteria2LogContains(logPath, "server mode") && linkUp(dev) {
+			if logPath != "" && hysteria2LogContains(logPath, "server up and running") {
 				return nil
 			}
 		} else if linkUp(dev) && logPath != "" &&
-			(hysteria2LogContains(logPath, "TUN listening") ||
-				hysteria2LogContains(logPath, "connected to server")) {
+			hysteria2LogContains(logPath, "connected to server") {
 			return nil
 		}
 		time.Sleep(250 * time.Millisecond)

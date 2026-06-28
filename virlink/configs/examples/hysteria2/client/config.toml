@@ -1,11 +1,11 @@
 # virlink — Hysteria2 client example
-# Copy /opt/virlink/pki/site1/export/ from the server before starting.
+# Copy /opt/virlink/pki/site1/export/ (password + pin.sha256) from the server before starting.
 [tunnel]
 type      = "hysteria2"
 mode      = "client"
 local_ip  = "198.51.100.20"
 remote_ip = "203.0.113.10"
-cidr      = "10.20.10.0/24"
+cidr      = "10.20.10.0/30"
 mtu       = 1400
 name      = "site1"
 
