@@ -6,6 +6,7 @@ package virlink
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -120,6 +122,16 @@ func (t *OpenvpnMultuTunnel) Up() error {
 		logOK(fmt.Sprintf("worker %d up  dev=%s  log=%s", i, w.dev, w.logPath))
 	}
 
+	if c.Mode == "client" {
+		peer := t.PeerIP()
+		step("waiting for overlay route to peer...")
+		if err := openvpnMultuWaitPeerRoute(peer, 30*time.Second); err != nil {
+			t.doClean()
+			return err
+		}
+		logOK(fmt.Sprintf("route to %s/32 ready (ECMP when all workers connected)", peer))
+	}
+
 	overlay := t.OverlayIP()
 	peer := t.PeerIP()
 	localPlain := plainIP(overlay)
@@ -167,6 +179,36 @@ func openvpnMultuPreclean(c *Config) {
 		delMSS(dev)
 		nlDown(dev)
 	}
+}
+
+func openvpnMultuWaitPeerRoute(peer string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if routeExistsToHost(peer) {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("no route to overlay peer %s/32 after %s — openvpn sessions not connected; check UDP ports/firewall and worker logs",
+		peer, timeout.Round(time.Second))
+}
+
+func routeExistsToHost(dst string) bool {
+	dstIP := net.ParseIP(dst)
+	if dstIP == nil {
+		return false
+	}
+	dstIP = dstIP.To4()
+	routes, err := netlink.RouteList(nil, unix.AF_INET)
+	if err != nil {
+		return false
+	}
+	for _, r := range routes {
+		if routeMatchesHost32(r, dstIP) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *OpenvpnMultuTunnel) startWorker(w *openvpnMultuWorker) error {

@@ -49,8 +49,9 @@ type BenchResult struct {
 
 // BenchMgr manages the benchmark server + test runs.
 type BenchMgr struct {
-	port   int
-	peerIP string
+	port      int
+	peerIP    string
+	overlayIP string
 
 	mu         sync.Mutex
 	running    bool
@@ -58,8 +59,8 @@ type BenchMgr struct {
 	lastRun    time.Time
 }
 
-func NewBenchMgr(healthPort int, peerIP string) *BenchMgr {
-	return &BenchMgr{port: healthPort + 1, peerIP: peerIP}
+func NewBenchMgr(healthPort int, peerIP, overlayIP string) *BenchMgr {
+	return &BenchMgr{port: healthPort + 1, peerIP: peerIP, overlayIP: overlayIP}
 }
 
 func tuneBenchConn(conn net.Conn) {
@@ -73,13 +74,17 @@ func tuneBenchConn(conn net.Conn) {
 // ── benchmark server ──────────────────────────────────────────────────────────
 
 func (b *BenchMgr) runServer() {
-	addr := fmt.Sprintf(":%d", b.port)
+	bindIP := b.overlayIP
+	if bindIP == "" {
+		bindIP = "0.0.0.0"
+	}
+	addr := fmt.Sprintf("%s:%d", bindIP, b.port)
 	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
 		logWarn(fmt.Sprintf("bench server: listen %s: %v", addr, err))
 		return
 	}
-	logInfo(fmt.Sprintf("bench  server   listen=0.0.0.0:%d  (healthPort+1)", b.port))
+	logInfo(fmt.Sprintf("bench  server   listen=%s  (healthPort+1)", addr))
 	for {
 		conn, err := ln.Accept()
 		if err != nil {

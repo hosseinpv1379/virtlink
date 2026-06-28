@@ -251,28 +251,47 @@ func waitForOpenVPNWorker(dev, logPath string, cmd *exec.Cmd, serverMode bool, t
 		"Failed to open tun/tap interface",
 		"Exiting due to fatal error",
 	}
+	clientFatalNeedles := []string{
+		"AUTH_FAILED",
+		"TLS handshake failed",
+		"Connection refused",
+		"Connection timed out",
+		"Inactivity timeout",
+		"SIGUSR1[soft",
+	}
 	for time.Now().Before(deadline) {
-		if linkUp(dev) {
-			return nil
-		}
 		if logPath != "" {
+			for _, needle := range fatalNeedles {
+				if openvpnLogContains(logPath, needle) {
+					return fmt.Errorf("openvpn failed on %s:\n%s", dev, openvpnLogTail(logPath, 30))
+				}
+			}
+			if !serverMode {
+				for _, needle := range clientFatalNeedles {
+					if openvpnLogContains(logPath, needle) {
+						return fmt.Errorf("openvpn client failed on %s:\n%s", dev, openvpnLogTail(logPath, 30))
+					}
+				}
+			}
 			if openvpnLogContains(logPath, "Initialization Sequence Completed") {
 				time.Sleep(300 * time.Millisecond)
 				if linkUp(dev) {
 					return nil
 				}
 			}
-			if serverMode {
+		}
+		// Server: TUN up / listening is enough (client may connect later).
+		// Client: never accept linkUp alone — tun can exist before the session is live.
+		if serverMode {
+			if linkUp(dev) {
+				return nil
+			}
+			if logPath != "" {
 				if openvpnLogContains(logPath, "TUN/TAP device "+dev+" opened") ||
 					openvpnLogContains(logPath, "Listening for incoming") {
 					time.Sleep(300 * time.Millisecond)
 					if linkUp(dev) {
 						return nil
-					}
-				}
-				for _, needle := range fatalNeedles {
-					if openvpnLogContains(logPath, needle) {
-						return fmt.Errorf("openvpn failed on %s:\n%s", dev, openvpnLogTail(logPath, 30))
 					}
 				}
 			}
@@ -283,7 +302,7 @@ func waitForOpenVPNWorker(dev, logPath string, cmd *exec.Cmd, serverMode bool, t
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	hint := "start OpenVPN server first; match port/proto/PKI; open firewall; for multi-core bandwidth install ovpn-dco (DCO)"
+	hint := "match port/proto/PKI; open firewall UDP to server; check worker log"
 	if serverMode {
 		hint = "check port not in use (ss -ulnp); stale worker: kill openvpn / ip link del " + dev
 	}

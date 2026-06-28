@@ -168,7 +168,7 @@ type healthJSON struct {
 	BenchHint    string       `json:"bench_hint,omitempty"`
 }
 
-func (h *HealthMgr) runHTTPServer(port int, tun Tunnel, bm *BenchMgr) {
+func (h *HealthMgr) runHTTPServer(overlayIP string, port int, tun Tunnel, bm *BenchMgr) {
 	mux := http.NewServeMux()
 
 	// GET /health  — probe state + last bench result if available
@@ -247,14 +247,14 @@ func (h *HealthMgr) runHTTPServer(port int, tun Tunnel, bm *BenchMgr) {
 		_, _ = w.Write([]byte(dashboardHTML))
 	})
 
-	addr := fmt.Sprintf(":%d", port)
+	addr := fmt.Sprintf("%s:%d", overlayIP, port)
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 120 * time.Second, // bench can take up to 60s
 	}
-	logInfo(fmt.Sprintf("health HTTP  listen=0.0.0.0:%d  /health  /profile  /bench(port %d)", port, port+1))
+	logInfo(fmt.Sprintf("health HTTP  listen=%s  /health  /profile  /bench(port %d)", addr, port+1))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logWarn(fmt.Sprintf("health HTTP: %v", err))
 	}
@@ -266,9 +266,9 @@ func (h *HealthMgr) runHTTPServer(port int, tun Tunnel, bm *BenchMgr) {
 // overlayIP must be the plain IP (no /prefix).
 // peerIP must be the plain peer overlay IP.
 func (h *HealthMgr) Start(overlayIP, peerIP string, port int, tun Tunnel) {
-	bm := NewBenchMgr(port, peerIP)
+	bm := NewBenchMgr(port, peerIP, overlayIP)
 	go h.runProbeServer(overlayIP, port)
 	go h.runProbeSender(peerIP, port)
 	go bm.runServer()
-	go h.runHTTPServer(port, tun, bm)
+	go h.runHTTPServer(overlayIP, port, tun, bm)
 }
