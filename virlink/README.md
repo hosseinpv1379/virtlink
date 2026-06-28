@@ -75,7 +75,7 @@ Other tunnel types (GRE, icmp, udp-obfs) are better for raw speed or DPI evasion
 ### Prerequisites
 
 - Linux amd64, **root**
-- **`openvpn`** and **`openssl`** — installed automatically by `virlink-setup` if missing (apt/dnf/yum/apk/zypper)
+- **`openvpn`** and **`openssl`** — installed automatically by `virlink-setup` on install, update, and when creating/starting OpenVPN tunnels (apt/dnf/yum/apk/zypper; EPEL on RHEL)
 - For automated PKI sync: **passwordless SSH** from client → server (`ssh-copy-id root@SERVER_IP`)
 
 ### Step-by-step (interactive)

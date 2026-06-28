@@ -6,7 +6,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@Gozar_XRay"
 TAGLINE="High-performance kernel & userspace tunneling"
@@ -305,6 +305,9 @@ do_install() {
   ok "${BOLD}${ver}${NC} installed to ${INSTALL_DIR}"
   ok "Setup script saved to ${INSTALL_DIR}/setup.sh"
   ok "Commands: ${W}virlink-setup${NC}  ${W}virlink${NC}"
+  blank
+  info "Ensuring OpenVPN core (openvpn + openssl)..."
+  ensure_openvpn_deps
   echo
   exec "${INSTALL_DIR}/setup.sh"
 }
@@ -363,6 +366,7 @@ do_update_script() {
   mv "${INSTALL_DIR}/setup.sh.new" "${INSTALL_DIR}/setup.sh"
   ln -sf "${INSTALL_DIR}/setup.sh" /usr/local/bin/virlink-setup 2>/dev/null || true
   ok "Setup script updated — restarting..."
+  ensure_openvpn_deps
   blank
   exec "${INSTALL_DIR}/setup.sh"
 }
@@ -455,6 +459,17 @@ _pkg_install() {
     [[ " ${seen[*]} " == *" $p "* ]] || seen+=("$p")
   done
 
+  if [[ " ${seen[*]} " == *" openvpn "* ]]; then
+    case "$mgr" in
+      dnf|yum)
+        if ! rpm -q epel-release &>/dev/null 2>&1; then
+          info "Installing EPEL (required for openvpn on RHEL/CentOS)..."
+          "$mgr" install -y epel-release 2>/dev/null || true
+        fi
+        ;;
+    esac
+  fi
+
   info "Installing: ${seen[*]} (${mgr})..."
   case "$mgr" in
     apt)
@@ -493,17 +508,18 @@ ensure_cmd() {
 }
 
 ensure_openvpn_deps() {
-  local -a need=() c pkg
+  local -a need=() c
   for c in openssl openvpn; do
     command -v "$c" &>/dev/null || need+=("$(_cmd_pkg_name "$c")")
   done
-  ((${#need[@]})) || return 0
+  ((${#need[@]})) || { ok "OpenVPN core ready (openvpn + openssl)"; return 0; }
   require_root
-  warn "OpenVPN dependencies missing — installing..."
+  warn "OpenVPN core missing — installing openvpn + openssl..."
   _pkg_install "${need[@]}"
   for c in openssl openvpn; do
     command -v "$c" &>/dev/null || die "'${c}' still missing after install"
   done
+  ok "OpenVPN core installed"
 }
 
 ensure_ssh_deps() {
@@ -556,10 +572,17 @@ EOF
   systemctl daemon-reload
 }
 
+_cfg_tunnel_type() {
+  grep -E '^\s*type\s*=' "$1" 2>/dev/null | head -1 | awk -F'"' '{print $2}'
+}
+
 tunnel_start() {
   local name="$1"
   local cfg="${CONFIGS_DIR}/${name}.toml"
   [[ -f "$cfg" ]] || die "Config not found: $cfg"
+  if [[ "$(_cfg_tunnel_type "$cfg")" == "openvpn" ]]; then
+    ensure_openvpn_deps
+  fi
   write_service_file "$name"
   local svc; svc="$(svc_name "$name")"
   info "Enabling service ${svc}..."
