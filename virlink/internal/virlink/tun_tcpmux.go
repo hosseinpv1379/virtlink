@@ -370,15 +370,8 @@ func (t *TcpMuxTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 	batch := newTunRxBatch(bsz)
 
 	flush := func() {
-		n, err := batch.flush(tun)
-		if n == 0 {
-			return
-		}
-		if err != nil && !t.stop.stopped() {
-			logWarn("tun write: " + err.Error())
-		} else if err == nil {
-			statAdd(statTCPRxWrite, uint64(n))
-		}
+		written, total, err := batch.flush(tun)
+		reportTunRxFlush(written, total, err, statTCPRxWrite, -1, "tcpmux:tun_write", "TCPMUX", &t.stop)
 	}
 	defer flush()
 

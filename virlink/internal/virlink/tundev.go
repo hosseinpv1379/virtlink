@@ -82,11 +82,13 @@ func openTunMulti(name string, n int) (*TunDev, error) {
 }
 
 // openTunMultiTry opens readQueues read fds + 1 dedicated write-only queue fd.
+// Queue 0 is the write fd (kernel always accepts inject on the primary queue);
+// queues 1..N are read-only for the TX poller (O_NONBLOCK, never written).
 func openTunMultiTry(name string, readQueues int) (*TunDev, error) {
 	if readQueues < 1 {
 		readQueues = 1
 	}
-	// +1 queue used exclusively for wire→TUN writes (never O_NONBLOCK).
+	// +1 queue: q0 = wire→TUN inject (blocking), q1.. = stack→userspace read.
 	totalQ := readQueues + 1
 	td := &TunDev{
 		fds:    make([]*os.File, 0, readQueues),
@@ -113,10 +115,10 @@ func openTunMultiTry(name string, readQueues int) (*TunDev, error) {
 			return nil, fmt.Errorf("TUNSETIFF %s q%d: %w", name, i, errno)
 		}
 		f := os.NewFile(uintptr(fd), fmt.Sprintf("%s-q%d", name, i))
-		if i < readQueues {
-			td.fds = append(td.fds, f)
-		} else {
+		if i == 0 {
 			td.writeFd = f
+		} else {
+			td.fds = append(td.fds, f)
 		}
 	}
 	if l, err := netlink.LinkByName(name); err == nil {

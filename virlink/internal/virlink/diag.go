@@ -172,8 +172,11 @@ func diagCause(tunnelType, mode, hs string, p pipeStats) string {
 	if p.txRead > 0 && p.txSend == 0 && p.txNoDst == 0 {
 		hints = append(hints, "outbound wire send failing — look for [wire] TX failed; check firewall, rp_filter, run as root")
 	}
-	if p.rxRecv == 0 && p.txSend > 0 && mode == "client" {
+	if p.rxRecv == 0 && p.txSend > 0 && mode == "client" && hs != "connected" && hs != "degraded" {
 		hints = append(hints, "we send but peer never replies — peer down, wrong remote_ip, or UDP/ICMP blocked inbound on server")
+	}
+	if p.rxRecv == 0 && p.txSend > 0 && mode == "client" && (hs == "connected" || hs == "degraded") {
+		hints = append(hints, "intermittent inbound loss — no wire packets in this window (ISP UDP filter or path loss)")
 	}
 	if p.rxRecv == 0 && p.txSend == 0 && p.txRead == 0 {
 		hints = append(hints, "no tunnel traffic — try: ping <peer_overlay>  or check both sides use same tunnel type/port")

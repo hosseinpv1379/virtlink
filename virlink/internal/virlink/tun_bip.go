@@ -117,16 +117,8 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 	batch := newTunRxBatch(bsz)
 
 	flush := func() {
-		n, err := batch.flush(tun)
-		if n == 0 {
-			return
-		}
-		if err != nil && !t.stop.stopped() {
-			logDiagOnce("bip:tun_write", 15*time.Second,
-				fmt.Sprintf("BIP TUN write failed: %v (%d pkt dropped)", err, n))
-		} else if err == nil {
-			statAdd(statBIPRxWrite, uint64(n))
-		}
+		written, total, err := batch.flush(tun)
+		reportTunRxFlush(written, total, err, statBIPRxWrite, statBIPRxDropWrite, "bip:tun_write", "BIP", &t.stop)
 	}
 	defer flush()
 
@@ -165,7 +157,7 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 				t.lastSrc.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
 			}
 			statInc(statBIPRxRecv)
-			NoteTunnelAlive()
+			logInfoOnce("tunnel:wire:rx", 24*time.Hour, "first valid packet from peer on wire (RX path OK)")
 			batch.add(inner)
 		}
 		if batch.len() > 0 {

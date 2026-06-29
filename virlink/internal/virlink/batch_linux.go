@@ -4,8 +4,10 @@
 package virlink
 
 import (
+	"fmt"
 	"net"
 	"os"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -152,13 +154,15 @@ func icmpWireCarrierType(pkt []byte, wireOn bool) byte {
 // returns EAGAIN immediately without retry. unix.Write lets us handle EAGAIN
 // with a brief sleep+retry so that transient kernel alloc_skb failures (GFP_ATOMIC
 // under memory pressure) do not silently drop received packets.
-func tunWritev(fd *os.File, bufs [][]byte) error {
+func tunWritev(fd *os.File, bufs [][]byte) (int, error) {
+	written := 0
 	for _, buf := range bufs {
 		if err := tunWrite(fd, buf); err != nil {
-			return err
+			return written, err
 		}
+		written++
 	}
-	return nil
+	return written, nil
 }
 
 // tunRxBatch accumulates inbound (wire → TUN) packets so a burst of datagrams
@@ -194,20 +198,41 @@ func (b *tunRxBatch) addOwned(frame []byte, n int) {
 
 func (b *tunRxBatch) len() int { return len(b.bufs) }
 
-// flush writes the batch in one tunWritev call and returns the packet count
-// that was flushed (0 if the batch was already empty).
-func (b *tunRxBatch) flush(tun *os.File) (int, error) {
-	n := len(b.bufs)
-	if n == 0 {
-		return 0, nil
+func reportTunRxFlush(written, total int, err error, writeStat, dropStat int, logKey, proto string, stop *stoppedFlag) {
+	if written == 0 && err == nil {
+		return
 	}
-	err := tunWritev(tun, b.bufs)
+	if written > 0 {
+		statAdd(writeStat, uint64(written))
+		NoteTunnelInjected(written)
+	}
+	if err == nil {
+		return
+	}
+	if dropped := total - written; dropped > 0 && dropStat >= 0 {
+		statAdd(dropStat, uint64(dropped))
+	}
+	if stop != nil && stop.stopped() {
+		return
+	}
+	logDiagOnce(logKey, 15*time.Second,
+		fmt.Sprintf("%s TUN write failed: %v (%d/%d pkt dropped)", proto, err, total-written, total))
+}
+
+// flush writes the batch via tunWritev and returns (written, total, err).
+// written may be less than total when a mid-batch TUN write fails.
+func (b *tunRxBatch) flush(tun *os.File) (written, total int, err error) {
+	total = len(b.bufs)
+	if total == 0 {
+		return 0, 0, nil
+	}
+	written, err = tunWritev(tun, b.bufs)
 	for _, p := range b.pooled {
 		putBuf(p)
 	}
 	b.bufs = b.bufs[:0]
 	b.pooled = b.pooled[:0]
-	return n, err
+	return written, total, err
 }
 
 // icmpTxBatch holds up to icmpBatchMax frames ready for sendmmsg.
@@ -235,10 +260,16 @@ func (b *icmpTxBatch) add(frame []byte, pktLen int, dst [4]byte, port uint16) {
 	b.addrs[i] = unix.RawSockaddrInet4{Family: unix.AF_INET, Port: portBE, Addr: dst}
 	b.iovs[i].Base = &frame[0]
 	b.iovs[i].Len = uint64(pktLen)
-	b.msgs[i].Hdr.Name = (*byte)(unsafe.Pointer(&b.addrs[i]))
-	b.msgs[i].Hdr.Namelen = unix.SizeofSockaddrInet4
 	b.msgs[i].Hdr.Iov = &b.iovs[i]
 	b.msgs[i].Hdr.Iovlen = 1
+	// port==0 → connected UDP socket; destination comes from connect(), not msghdr.
+	if port != 0 {
+		b.msgs[i].Hdr.Name = (*byte)(unsafe.Pointer(&b.addrs[i]))
+		b.msgs[i].Hdr.Namelen = unix.SizeofSockaddrInet4
+	} else {
+		b.msgs[i].Hdr.Name = nil
+		b.msgs[i].Hdr.Namelen = 0
+	}
 	b.n++
 }
 
@@ -254,11 +285,17 @@ func mmsgSendBatch(rawFd int, b *icmpTxBatch) int {
 		sent = 0
 	}
 	for i := sent; i < b.n; i++ {
-		sa := &unix.SockaddrInet4{Addr: b.addrs[i].Addr}
-		if p := b.ports[i]; p != 0 {
-			sa.Port = int(p)
+		var e error
+		if b.ports[i] == 0 {
+			_, e = unix.Write(rawFd, b.frames[i][:b.lens[i]])
+		} else {
+			sa := &unix.SockaddrInet4{Addr: b.addrs[i].Addr}
+			if p := b.ports[i]; p != 0 {
+				sa.Port = int(p)
+			}
+			e = unix.Sendto(rawFd, b.frames[i][:b.lens[i]], 0, sa)
 		}
-		if e := unix.Sendto(rawFd, b.frames[i][:b.lens[i]], 0, sa); e != nil && e != unix.EAGAIN {
+		if e != nil && e != unix.EAGAIN {
 			errs++
 		}
 	}

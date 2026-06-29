@@ -223,10 +223,8 @@ func (t *Hysteria2Tunnel) rxLoopServer(conn *net.UDPConn, tun *os.File) {
 	pollMs := perfPollMs()
 
 	flush := func() {
-		n, ferr := batch.flush(tun)
-		if n > 0 && ferr == nil {
-			statAdd(statUDPRxWrite, uint64(n))
-		}
+		written, total, err := batch.flush(tun)
+		reportTunRxFlush(written, total, err, statUDPRxWrite, statUDPRxDropWrite, "hy2:tun_write", "HY2", &t.stop)
 	}
 	defer flush()
 
@@ -384,10 +382,8 @@ func (t *Hysteria2Tunnel) rxLoopClient(conn *net.UDPConn, tun *os.File) {
 	pollMs := perfPollMs()
 
 	flush := func() {
-		n, ferr := batch.flush(tun)
-		if n > 0 && ferr == nil {
-			statAdd(statUDPRxWrite, uint64(n))
-		}
+		written, total, err := batch.flush(tun)
+		reportTunRxFlush(written, total, err, statUDPRxWrite, statUDPRxDropWrite, "hy2:tun_write", "HY2", &t.stop)
 	}
 	defer flush()
 

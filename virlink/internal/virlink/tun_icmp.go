@@ -224,19 +224,8 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 	batch := newTunRxBatch(bsz)
 
 	flush := func() {
-		n, err := batch.flush(tun)
-		if n == 0 {
-			return
-		}
-		if err != nil {
-			statInc(statICMPRxDropWrite)
-			if !t.stop.stopped() {
-				logDiagOnce("icmp:tun_write", 15*time.Second,
-					fmt.Sprintf("ICMP TUN write failed: %v (%d pkt dropped)", err, n))
-			}
-		} else {
-			statAdd(statICMPRxWrite, uint64(n))
-		}
+		written, total, err := batch.flush(tun)
+		reportTunRxFlush(written, total, err, statICMPRxWrite, statICMPRxDropWrite, "icmp:tun_write", "ICMP", &t.stop)
 	}
 	defer flush()
 
@@ -280,7 +269,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 				continue
 			}
 			statInc(statICMPRxRecv)
-			NoteTunnelAlive()
+			logInfoOnce("tunnel:wire:rx", 24*time.Hour, "first valid packet from peer on wire (RX path OK)")
 			seq := binary.BigEndian.Uint16(icmp[6:8])
 			if t.dedup.dup(seq) {
 				statInc(statICMPRxDropSeq)

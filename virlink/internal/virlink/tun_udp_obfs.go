@@ -203,13 +203,8 @@ func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD,
 	var lastPeerPort uint16
 
 	flush := func() {
-		n, err := batch.flush(tun)
-		if n == 0 {
-			return
-		}
-		if err != nil && !t.stop.stopped() {
-			logWarn("tun write: " + err.Error())
-		}
+		written, total, err := batch.flush(tun)
+		reportTunRxFlush(written, total, err, statUDPRxWrite, statUDPRxDropWrite, "udp-obfs:tun_write", "UDP-OBFS", &t.stop)
 	}
 	defer flush()
 

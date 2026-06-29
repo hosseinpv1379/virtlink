@@ -96,6 +96,9 @@ func (t *UdpTunnel) Up() error {
 		if c.Mode == "client" {
 			dst := &net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port}
 			t.lastPeer.Store(dst)
+			if err := connectUDP(t.udpConn, dst); err != nil {
+				logWarn("udp client connect: " + err.Error())
+			}
 		}
 		logOK(fmt.Sprintf("UDP :%d", port))
 	}
@@ -130,19 +133,8 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 	batch := newTunRxBatch(bsz)
 
 	flush := func() {
-		n, err := batch.flush(tun)
-		if n == 0 {
-			return
-		}
-		if err != nil {
-			statInc(statUDPRxDropWrite)
-			if !t.stop.stopped() {
-				logDiagOnce("udp:tun_write", 15*time.Second,
-					fmt.Sprintf("UDP TUN write failed: %v (%d pkt dropped)", err, n))
-			}
-		} else {
-			statAdd(statUDPRxWrite, uint64(n))
-		}
+		written, total, err := batch.flush(tun)
+		reportTunRxFlush(written, total, err, statUDPRxWrite, statUDPRxDropWrite, "udp:tun_write", "UDP", &t.stop)
 	}
 	defer flush()
 
@@ -196,7 +188,7 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 				t.lastRoute.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
 			}
 			statInc(statUDPRxRecv)
-			NoteTunnelAlive()
+			logInfoOnce("tunnel:wire:rx", 24*time.Hour, "first valid packet from peer on wire (RX path OK)")
 			batch.add(payload)
 		}
 		if batch.len() > 0 {
@@ -303,19 +295,8 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 	var lastPeerPort uint16
 
 	flush := func() {
-		n, err := batch.flush(tun)
-		if n == 0 {
-			return
-		}
-		if err != nil {
-			statInc(statUDPRxDropWrite)
-			if !t.stop.stopped() {
-				logDiagOnce("udp:tun_write", 15*time.Second,
-					fmt.Sprintf("UDP TUN write failed: %v (%d pkt dropped)", err, n))
-			}
-		} else {
-			statAdd(statUDPRxWrite, uint64(n))
-		}
+		written, total, err := batch.flush(tun)
+		reportTunRxFlush(written, total, err, statUDPRxWrite, statUDPRxDropWrite, "udp:tun_write", "UDP", &t.stop)
 	}
 	defer flush()
 
@@ -361,7 +342,7 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 				}
 			}
 			statInc(statUDPRxRecv)
-			NoteTunnelAlive()
+			logInfoOnce("tunnel:wire:rx", 24*time.Hour, "first valid packet from peer on wire (RX path OK)")
 			batch.add(pkt)
 		}
 		if batch.len() > 0 {
@@ -401,7 +382,6 @@ func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 			t.lastPeer.Store(src)
 		}
 		statInc(statUDPRxRecv)
-		NoteTunnelAlive()
 		if err := tunWrite(tun, buf[:n]); err != nil {
 			statInc(statUDPRxDropWrite)
 			if !t.stop.stopped() {
@@ -410,6 +390,7 @@ func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 			}
 		} else {
 			statInc(statUDPRxWrite)
+			NoteTunnelInjected(1)
 		}
 	}
 }
@@ -465,7 +446,7 @@ func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 			var port uint16
 			if t.cfg.Mode == "client" {
 				dst = t.peerIP
-				port = uint16(t.cfg.Transport.Port)
+				port = 0 // connected UDP socket — sendmmsg must not set msg_name
 			} else if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
 				copy(dst[:], p.IP.To4())
 				port = uint16(p.Port)
