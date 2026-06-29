@@ -93,9 +93,23 @@ func openTunMultiTry(name string, n int) (*TunDev, error) {
 }
 
 func tunWrite(fd *os.File, pkt []byte) error {
-	rawFd := int(fd.Fd())
-	const maxRetries = 32
-	for i := 0; ; i++ {
+	return tunWriteOne(int(fd.Fd()), pkt)
+}
+
+// tunWriteOne injects one packet into the TUN device.
+//
+// The TX poller sets the TUN queue fds non-blocking (for reads), and the RX
+// loop writes to the same fd, so a write can return EAGAIN when the kernel's
+// TUN rx queue is momentarily full. Instead of dropping the packet (which left
+// the overlay with rx_write=0 and the handshake stuck on "waiting"), we wait
+// for the fd to become writable and retry. Empty packets are skipped so a
+// zero-length datagram never turns into a no-op "successful" write.
+func tunWriteOne(rawFd int, pkt []byte) error {
+	if len(pkt) == 0 {
+		return nil
+	}
+	pfd := []unix.PollFd{{Fd: int32(rawFd), Events: unix.POLLOUT}}
+	for attempt := 0; attempt < 1024; attempt++ {
 		_, err := unix.Write(rawFd, pkt)
 		if err == nil {
 			return nil
@@ -103,12 +117,14 @@ func tunWrite(fd *os.File, pkt []byte) error {
 		if err == unix.EINTR {
 			continue
 		}
-		if (err == unix.EAGAIN || err == unix.EWOULDBLOCK) && i < maxRetries {
-			unix.Nanosleep(&unix.Timespec{Nsec: 1_000_000}, nil)
+		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			// Wait up to 100 ms for the TUN to drain, then retry.
+			_, _ = unix.Poll(pfd, 100)
 			continue
 		}
 		return err
 	}
+	return unix.EAGAIN
 }
 
 // tunReadNB reads one packet from a non-blocking TUN fd.

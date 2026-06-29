@@ -102,8 +102,16 @@ func (b *rxMmsgBatch) data(i int) []byte {
 	return b.bufs[i][:b.msgs[i].Len]
 }
 
+// from4 returns the source address of received datagram i.
+// RawSockaddrInet4.Port is network byte order; unix.SockaddrInet4.Port is host
+// order, so we byte-swap. Dropping the port here made UDP server mode reply to
+// port 0 (every send failed) — the source port is required for the return path.
 func (b *rxMmsgBatch) from4(i int) *unix.SockaddrInet4 {
-	return &unix.SockaddrInet4{Addr: b.addrs[i].Addr}
+	p := b.addrs[i].Port
+	return &unix.SockaddrInet4{
+		Port: int(p>>8 | p<<8),
+		Addr: b.addrs[i].Addr,
+	}
 }
 
 // installICMPFilter drops all ICMP types except echo request (type 8) at the socket.
@@ -147,21 +155,7 @@ func icmpWireCarrierType(pkt []byte, wireOn bool) byte {
 func tunWritev(fd *os.File, bufs [][]byte) error {
 	rawFd := int(fd.Fd())
 	for _, buf := range bufs {
-		const maxRetries = 32
-		for i := 0; ; i++ {
-			_, err := unix.Write(rawFd, buf)
-			if err == nil {
-				break
-			}
-			if err == unix.EINTR {
-				continue
-			}
-			if (err == unix.EAGAIN || err == unix.EWOULDBLOCK) && i < maxRetries {
-				// Transient: kernel alloc_skb failed with GFP_ATOMIC.
-				// Sleep 1 ms to allow memory reclaim then retry.
-				unix.Nanosleep(&unix.Timespec{Nsec: 1_000_000}, nil)
-				continue
-			}
+		if err := tunWriteOne(rawFd, buf); err != nil {
 			return err
 		}
 	}

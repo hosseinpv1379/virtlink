@@ -345,8 +345,8 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 				continue
 			}
 			if t.cfg.Mode == "server" {
-				// Network byte-order port from RawSockaddrInet4.
-				saPort := uint16(sa.Port>>8) | uint16(sa.Port<<8)
+				// from4 already returns the port in host byte order.
+				saPort := uint16(sa.Port)
 				if sa.Addr != lastPeerAddr || saPort != lastPeerPort {
 					lastPeerAddr = sa.Addr
 					lastPeerPort = saPort
