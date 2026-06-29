@@ -2,9 +2,11 @@
 package app
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	_ "virlink/internal/protocol"
 	"virlink/internal/config"
@@ -12,14 +14,17 @@ import (
 	"virlink/internal/platform"
 )
 
-const version = "3.3.13"
+const version = "3.3.14"
 
 func Main() {
-	cfgFile := flag.String("c", "", "path to config.toml")
+	cfgFile := flag.String("c", "", "path to config.toml (tunnel or web panel)")
 	doDown := flag.Bool("down", false, "tear down tunnel (one-shot)")
 	doStatus := flag.Bool("status", false, "show current tunnel status")
 	doVer := flag.Bool("version", false, "print version")
 	doVerbose := flag.Bool("v", false, "verbose debug logging (log every command)")
+	doWeb := flag.Bool("web", false, "run centralized web panel service")
+	doHashPW := flag.Bool("hash-password", false, "print web panel password hash (pass password as arg or stdin)")
+	hashUser := flag.String("user", "admin", "username for --hash-password salt")
 	flag.BoolVar(doVerbose, "verbose", false, "verbose debug logging (log every command)")
 	flag.Usage = printUsage
 	flag.Parse()
@@ -27,6 +32,30 @@ func Main() {
 	if *doVer {
 		fmt.Printf("virlink v%s\n", version)
 		return
+	}
+
+	if *doHashPW {
+		pass := strings.TrimSpace(strings.Join(flag.Args(), " "))
+		if pass == "" {
+			sc := bufio.NewScanner(os.Stdin)
+			if sc.Scan() {
+				pass = strings.TrimSpace(sc.Text())
+			}
+		}
+		hashPasswordCLI(*hashUser, pass)
+		return
+	}
+
+	if *doWeb {
+		if os.Geteuid() != 0 {
+			fmt.Fprintln(os.Stderr, platform.Color(platform.CRed, "✗")+" web panel must run as root (sudo)")
+			os.Exit(1)
+		}
+		path := *cfgFile
+		if path == "" {
+			path = "/opt/virlink/webpanel.toml"
+		}
+		os.Exit(runWebPanel(path))
 	}
 
 	if *cfgFile == "" {
@@ -85,38 +114,24 @@ func printUsage() {
 virlink v%s — kernel tunnel manager
 
 Usage:
-  sudo ./virlink -c config.toml            run (tunnel up, blocks, Ctrl+C removes)
-  sudo ./virlink -v -c config.toml         run with debug logging (every command)
+  sudo ./virlink -c config.toml            run tunnel (blocks until Ctrl+C)
+  sudo ./virlink --web -c webpanel.toml    run centralized web panel
+  ./virlink --hash-password SECRET           hash password for web panel config
   sudo ./virlink -c config.toml --down     tear down tunnel
   sudo ./virlink -c config.toml --status   show tunnel status
        ./virlink --version
 
-Tunnel types  ([tunnel] type = "..." in config.toml):
-  gre-fou         GRE in UDP (FOU)           port 5556
-  ipip-fou        IPIP in UDP (FOU)          port 5055
-  bonded-gre-fou  dual GRE-FOU ECMP 2×BW    port 5557/5558
-  l2tpv3          L2TPv3 over UDP            port 5059
-  gre-fou-ipsec   GRE-FOU + IPsec ESP        port 5556
-  udp-obfs        AES-256-GCM obfuscated UDP port 443
-  gre             Kernel GRE (proto 47)      raw
-  tcp             User-space TCP tunnel      port 8443
-  tcpmux          TCP flow-hash multiplex    port 8443
-  openvpn         OpenVPN (openvpn core)     port 1194
-  openvpnmultu    OpenVPN multi-worker ECMP  ports 1194+
-  hysteria2       Hysteria2 QUIC tunnel      port 443
-  wireguard       WireGuard (kernel WG)      port 51820
-  amneziawg       AmneziaWG obfuscated WG     UDP · DPI-resistant
-  udp             User-space UDP tunnel      port 5060
-  icmp            ICMP Echo tunnel (proto 1) raw
-  bip             BIP tunnel (proto 58)      raw
+Web panel:
+  Install via virlink-setup → Install Web Panel
+  Scans /opt/virlink/configs/*.toml and shows all tunnels (HTTP Basic Auth)
 
-Lifecycle:
-  • tunnel is created when the process starts
-  • heartbeat log printed every [transport] heartbeat_interval seconds
+Tunnel lifecycle:
+  • Link state is logged only on change (connected / waiting / disconnected)
   • Ctrl+C / SIGTERM → tunnel removed automatically
 
 Examples:
-  sudo ./virlink -c configs/examples/gre-fou/client/config.toml
+  sudo ./virlink -c /opt/virlink/configs/mylink.toml
+  sudo ./virlink --web -c /opt/virlink/webpanel.toml
 
 `, version)
 }

@@ -12,7 +12,7 @@ set -Eeuo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.8.0"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@mioopython"
 AUTHOR="Hossein"
@@ -25,6 +25,10 @@ INSTALL_DIR="/opt/virlink"
 VIRLINK_BIN="${INSTALL_DIR}/virlink"
 CONFIGS_DIR="${INSTALL_DIR}/configs"
 LOGS_DIR="/var/log/virlink"
+WEBPANEL_CFG="${INSTALL_DIR}/webpanel.toml"
+WEBPANEL_SVC="virlink-webpanel"
+WEBPANEL_UNIT="/etc/systemd/system/${WEBPANEL_SVC}.service"
+WEBPANEL_LOG="${LOGS_DIR}/webpanel.log"
 MANUAL_CLIENT_CONF_DIR="/root/manual-client-conf"
 
 UPDATE_AVAILABLE=0
@@ -560,7 +564,7 @@ do_remove_core() {
   fi
 
   local unit name
-  for unit in /etc/systemd/system/virlink-*.service; do
+  for unit in /etc/systemd/system/virlink-*.service /etc/systemd/system/virlink-webpanel.service; do
     [[ -f "$unit" ]] || continue
     name=$(basename "$unit" .service)
     info "Stopping ${name}..."
@@ -931,6 +935,161 @@ tunnel_start() {
   journalctl -u "$svc" -n 20 --no-pager 2>/dev/null | sed 's/^/  /' || \
     tail -20 "$(svc_log "$name")" 2>/dev/null | sed 's/^/  /' || true
   return 1
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Web panel (central dashboard for all tunnels)
+# ══════════════════════════════════════════════════════════════════════════════
+webpanel_is_installed() {
+  [[ -f "$WEBPANEL_CFG" && -f "$WEBPANEL_UNIT" ]]
+}
+
+webpanel_is_running() {
+  systemctl is-active "$WEBPANEL_SVC" &>/dev/null
+}
+
+webpanel_hash_password() {
+  local user="$1" pass="$2"
+  printf '%s' "$pass" | "$VIRLINK_BIN" --user "$user" --hash-password 2>/dev/null | tail -1
+}
+
+webpanel_write_config() {
+  local listen="$1" user="$2" hash="$3"
+  cat > "$WEBPANEL_CFG" << EOF
+# virlink web panel — centralized tunnel dashboard
+[webpanel]
+listen         = "${listen}"
+username       = "${user}"
+password_hash  = "${hash}"
+configs_dir    = "${CONFIGS_DIR}"
+EOF
+  chmod 600 "$WEBPANEL_CFG"
+}
+
+webpanel_write_service() {
+  mkdir -p "$LOGS_DIR"
+  cat > "$WEBPANEL_UNIT" << EOF
+[Unit]
+Description=virlink web panel (all tunnels dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=${VIRLINK_BIN} --web -c ${WEBPANEL_CFG}
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:${WEBPANEL_LOG}
+StandardError=append:${WEBPANEL_LOG}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+webpanel_install() {
+  local listen user pass pass2 hash host port
+  require_root
+  [[ -x "$VIRLINK_BIN" ]] || die "virlink binary not found — install core first"
+
+  blank
+  info "Web panel — centralized dashboard for all tunnels in ${CONFIGS_DIR}"
+  info "Secured with HTTP Basic Auth (username + password)."
+  blank
+
+  prompt listen "Listen address:port" "0.0.0.0:8787"
+  listen="${listen// /}"
+  [[ -z "$listen" ]] && listen="0.0.0.0:8787"
+
+  prompt user "Admin username" "admin"
+  [[ -z "$user" ]] && user="admin"
+
+  while true; do
+    tty_out "  ${W}?${NC} Admin password: "
+    read -rs pass < /dev/tty || true
+    echo >&2
+    tty_out "  ${W}?${NC} Confirm password: "
+    read -rs pass2 < /dev/tty || true
+    echo >&2
+    [[ -n "$pass" && "$pass" == "$pass2" ]] && break
+    warn "Passwords do not match or empty — try again."
+  done
+
+  hash=$(webpanel_hash_password "$user" "$pass")
+  [[ -n "$hash" ]] || die "Failed to hash password (is virlink binary up to date?)"
+
+  webpanel_write_config "$listen" "$user" "$hash"
+  webpanel_write_service
+
+  info "Enabling ${WEBPANEL_SVC}..."
+  systemctl enable "$WEBPANEL_SVC" || die "systemctl enable failed"
+  systemctl restart "$WEBPANEL_SVC" || die "systemctl start failed"
+  sleep 1
+
+  if webpanel_is_running; then
+    host="${listen%%:*}"
+    port="${listen##*:}"
+    [[ "$host" == "0.0.0.0" || "$host" == "::" ]] && host="<server-ip>"
+    ok "Web panel running at ${W}http://${host}:${port}/${NC}"
+    info "Login: user=${user}  (password you just set)"
+    info "Log: ${WEBPANEL_LOG}"
+    info "Service: systemctl {status|restart|stop} ${WEBPANEL_SVC}"
+  else
+    err "Web panel failed to start — check: journalctl -u ${WEBPANEL_SVC} -n 30"
+    return 1
+  fi
+}
+
+webpanel_remove() {
+  require_root
+  info "Stopping web panel..."
+  systemctl stop "$WEBPANEL_SVC" 2>/dev/null || true
+  systemctl disable "$WEBPANEL_SVC" 2>/dev/null || true
+  rm -f "$WEBPANEL_UNIT" "$WEBPANEL_CFG" "$WEBPANEL_LOG"
+  systemctl daemon-reload 2>/dev/null || true
+  ok "Web panel removed"
+}
+
+menu_webpanel() {
+  blank
+  if webpanel_is_installed; then
+    info "Web panel is installed."
+    if webpanel_is_running; then
+      ok "Status: ${G}running${NC}"
+    else
+      warn "Status: ${R}stopped${NC}"
+    fi
+    pick _wp_act "Web panel" \
+      "Open URL / credentials info" \
+      "Reinstall (new user/pass)" \
+      "Restart service" \
+      "Stop service" \
+      "Remove web panel" \
+      "Back"
+    case "$(label_key "$_wp_act")" in
+      open)
+        grep -E '^\s*listen\s*=' "$WEBPANEL_CFG" 2>/dev/null | head -1
+        grep -E '^\s*username\s*=' "$WEBPANEL_CFG" 2>/dev/null | head -1
+        info "Log: ${WEBPANEL_LOG}"
+        ;;
+      reinstall) webpanel_install ;;
+      restart) systemctl restart "$WEBPANEL_SVC" && ok "Restarted" ;;
+      stop) systemctl stop "$WEBPANEL_SVC" && ok "Stopped" ;;
+      remove)
+        if confirm "Remove web panel service and config"; then
+          webpanel_remove
+        fi
+        ;;
+      *) return 0 ;;
+    esac
+  else
+    info "Web panel is not installed yet."
+    if confirm "Install web panel now"; then
+      webpanel_install
+    fi
+  fi
 }
 
 tunnel_remove_pki() {
@@ -4902,9 +5061,10 @@ main() {
     fi
     echo -e "    ${C} 5${NC}  Update script"
     echo -e "    ${C} 6${NC}  Remove Virtlink Core"
+    echo -e "    ${C} 7${NC}  Install Web Panel"
     echo -e "    ${C} 0${NC}  Exit"
     blank
-    tty_out "  ${W}?${NC} Choose [0-6]: "
+    tty_out "  ${W}?${NC} Choose [0-7]: "
     read -r choice < /dev/tty || { blank; ok "Goodbye."; blank; exit 0; }
     case "$choice" in
       1) menu_create_tunnel ;;
@@ -4913,6 +5073,7 @@ main() {
       4) menu_update_core ;;
       5) menu_update_script ;;
       6) menu_remove_core ;;
+      7) menu_webpanel ;;
       0) blank; ok "Goodbye."; blank; exit 0 ;;
       *) warn "Invalid choice." ;;
     esac

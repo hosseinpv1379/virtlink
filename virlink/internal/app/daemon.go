@@ -21,6 +21,12 @@ import (
 	"virlink/internal/wire"
 )
 
+type linkMonitor struct {
+	lastHS   string
+	lastLink string
+	inited   bool
+}
+
 func runDaemon(cfg *config.Config, tun core.Tunnel) int {
 	platform.InitLogger(&cfg.Logging)
 	platform.Header(fmt.Sprintf("%s · %s", cfg.Tunnel.Type, cfg.Tunnel.Mode))
@@ -58,7 +64,7 @@ func runDaemon(cfg *config.Config, tun core.Tunnel) int {
 	hp := cfg.Health.HTTPPort
 	platform.PrintBanner(
 		cfg.Tunnel.Type, cfg.Tunnel.Mode,
-		cfg.LocalIP, cfg.RemoteIP,
+		cfg.Tunnel.LocalIP, cfg.Tunnel.RemoteIP,
 		tun.OverlayIP(), tun.PeerIP(), tun.DevName(),
 		cfg.Health.Port, hp, hp+1,
 	)
@@ -71,6 +77,8 @@ func runDaemon(cfg *config.Config, tun core.Tunnel) int {
 		platform.LogInfo("[fwd] rules: " + strings.Join(parts, "  "))
 	}
 
+	var mon linkMonitor
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -81,7 +89,7 @@ func runDaemon(cfg *config.Config, tun core.Tunnel) int {
 		for {
 			select {
 			case <-ticker.C:
-				printHeartbeat(tun, fwdRules, startedAt, hm)
+				printHeartbeat(tun, startedAt, hm, &mon)
 			case <-stopHB:
 				return
 			}
@@ -108,13 +116,15 @@ func runDaemon(cfg *config.Config, tun core.Tunnel) int {
 	return 0
 }
 
-func printHeartbeat(tun core.Tunnel, fwdRules []platform.ForwardRule, since time.Time, hm *platform.HealthMgr) {
+func printHeartbeat(tun core.Tunnel, since time.Time, hm *platform.HealthMgr, mon *linkMonitor) {
 	dev := tun.DevName()
-	uptime := time.Since(since)
 
 	l, err := netlink.LinkByName(dev)
 	if err != nil {
-		platform.LogWarn(fmt.Sprintf("[♥] dev=%s NOT FOUND  uptime=%s", dev, uptime.Round(time.Second)))
+		if mon.lastLink != "MISSING" {
+			mon.lastLink = "MISSING"
+			platform.LogWarn(fmt.Sprintf("[link] %s interface missing", dev))
+		}
 		return
 	}
 
@@ -123,72 +133,67 @@ func printHeartbeat(tun core.Tunnel, fwdRules []platform.ForwardRule, since time
 		linkState = "DOWN"
 	}
 
-	var rxB, txB, rxPkt, txPkt uint64
-	if s := l.Attrs().Statistics; s != nil {
-		rxB, txB = s.RxBytes, s.TxBytes
-		rxPkt, txPkt = s.RxPackets, s.TxPackets
-	}
-
-	hsState := ""
-	lastProbe := ""
+	hsState := "unknown"
 	if hm != nil {
 		hsState = hm.Handshake()
-		lastProbe = hm.LastSeenStr()
 	} else if _, ok := tun.(*hysteria2.Hysteria2Tunnel); ok {
 		hsState = "hy2"
-		lastProbe = "n/a (check hysteria2 log)"
 	}
 	if wg, ok := tun.(*wireguard.WireGuardTunnel); ok {
-		dev := wg.DevName()
-		if ts, wgOK := wireguard.WireguardLatestHandshake(dev, "wg"); wgOK {
-			wgAge := time.Since(ts).Round(time.Second).String()
-			if hsState == "" || hsState == "waiting" {
-				hsState = "wg-ok"
-			}
-			lastProbe = "wg " + wgAge + " ago"
+		if ts, wgOK := wireguard.WireguardLatestHandshake(wg.DevName(), "wg"); wgOK {
+			hsState = "connected"
+			_ = ts
 		} else if hsState == "" || hsState == "waiting" {
-			hsState = "wg-wait"
-			lastProbe = "no wg handshake"
+			hsState = "waiting"
 		}
 	}
 	if awg, ok := tun.(*amneziawg.AmneziaWGTunnel); ok {
-		dev := awg.DevName()
-		if ts, ok := wireguard.WireguardLatestHandshake(dev, "awg"); ok {
-			wgAge := time.Since(ts).Round(time.Second).String()
-			if hsState == "" || hsState == "waiting" {
-				hsState = "awg-ok"
-			}
-			lastProbe = "awg " + wgAge + " ago"
+		if ts, ok := wireguard.WireguardLatestHandshake(awg.DevName(), "awg"); ok {
+			hsState = "connected"
+			_ = ts
 		} else if hsState == "" || hsState == "waiting" {
-			hsState = "awg-wait"
-			lastProbe = "no awg handshake"
+			hsState = "waiting"
 		}
 	}
 
-	msg := platform.FmtHeartbeat(dev, linkState, hsState, lastProbe,
-		rxB, txB, rxPkt, txPkt, uptime)
-	platform.LogInfo(msg)
-	wire.WireLogHeartbeat()
-}
+	logKey := hsState + "|" + linkState
+	if mon.inited && mon.lastHS+"|"+mon.lastLink == logKey {
+		return
+	}
+	prevHS := mon.lastHS
+	wasInited := mon.inited
+	mon.inited = true
+	mon.lastHS = hsState
+	mon.lastLink = linkState
 
-func fmtBytes(b uint64) string {
+	if linkState == "DOWN" {
+		if prevHS != "" || wasInited {
+			platform.LogWarn(fmt.Sprintf("[link] %s disconnected (interface DOWN)", dev))
+		}
+		wire.WireLogHeartbeat()
+		return
+	}
+
+	healthy := hsState == "connected" || hsState == "hy2"
+
 	switch {
-	case b < 1024:
-		return fmt.Sprintf("%dB", b)
-	case b < 1024*1024:
-		return fmt.Sprintf("%.1fKB", float64(b)/1024)
-	case b < 1024*1024*1024:
-		return fmt.Sprintf("%.2fMB", float64(b)/1024/1024)
+	case healthy:
+		if !wasInited || (prevHS != hsState && prevHS != "connected" && prevHS != "hy2") {
+			platform.LogInfo(fmt.Sprintf("[link] %s connected", dev))
+		}
+	case hsState == "waiting":
+		platform.LogWarn(fmt.Sprintf("[link] %s waiting for peer", dev))
+	case hsState == "degraded":
+		platform.LogWarn(fmt.Sprintf("[link] %s degraded (packet loss)", dev))
+	case hsState == "dead":
+		platform.LogError(fmt.Sprintf("[link] %s disconnected (probe timeout)", dev))
 	default:
-		return fmt.Sprintf("%.2fGB", float64(b)/1024/1024/1024)
+		if prevHS != hsState {
+			platform.LogInfo(fmt.Sprintf("[link] %s state=%s", dev, hsState))
+		}
 	}
-}
 
-func fmtNum(n uint64) string {
-	if n < 1000 {
-		return fmt.Sprintf("%d", n)
-	} else if n < 1_000_000 {
-		return fmt.Sprintf("%.1fK", float64(n)/1000)
+	if !healthy {
+		wire.WireLogHeartbeat()
 	}
-	return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
 }
