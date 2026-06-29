@@ -108,7 +108,7 @@ func (t *IpsecTunnel) Up() error {
 	}
 
 	step("iptables MSS clamping...")
-	addMSS(dev)
+	addMSS(c, dev)
 
 	if err := kernelTunnelWireUp(c); err != nil {
 		return err

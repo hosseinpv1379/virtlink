@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const statMax = 32
+const statMax = 40
 
 const (
 	statICMPTxPoll = iota
@@ -51,6 +51,11 @@ const (
 	statTCPTxNoConn
 	statTCPRxFrame
 	statTCPRxWrite
+
+	// TUN write failure counters (EAGAIN retries exhausted or other error).
+	statICMPRxDropWrite
+	statUDPRxDropWrite
+	statBIPRxDropWrite
 )
 
 var statNames = [statMax]string{
@@ -88,6 +93,10 @@ var statNames = [statMax]string{
 	statTCPTxNoConn: "tcp.tx_noconn",
 	statTCPRxFrame:  "tcp.rx_frame",
 	statTCPRxWrite:  "tcp.rx_write",
+
+	statICMPRxDropWrite: "icmp.rx_drop_write",
+	statUDPRxDropWrite:  "udp.rx_drop_write",
+	statBIPRxDropWrite:  "bip.rx_drop_write",
 }
 
 var (

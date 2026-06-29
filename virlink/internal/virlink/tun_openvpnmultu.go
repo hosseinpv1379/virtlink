@@ -154,7 +154,7 @@ func (t *OpenvpnMultuTunnel) Up() error {
 	c.Tuning.Multipath = true
 	applyTunnelTuning(c, devs...)
 	for _, d := range devs {
-		addMSS(d)
+		addMSS(c, d)
 	}
 
 	ports := openvpnMultuPortRange(c)

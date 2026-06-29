@@ -137,9 +137,31 @@ func icmpWireCarrierType(pkt []byte, wireOn bool) byte {
 //
 // Each packet must be written with its own write() call. The syscall overhead is
 // negligible: at 100 Mbps / 1320-byte MTU = ~9500 pkt/s × 200 ns ≈ 0.2% CPU.
+//
+// We use unix.Write directly (not fd.Write) because the TUN fd is set to
+// O_NONBLOCK by the TX poller. Go's *os.File.Write on a non-pollable fd (TUN is
+// a character device, not a network socket — not registered in Go's netpoller)
+// returns EAGAIN immediately without retry. unix.Write lets us handle EAGAIN
+// with a brief sleep+retry so that transient kernel alloc_skb failures (GFP_ATOMIC
+// under memory pressure) do not silently drop received packets.
 func tunWritev(fd *os.File, bufs [][]byte) error {
+	rawFd := int(fd.Fd())
 	for _, buf := range bufs {
-		if _, err := fd.Write(buf); err != nil {
+		const maxRetries = 32
+		for i := 0; ; i++ {
+			_, err := unix.Write(rawFd, buf)
+			if err == nil {
+				break
+			}
+			if err == unix.EINTR {
+				continue
+			}
+			if (err == unix.EAGAIN || err == unix.EWOULDBLOCK) && i < maxRetries {
+				// Transient: kernel alloc_skb failed with GFP_ATOMIC.
+				// Sleep 1 ms to allow memory reclaim then retry.
+				unix.Nanosleep(&unix.Timespec{Nsec: 1_000_000}, nil)
+				continue
+			}
 			return err
 		}
 	}

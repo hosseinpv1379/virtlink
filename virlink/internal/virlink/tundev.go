@@ -93,8 +93,22 @@ func openTunMultiTry(name string, n int) (*TunDev, error) {
 }
 
 func tunWrite(fd *os.File, pkt []byte) error {
-	_, err := fd.Write(pkt)
-	return err
+	rawFd := int(fd.Fd())
+	const maxRetries = 32
+	for i := 0; ; i++ {
+		_, err := unix.Write(rawFd, pkt)
+		if err == nil {
+			return nil
+		}
+		if err == unix.EINTR {
+			continue
+		}
+		if (err == unix.EAGAIN || err == unix.EWOULDBLOCK) && i < maxRetries {
+			unix.Nanosleep(&unix.Timespec{Nsec: 1_000_000}, nil)
+			continue
+		}
+		return err
+	}
 }
 
 // tunReadNB reads one packet from a non-blocking TUN fd.

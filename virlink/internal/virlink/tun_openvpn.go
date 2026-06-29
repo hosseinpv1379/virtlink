@@ -130,7 +130,7 @@ func (t *OpenvpnTunnel) Up() error {
 
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)
-	addMSS(dev)
+	addMSS(c, dev)
 
 	if t.useDCO {
 		t.logDCOStatus(logPath)

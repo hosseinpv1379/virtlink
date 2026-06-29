@@ -99,8 +99,8 @@ func (t *BondedTunnel) Up() error {
 	applyTunnelTuning(c, dev0, dev1)
 
 	step("iptables MSS clamping...")
-	addMSS(dev0)
-	addMSS(dev1)
+	addMSS(c, dev0)
+	addMSS(c, dev1)
 
 	if err := kernelTunnelWireUp(c); err != nil {
 		return err

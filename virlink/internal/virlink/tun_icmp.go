@@ -110,7 +110,7 @@ func (t *IcmpTunnel) Up() error {
 	logOK("raw ICMP socket ready")
 	logWireSpoof(t.cfg, t.wire)
 
-	addMSS(dev)
+	addMSS(c, dev)
 	t.done = make(chan struct{})
 
 	rawFd := t.rawFd
@@ -227,9 +227,12 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 		if n == 0 {
 			return
 		}
-		if err != nil && !t.stop.stopped() {
-			logWarn("tun write: " + err.Error())
-		} else if err == nil {
+		if err != nil {
+			statInc(statICMPRxDropWrite)
+			if !t.stop.stopped() {
+				logWarn(fmt.Sprintf("icmp tun write: %v (dropped %d pkt)", err, n))
+			}
+		} else {
 			statAdd(statICMPRxWrite, uint64(n))
 		}
 	}

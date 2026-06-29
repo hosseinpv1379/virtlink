@@ -189,7 +189,7 @@ func (t *Hysteria2Tunnel) Up() error {
 
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)
-	addMSS(dev)
+	addMSS(c, dev)
 
 	logOK(fmt.Sprintf("hysteria2 running  pid=%d  dev=%s", t.cmd.Process.Pid, dev))
 	logOK(fmt.Sprintf("overlay %s  peer %s  wrap :%d", addr, peer, wrapPort))

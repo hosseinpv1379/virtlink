@@ -111,7 +111,7 @@ func (t *AmneziaWGTunnel) Up() error {
 
 	step(fmt.Sprintf("tuning (%s)...", tuningModeLabel(c)))
 	applyTunnelTuning(c, dev)
-	addMSS(dev)
+	addMSS(c, dev)
 
 	logWireGuardStatus(dev, c.Mode, "awg")
 

@@ -158,15 +158,25 @@ func openRawICMP() (int, error) {
 }
 
 // connectUDP binds the socket to a fixed peer (fewer lookups per send).
+//
+// Uses SyscallConn.Control (not conn.File()) so we operate on the live fd
+// without duplicating it. conn.File() dups + closes the dup, which in some
+// Go versions marks the original netFD internal state as "file fd" and breaks
+// subsequent SyscallConn.Control / udpConnFD calls with EBADF or EINVAL.
 func connectUDP(conn *net.UDPConn, dst *net.UDPAddr) error {
-	f, err := conn.File()
+	sc, err := conn.SyscallConn()
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	sa := &unix.SockaddrInet4{Port: dst.Port}
+	sa := unix.SockaddrInet4{Port: dst.Port}
 	copy(sa.Addr[:], dst.IP.To4())
-	return unix.Connect(int(f.Fd()), sa)
+	var connectErr error
+	if cerr := sc.Control(func(fd uintptr) {
+		connectErr = unix.Connect(int(fd), &sa)
+	}); cerr != nil {
+		return cerr
+	}
+	return connectErr
 }
 
 func closeFDs(fds []int) {

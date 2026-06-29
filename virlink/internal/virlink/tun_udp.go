@@ -95,12 +95,11 @@ func (t *UdpTunnel) Up() error {
 		if c.Mode == "client" {
 			dst := &net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port}
 			t.lastPeer.Store(dst)
-			_ = connectUDP(t.udpConn, dst)
 		}
 		logOK(fmt.Sprintf("UDP :%d", port))
 	}
 
-	addMSS(dev)
+	addMSS(c, dev)
 	t.done = make(chan struct{})
 
 	if t.wire.on {
@@ -134,9 +133,12 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 		if n == 0 {
 			return
 		}
-		if err != nil && !t.stop.stopped() {
-			logWarn("tun write: " + err.Error())
-		} else if err == nil {
+		if err != nil {
+			statInc(statUDPRxDropWrite)
+			if !t.stop.stopped() {
+				logWarn(fmt.Sprintf("udp tun write: %v (dropped %d pkt)", err, n))
+			}
+		} else {
 			statAdd(statUDPRxWrite, uint64(n))
 		}
 	}
@@ -302,9 +304,12 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 		if n == 0 {
 			return
 		}
-		if err != nil && !t.stop.stopped() {
-			logWarn("tun write: " + err.Error())
-		} else if err == nil {
+		if err != nil {
+			statInc(statUDPRxDropWrite)
+			if !t.stop.stopped() {
+				logWarn(fmt.Sprintf("udp tun write: %v (dropped %d pkt)", err, n))
+			}
+		} else {
 			statAdd(statUDPRxWrite, uint64(n))
 		}
 	}
@@ -391,8 +396,11 @@ func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 			t.lastPeer.Store(src)
 		}
 		statInc(statUDPRxRecv)
-		if err := tunWrite(tun, buf[:n]); err != nil && !t.stop.stopped() {
-			logWarn("tun write: " + err.Error())
+		if err := tunWrite(tun, buf[:n]); err != nil {
+			statInc(statUDPRxDropWrite)
+			if !t.stop.stopped() {
+				logWarn(fmt.Sprintf("udp tun write: %v", err))
+			}
 		} else {
 			statInc(statUDPRxWrite)
 		}

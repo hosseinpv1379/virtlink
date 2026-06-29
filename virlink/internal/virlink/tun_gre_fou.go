@@ -65,7 +65,7 @@ func (t *GreFouTunnel) Up() error {
 	applyTunnelTuning(c, dev)
 
 	step("iptables MSS clamping...")
-	addMSS(dev)
+	addMSS(c, dev)
 
 	if err := kernelTunnelWireUp(c); err != nil {
 		return err

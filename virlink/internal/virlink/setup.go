@@ -38,7 +38,11 @@ func setupBonding() error {
 }
 
 // addMSS installs iptables MSS-clamping + FORWARD ACCEPT rules for dev.
-func addMSS(dev string) {
+// Only runs when [mangle] is present in the config (srcip+dstip configured).
+func addMSS(cfg *Config, dev string) {
+	if !wireSpoofEnabled(cfg) {
+		return
+	}
 	rules := [][]string{
 		{"-t", "mangle", "-A", "FORWARD", "-i", dev, "-p", "tcp",
 			"--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"},

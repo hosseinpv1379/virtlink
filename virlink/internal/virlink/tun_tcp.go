@@ -82,7 +82,7 @@ func (t *TcpTunnel) Up() error {
 		return err
 	}
 
-	addMSS(dev)
+	addMSS(c, dev)
 	t.done = make(chan struct{})
 
 	tun0 := t.tun.Fd0()

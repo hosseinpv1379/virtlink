@@ -89,7 +89,7 @@ func (t *BipTunnel) Up() error {
 	logOK(fmt.Sprintf("raw proto=%d ready", bipProto))
 	logWireSpoof(t.cfg, t.wire)
 
-	addMSS(dev)
+	addMSS(c, dev)
 	t.done = make(chan struct{})
 
 	rawFd := t.rawFd
