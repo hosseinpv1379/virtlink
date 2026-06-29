@@ -32,6 +32,74 @@ func sendmmsg(fd int, msgs []mmsghdr) (int, error) {
 	return int(n), nil
 }
 
+func recvmmsg(fd int, msgs []mmsghdr, flags int) (int, error) {
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+	n, _, e := unix.Syscall6(unix.SYS_RECVMMSG,
+		uintptr(fd),
+		uintptr(unsafe.Pointer(&msgs[0])),
+		uintptr(len(msgs)),
+		uintptr(flags), 0, 0)
+	if e != 0 {
+		return int(n), e
+	}
+	return int(n), nil
+}
+
+// rxMmsgBatch receives up to nbufs datagrams per recvmmsg syscall (wire/UDP RX).
+type rxMmsgBatch struct {
+	nbufs int
+	bufs  [icmpBatchMax][]byte
+	iovs  [icmpBatchMax]unix.Iovec
+	addrs [icmpBatchMax]unix.RawSockaddrInet4
+	msgs  [icmpBatchMax]mmsghdr
+}
+
+func (b *rxMmsgBatch) init(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > icmpBatchMax {
+		n = icmpBatchMax
+	}
+	b.nbufs = n
+	for i := 0; i < n; i++ {
+		if b.bufs[i] == nil {
+			b.bufs[i] = getBuf()
+		}
+		b.iovs[i].Base = &b.bufs[i][0]
+		b.iovs[i].Len = uint64(len(b.bufs[i]))
+		b.msgs[i].Hdr.Iov = &b.iovs[i]
+		b.msgs[i].Hdr.Iovlen = 1
+		b.msgs[i].Hdr.Name = (*byte)(unsafe.Pointer(&b.addrs[i]))
+		b.msgs[i].Hdr.Namelen = unix.SizeofSockaddrInet4
+		b.msgs[i].Len = 0
+	}
+}
+
+func (b *rxMmsgBatch) release() {
+	for i := 0; i < icmpBatchMax; i++ {
+		if b.bufs[i] != nil {
+			putBuf(b.bufs[i])
+			b.bufs[i] = nil
+		}
+	}
+}
+
+// recv drains up to nbufs packets with one recvmmsg (MSG_DONTWAIT).
+func (b *rxMmsgBatch) recv(fd int) (int, error) {
+	return recvmmsg(fd, b.msgs[:b.nbufs], unix.MSG_DONTWAIT)
+}
+
+func (b *rxMmsgBatch) data(i int) []byte {
+	return b.bufs[i][:b.msgs[i].Len]
+}
+
+func (b *rxMmsgBatch) from4(i int) *unix.SockaddrInet4 {
+	return (*unix.SockaddrInet4)(unsafe.Pointer(&b.addrs[i]))
+}
+
 func tunWritev(fd *os.File, bufs [][]byte) error {
 	if len(bufs) == 0 {
 		return nil
@@ -51,6 +119,15 @@ func tunWritev(fd *os.File, bufs [][]byte) error {
 type tunRxBatch struct {
 	bufs   [][]byte
 	pooled [][]byte
+}
+
+// newTunRxBatch pre-allocates slice backing arrays sized to cap so the first
+// append in a burst loop does not trigger a runtime growth allocation.
+func newTunRxBatch(cap int) tunRxBatch {
+	return tunRxBatch{
+		bufs:   make([][]byte, 0, cap),
+		pooled: make([][]byte, 0, cap),
+	}
 }
 
 func (b *tunRxBatch) add(payload []byte) {

@@ -101,13 +101,19 @@ func tuneTCPConn(conn net.Conn) {
 }
 
 // udpConnFD returns the underlying socket fd for sendmmsg batching.
+// Uses SyscallConn.Control so we get the live fd without duplicating it —
+// conn.File() would dup the fd and then close the dup on return, handing
+// the caller a closed fd that fails every recvmmsg/sendmmsg with EBADF.
 func udpConnFD(conn *net.UDPConn) (int, error) {
-	f, err := conn.File()
+	sc, err := conn.SyscallConn()
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
-	return int(f.Fd()), nil
+	var rawFd int = -1
+	if cerr := sc.Control(func(fd uintptr) { rawFd = int(fd) }); cerr != nil {
+		return 0, cerr
+	}
+	return rawFd, nil
 }
 
 // openRawICMP creates one raw ICMP socket (no SO_REUSEPORT — duplicates packets).

@@ -104,14 +104,16 @@ func (t *BipTunnel) Up() error {
 }
 
 func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
-	buf := getBuf()
-	defer putBuf(buf)
+	var rb rxMmsgBatch
+	rb.init(perfBatchSize())
+	defer rb.release()
+
 	peer := t.wire.wirePeer(t.peerIP)
 	local := t.localIP
 	pollMs := perfPollMs()
 	idleMs := pollMs
 	bsz := perfBatchSize()
-	var batch tunRxBatch
+	batch := newTunRxBatch(bsz)
 
 	flush := func() {
 		n, err := batch.flush(tun)
@@ -127,12 +129,12 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 	defer flush()
 
 	for {
-		n, from, err := unix.Recvfrom(rawFd, buf, 0)
-		if err != nil {
+		got, err := rb.recv(rawFd)
+		if got == 0 {
 			if t.stop.stopped() {
 				return
 			}
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == nil {
 				flush()
 				statInc(statBIPRxPoll)
 				_ = pollFD(rawFd, unix.POLLIN, idleMs)
@@ -148,23 +150,27 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 			continue
 		}
 		idleMs = pollMs
-		sa, ok := from.(*unix.SockaddrInet4)
-		if !ok || !acceptWirePeer(buf[:n], sa, local, peer, t.wire.src, t.wire, bipProto) {
-			statInc(statBIPRxDrop)
-			continue
+		for i := 0; i < got; i++ {
+			pkt := rb.data(i)
+			sa := rb.from4(i)
+			if !acceptWirePeer(pkt, sa, local, peer, t.wire.src, t.wire, bipProto) {
+				statInc(statBIPRxDrop)
+				continue
+			}
+			n := len(pkt)
+			if n < 20 {
+				continue
+			}
+			ihl := int(pkt[0]&0xf) * 4
+			if n <= ihl {
+				continue
+			}
+			if t.cfg.Mode == "server" {
+				t.lastSrc.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
+			}
+			statInc(statBIPRxRecv)
+			batch.add(pkt[ihl:n])
 		}
-		if n < 20 {
-			continue
-		}
-		ihl := int(buf[0]&0xf) * 4
-		if n <= ihl {
-			continue
-		}
-		if t.cfg.Mode == "server" {
-			t.lastSrc.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
-		}
-		statInc(statBIPRxRecv)
-		batch.add(buf[ihl:n])
 		if batch.len() >= bsz {
 			flush()
 		}

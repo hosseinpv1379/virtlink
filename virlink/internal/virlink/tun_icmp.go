@@ -207,12 +207,16 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 }
 
 func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
-	buf := getBuf()
-	defer putBuf(buf)
+	var rb rxMmsgBatch
+	rb.init(perfBatchSize())
+	defer rb.release()
+
 	peer := t.wire.wirePeer(t.peerIP)
 	local := t.localIP
 	bsz := perfBatchSize()
-	var batch tunRxBatch
+	pollMs := perfPollMs()
+	idleMs := pollMs
+	batch := newTunRxBatch(bsz)
 
 	flush := func() {
 		n, err := batch.flush(tun)
@@ -228,15 +232,18 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 	defer flush()
 
 	for !t.stop.stopped() {
-		n, from, err := unix.Recvfrom(rawFd, buf, 0)
-		if err != nil {
+		got, err := rb.recv(rawFd)
+		if got == 0 {
 			if t.stop.stopped() {
 				return
 			}
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == nil {
 				flush()
 				statInc(statICMPRxPoll)
-				_ = pollFD(rawFd, unix.POLLIN, perfPollMs())
+				_ = pollFD(rawFd, unix.POLLIN, idleMs)
+				if idleMs < 50 {
+					idleMs += pollMs
+				}
 				continue
 			}
 			if err == unix.EINTR {
@@ -245,34 +252,39 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 			logWarn("icmp rx: " + err.Error())
 			continue
 		}
-		sa, ok := from.(*unix.SockaddrInet4)
-		if !ok || !acceptWirePeer(buf[:n], sa, local, peer, t.wire.src, t.wire, unix.IPPROTO_ICMP) {
-			statInc(statICMPRxDropPeer)
-			continue
+		idleMs = pollMs
+		for i := 0; i < got; i++ {
+			pkt := rb.data(i)
+			sa := rb.from4(i)
+			if !acceptWirePeer(pkt, sa, local, peer, t.wire.src, t.wire, unix.IPPROTO_ICMP) {
+				statInc(statICMPRxDropPeer)
+				continue
+			}
+			n := len(pkt)
+			if n < 20 {
+				continue
+			}
+			ihl := int(pkt[0]&0xf) * 4
+			if n < ihl+8 {
+				continue
+			}
+			icmp := pkt[ihl:n]
+			if icmp[0] != icmpEchoReq || binary.BigEndian.Uint16(icmp[4:6]) != icmpTunID {
+				statInc(statICMPRxDropProto)
+				continue
+			}
+			statInc(statICMPRxRecv)
+			seq := binary.BigEndian.Uint16(icmp[6:8])
+			if t.dedup.dup(seq) {
+				statInc(statICMPRxDropSeq)
+				continue
+			}
+			inner := icmp[8:]
+			if t.cfg.Mode == "server" {
+				t.lastSrc.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
+			}
+			batch.add(inner)
 		}
-		if n < 20 {
-			continue
-		}
-		ihl := int(buf[0]&0xf) * 4
-		if n < ihl+8 {
-			continue
-		}
-		icmp := buf[ihl:n]
-		if icmp[0] != icmpEchoReq || binary.BigEndian.Uint16(icmp[4:6]) != icmpTunID {
-			statInc(statICMPRxDropProto)
-			continue
-		}
-		statInc(statICMPRxRecv)
-		seq := binary.BigEndian.Uint16(icmp[6:8])
-		if t.dedup.dup(seq) {
-			statInc(statICMPRxDropSeq)
-			continue
-		}
-		inner := icmp[8:]
-		if t.cfg.Mode == "server" {
-			t.lastSrc.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
-		}
-		batch.add(inner)
 		if batch.len() >= bsz {
 			flush()
 		}

@@ -135,8 +135,8 @@ func (t *TcpTunnel) txPollLoop() {
 	defer poller.close()
 
 	bsz := perfBatchSize()
-	var bufs net.Buffers
-	var pooled [][]byte
+	bufs := make(net.Buffers, 0, bsz)
+	pooled := make([][]byte, 0, bsz)
 	var curConn net.Conn
 
 	flush := func() {
@@ -267,6 +267,22 @@ func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 	defer putBuf(buf)
 	br := bufio.NewReaderSize(conn, tcpRxBufSize)
 	var hdr [2]byte
+	bsz := perfBatchSize()
+	batch := newTunRxBatch(bsz)
+
+	flush := func() {
+		n, err := batch.flush(tun)
+		if n == 0 {
+			return
+		}
+		if err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
+		} else if err == nil {
+			statAdd(statTCPRxWrite, uint64(n))
+		}
+	}
+	defer flush()
+
 	for {
 		if _, err := io.ReadFull(br, hdr[:]); err != nil {
 			if !t.stop.stopped() {
@@ -287,13 +303,9 @@ func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 			return
 		}
 		statInc(statTCPRxFrame)
-		if _, err := tun.Write(buf[:n]); err != nil {
-			if t.stop.stopped() {
-				return
-			}
-			logWarn("tun write: " + err.Error())
-		} else {
-			statInc(statTCPRxWrite)
+		batch.add(buf[:n])
+		if batch.len() >= bsz {
+			flush()
 		}
 	}
 }

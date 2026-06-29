@@ -118,14 +118,16 @@ func (t *UdpTunnel) Up() error {
 }
 
 func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
-	buf := getBuf()
-	defer putBuf(buf)
+	var rb rxMmsgBatch
+	rb.init(perfBatchSize())
+	defer rb.release()
+
 	peer := t.wire.wirePeer(t.peerIP)
 	local := t.localIP
 	pollMs := perfPollMs()
 	idleMs := pollMs
 	bsz := perfBatchSize()
-	var batch tunRxBatch
+	batch := newTunRxBatch(bsz)
 
 	flush := func() {
 		n, err := batch.flush(tun)
@@ -141,12 +143,12 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 	defer flush()
 
 	for {
-		n, from, err := unix.Recvfrom(rawFd, buf, 0)
-		if err != nil {
+		got, err := rb.recv(rawFd)
+		if got == 0 {
 			if t.stop.stopped() {
 				return
 			}
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == nil {
 				flush()
 				_ = pollFD(rawFd, unix.POLLIN, idleMs)
 				if idleMs < 50 {
@@ -161,35 +163,39 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 			continue
 		}
 		idleMs = pollMs
-		sa, ok := from.(*unix.SockaddrInet4)
-		if !ok || !acceptWirePeer(buf[:n], sa, local, peer, t.wire.src, t.wire, unix.IPPROTO_UDP) {
-			statInc(statUDPRxDrop)
-			continue
-		}
-		ihl, ok := parseIPv4Payload(buf[:n])
-		if !ok {
-			continue
-		}
-		if n < ihl+udpHdrLen {
-			continue
-		}
-		if int(binary.BigEndian.Uint16(buf[ihl+2:])) != port {
-			statInc(statUDPRxDrop)
-			if wireMonitorActive() {
-				sport := binary.BigEndian.Uint16(buf[ihl:])
-				var src [4]byte
-				copy(src[:], buf[12:16])
-				logWarn(fmt.Sprintf("[wire] RX drop bad_udp_port sport=%d want=%d outer src=%s",
-					sport, port, ip4Fmt(src)))
+		for i := 0; i < got; i++ {
+			pkt := rb.data(i)
+			sa := rb.from4(i)
+			if !acceptWirePeer(pkt, sa, local, peer, t.wire.src, t.wire, unix.IPPROTO_UDP) {
+				statInc(statUDPRxDrop)
+				continue
 			}
-			continue
+			ihl, ok := parseIPv4Payload(pkt)
+			if !ok {
+				continue
+			}
+			n := len(pkt)
+			if n < ihl+udpHdrLen {
+				continue
+			}
+			if int(binary.BigEndian.Uint16(pkt[ihl+2:])) != port {
+				statInc(statUDPRxDrop)
+				if wireMonitorActive() {
+					sport := binary.BigEndian.Uint16(pkt[ihl:])
+					var src [4]byte
+					copy(src[:], pkt[12:16])
+					logWarn(fmt.Sprintf("[wire] RX drop bad_udp_port sport=%d want=%d outer src=%s",
+						sport, port, ip4Fmt(src)))
+				}
+				continue
+			}
+			payload := pkt[ihl+udpHdrLen : n]
+			if t.cfg.Mode == "server" {
+				t.lastRoute.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
+			}
+			statInc(statUDPRxRecv)
+			batch.add(payload)
 		}
-		payload := buf[ihl+udpHdrLen : n]
-		if t.cfg.Mode == "server" {
-			t.lastRoute.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
-		}
-		statInc(statUDPRxRecv)
-		batch.add(payload)
 		if batch.len() >= bsz {
 			flush()
 		}
@@ -273,6 +279,93 @@ func (t *UdpTunnel) txPollLoopRaw(rawFd int, port int) {
 }
 
 func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
+	rawFd, err := udpConnFD(conn)
+	if err != nil {
+		t.rxLoopBlocking(conn, tun)
+		return
+	}
+	_ = unix.SetNonblock(rawFd, true)
+
+	var rb rxMmsgBatch
+	rb.init(perfBatchSize())
+	defer rb.release()
+
+	peer, local := t.peerIP, t.localIP
+	bsz := perfBatchSize()
+	pollMs := perfPollMs()
+	idleMs := pollMs
+	batch := newTunRxBatch(bsz)
+	// Track last stored peer to avoid a heap allocation on every received packet.
+	var lastPeerAddr [4]byte
+	var lastPeerPort uint16
+
+	flush := func() {
+		n, err := batch.flush(tun)
+		if n == 0 {
+			return
+		}
+		if err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
+		} else if err == nil {
+			statAdd(statUDPRxWrite, uint64(n))
+		}
+	}
+	defer flush()
+
+	for {
+		got, err := rb.recv(rawFd)
+		if got == 0 {
+			if t.stop.stopped() {
+				return
+			}
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == nil {
+				flush()
+				_ = pollFD(rawFd, unix.POLLIN, idleMs)
+				if idleMs < 50 {
+					idleMs += pollMs
+				}
+				continue
+			}
+			if err == unix.EINTR {
+				continue
+			}
+			continue
+		}
+		idleMs = pollMs
+		for i := 0; i < got; i++ {
+			pkt := rb.data(i)
+			sa := rb.from4(i)
+			if sa.Addr == local {
+				statInc(statUDPRxDrop)
+				continue
+			}
+			if t.cfg.Mode == "client" && sa.Addr != peer {
+				statInc(statUDPRxDrop)
+				continue
+			}
+			if t.cfg.Mode == "server" {
+				// Network byte-order port from RawSockaddrInet4.
+				saPort := uint16(sa.Port>>8) | uint16(sa.Port<<8)
+				if sa.Addr != lastPeerAddr || saPort != lastPeerPort {
+					lastPeerAddr = sa.Addr
+					lastPeerPort = saPort
+					t.lastPeer.Store(&net.UDPAddr{
+						IP:   net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]),
+						Port: int(saPort),
+					})
+				}
+			}
+			statInc(statUDPRxRecv)
+			batch.add(pkt)
+		}
+		if batch.len() >= bsz {
+			flush()
+		}
+	}
+}
+
+// rxLoopBlocking is the fallback when udpConnFD fails (single-packet reads).
+func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
 	peer, local := t.peerIP, t.localIP

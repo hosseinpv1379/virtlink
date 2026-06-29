@@ -31,6 +31,7 @@ import (
 	"sync/atomic"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const obfsSubnet = "10.20.20.0/24"
@@ -181,10 +182,83 @@ func (t *UdpObfsTunnel) Up() error {
 	return nil
 }
 
-// rxLoop: UDP → decrypt → TUN
-// conn and tun are passed as values so they're never nil after doClean().
-// Uses a pre-allocated buffer from the pool — zero per-packet allocation.
+// rxLoop: UDP → decrypt → TUN (recvmmsg + tunWritev batching).
 func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD, mask string) {
+	rawFd, err := udpConnFD(conn)
+	if err != nil {
+		t.rxLoopBlocking(conn, tun, gcm, mask)
+		return
+	}
+	_ = unix.SetNonblock(rawFd, true)
+
+	var rb rxMmsgBatch
+	rb.init(perfBatchSize())
+	defer rb.release()
+
+	bsz := perfBatchSize()
+	pollMs := perfPollMs()
+	idleMs := pollMs
+	batch := newTunRxBatch(bsz)
+	var lastPeerAddr [4]byte
+	var lastPeerPort uint16
+
+	flush := func() {
+		n, err := batch.flush(tun)
+		if n == 0 {
+			return
+		}
+		if err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
+		}
+	}
+	defer flush()
+
+	for {
+		got, err := rb.recv(rawFd)
+		if got == 0 {
+			if t.stop.stopped() {
+				return
+			}
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == nil {
+				flush()
+				_ = pollFD(rawFd, unix.POLLIN, idleMs)
+				if idleMs < 50 {
+					idleMs += pollMs
+				}
+				continue
+			}
+			if err == unix.EINTR {
+				continue
+			}
+			continue
+		}
+		idleMs = pollMs
+		for i := 0; i < got; i++ {
+			pkt := rb.data(i)
+			sa := rb.from4(i)
+			plain, derr := obfsDecrypt(pkt, gcm, mask, t.cfg.Obfs.Padding)
+			if derr != nil {
+				logDebug(fmt.Sprintf("rx from %v: %v", sa, derr))
+				continue
+			}
+			saPort := uint16(sa.Port>>8) | uint16(sa.Port<<8)
+			if sa.Addr != lastPeerAddr || saPort != lastPeerPort {
+				lastPeerAddr = sa.Addr
+				lastPeerPort = saPort
+				t.lastPeer.Store(&net.UDPAddr{
+					IP:   net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]),
+					Port: int(saPort),
+				})
+			}
+			batch.add(plain)
+		}
+		if batch.len() >= bsz {
+			flush()
+		}
+	}
+}
+
+func (t *UdpObfsTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD, mask string) {
 	buf := getBuf()
 	defer putBuf(buf)
 	for {
@@ -208,6 +282,81 @@ func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD,
 }
 
 func (t *UdpObfsTunnel) txPollLoop(conn *net.UDPConn, gcm cipher.AEAD, mask string, fixed *net.UDPAddr) {
+	rawFd, err := udpConnFD(conn)
+	if err != nil {
+		t.txPollLoopUnbatched(conn, gcm, mask, fixed)
+		return
+	}
+
+	poller := newTunPoller(t.tun, &t.stop)
+	defer poller.close()
+
+	var batch icmpTxBatch
+	bsz := perfBatchSize()
+	var curDst [4]byte
+	var curPort uint16
+	var haveDst bool
+
+	flush := func() {
+		if batch.n == 0 {
+			return
+		}
+		if nerr := mmsgSendBatch(rawFd, &batch); nerr > 0 {
+			logDebug(fmt.Sprintf("obfs tx batch: %d failed", nerr))
+		}
+		for i := 0; i < batch.n; i++ {
+			putBuf(batch.frames[i])
+			batch.frames[i] = nil
+		}
+		batch.reset()
+		haveDst = false
+	}
+
+	addPkt := func(dst [4]byte, port uint16, payload []byte) {
+		if haveDst && (dst != curDst || port != curPort) {
+			flush()
+		}
+		curDst = dst
+		curPort = port
+		haveDst = true
+		frameBuf := getBuf()
+		frame, encErr := obfsEncrypt(frameBuf, payload, gcm, mask, t.cfg.Obfs.Padding)
+		if encErr != nil {
+			putBuf(frameBuf)
+			return
+		}
+		batch.add(frameBuf, len(frame), dst, port)
+		if batch.n >= bsz {
+			flush()
+		}
+	}
+
+	poller.Run(
+		func() {
+			if batch.n > 0 {
+				flush()
+			}
+		},
+		func(pkt []byte, n int) bool {
+			var dst [4]byte
+			var port uint16
+			if fixed != nil {
+				copy(dst[:], fixed.IP.To4())
+				port = uint16(fixed.Port)
+			} else if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
+				copy(dst[:], p.IP.To4())
+				port = uint16(p.Port)
+			} else {
+				return true
+			}
+			addPkt(dst, port, pkt[:n])
+			return !t.stop.stopped()
+		},
+	)
+	flush()
+}
+
+func (t *UdpObfsTunnel) txPollLoopUnbatched(conn *net.UDPConn, gcm cipher.AEAD, mask string, fixed *net.UDPAddr) {
 	poller := newTunPoller(t.tun, &t.stop)
 	defer poller.close()
 
@@ -291,11 +440,23 @@ func obfsEncrypt(frame, pkt []byte, gcm cipher.AEAD, mask string, padding bool) 
 
 	nonceOff := hdrLen
 	plainOff := nonceOff + 12
+	nonce := frame[nonceOff:plainOff]
 	innerLen := 1 + len(pkt)
 	padLen := 0
 	if padding {
-		padLen = int(mustRandByte()%48) + 4
+		// Read nonce (12B) + one extra byte for pad-length selection in a single syscall,
+		// saving one getrandom() call compared to rand.Read(nonce) + mustRandByte().
+		var noncePad [13]byte
+		if _, err := rand.Read(noncePad[:]); err != nil {
+			return nil, err
+		}
+		copy(nonce, noncePad[:12])
+		padLen = int(noncePad[12]%48) + 4
 		innerLen += padLen
+	} else {
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, err
+		}
 	}
 
 	// plaintext, written directly into frame: flags(1B) | packet | [pad...] [padLen(1B)]
@@ -311,12 +472,6 @@ func obfsEncrypt(frame, pkt []byte, gcm cipher.AEAD, mask string, padding bool) 
 	} else {
 		plain[0] = 0x00
 		copy(plain[1:], pkt)
-	}
-
-	// nonce: 12-byte random (GCM standard), written into frame right before the plaintext.
-	nonce := frame[nonceOff:plainOff]
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
 	}
 
 	// encrypt in place — dst aliases plain exactly (documented crypto/cipher idiom).
@@ -381,8 +536,3 @@ func obfsDecrypt(frame []byte, gcm cipher.AEAD, mask string, _ bool) ([]byte, er
 	return data, nil
 }
 
-func mustRandByte() byte {
-	var b [1]byte
-	rand.Read(b[:])
-	return b[0]
-}
