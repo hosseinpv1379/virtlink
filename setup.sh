@@ -3165,8 +3165,8 @@ tls:
   pinSHA256: ${pin}
 
 bandwidth:
-  up: 200 mbps
-  down: 200 mbps
+  up: 1 gbps
+  down: 1 gbps
 
 quic:
   keepAlivePeriod: 10s
