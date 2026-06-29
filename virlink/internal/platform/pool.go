@@ -2,12 +2,14 @@
 package platform
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -134,6 +136,36 @@ func icmpChecksum(b []byte) uint16 {
 func TuneUDPConn(conn *net.UDPConn) {
 	_ = conn.SetReadBuffer(perfSockBuf())
 	_ = conn.SetWriteBuffer(perfSockBuf())
+}
+
+// ListenUDPReusePort binds :port with SO_REUSEPORT (parallel TX sockets on client).
+func ListenUDPReusePort(port int) (*net.UDPConn, error) {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var ctlErr error
+			err := c.Control(func(fd uintptr) {
+				ctlErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+				if ctlErr != nil {
+					return
+				}
+				ctlErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			})
+			if err != nil {
+				return err
+			}
+			return ctlErr
+		},
+	}
+	pc, err := lc.ListenPacket(context.Background(), "udp4", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return nil, err
+	}
+	uc, ok := pc.(*net.UDPConn)
+	if !ok {
+		_ = pc.Close()
+		return nil, fmt.Errorf("ListenPacket udp4: not *net.UDPConn")
+	}
+	return uc, nil
 }
 
 func TuneRawSock(fd int) {

@@ -15,22 +15,26 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	icmpSubnet  = "10.20.43.0/24"
-	icmpTunID   = uint16(0xCAFE)
-	icmpEchoReq = 8
+	icmpSubnet    = "10.20.43.0/24"
+	icmpTunID     = uint16(0xCAFE)
+	icmpEchoReq   = 8
+	icmpHdrRoom   = 8 // RunOwned payload offset; buf[0:2] holds len for stream writers
+	icmpTxChanCap = 32
 )
 
 type IcmpTunnel struct {
-	cfg     *config.Config
-	tun     *platform.TunDev
-	rawFd   int
-	lockFd  *os.File
+	cfg      *config.Config
+	tun      *platform.TunDev
+	rawFd    int
+	rawTxFds []int
+	lockFd   *os.File
 	done chan struct{}
 	stop    platform.StoppedFlag
 	seq     atomic.Uint32
@@ -98,35 +102,85 @@ func (t *IcmpTunnel) Up() error {
 	platform.ApplyTunnelTuning(c, dev)
 
 	platform.Step("raw ICMP socket...")
-	if t.wire.On {
-		t.rawFd, err = wire.OpenRawWire()
-	} else {
-		t.rawFd, err = platform.OpenRawICMP()
+	if err := t.openRawSockets(); err != nil {
+		return err
 	}
-	if err != nil {
-		return fmt.Errorf("SOCK_RAW: %w", err)
-	}
-	platform.TuneRawSock(t.rawFd)
-	if !t.wire.On {
-		_ = platform.InstallICMPFilter(t.rawFd)
-	}
-	_ = unix.SetNonblock(t.rawFd, true)
 	platform.LogOK("raw ICMP socket ready")
 	wire.LogWireSpoof(t.cfg, t.wire)
 
 	platform.AddMSS(c, dev)
 	t.done = make(chan struct{})
 
-	rawFd := t.rawFd
-	go t.rxLoop(rawFd, t.tun.Fd0())
-	go t.txPollLoop(rawFd)
+	go t.rxLoop(t.rawFd, t.tun.Fd0())
+	if len(t.rawTxFds) > 1 {
+		go t.txPollLoopMulti(t.rawTxFds)
+	} else {
+		go t.txPollLoop(t.rawFd)
+	}
 
+	streams := len(t.rawTxFds)
+	if streams <= 1 {
+		streams = 1
+	}
 	platform.Done(dev, addr, peer,
-		fmt.Sprintf("transport : ICMP poller×1  queues=%d  batch=%d", t.tun.QueueCount(), platform.PerfBatchSize()),
+		fmt.Sprintf("transport : ICMP ×%d streams  poller×1  queues=%d  batch=%d",
+			streams, t.tun.QueueCount(), platform.PerfBatchSize()),
 		"filter   : peer="+c.RemoteIP,
 		"test     : ping -c3 "+peer,
 	)
 	return nil
+}
+
+func (t *IcmpTunnel) openRawSockets() error {
+	streams := platform.PerfTcpStreams()
+	if t.wire.On || streams <= 1 {
+		fd, err := t.openOneRaw()
+		if err != nil {
+			return err
+		}
+		t.rawFd = fd
+		return nil
+	}
+
+	fds := make([]int, streams)
+	for i := 0; i < streams; i++ {
+		fd, err := t.openOneRaw()
+		if err != nil {
+			platform.CloseFDs(fds[:i])
+			return fmt.Errorf("SOCK_RAW stream %d: %w", i, err)
+		}
+		fds[i] = fd
+	}
+	t.rawFd = fds[0]
+	t.rawTxFds = fds
+	platform.LogOK(fmt.Sprintf("raw ICMP ×%d TX streams (RX on stream 0)", streams))
+	return nil
+}
+
+func (t *IcmpTunnel) openOneRaw() (int, error) {
+	var fd int
+	var err error
+	if t.wire.On {
+		fd, err = wire.OpenRawWire()
+	} else {
+		fd, err = platform.OpenRawICMP()
+	}
+	if err != nil {
+		return 0, err
+	}
+	platform.TuneRawSock(fd)
+	if !t.wire.On {
+		_ = platform.InstallICMPFilter(fd)
+	}
+	_ = unix.SetNonblock(fd, true)
+	return fd, nil
+}
+
+func icmpStreamSlot(data []byte, streams int) int {
+	if streams <= 1 {
+		return 0
+	}
+	return int(platform.HashIPPacket(data) % uint32(streams))
 }
 
 func (t *IcmpTunnel) resolveDst() ([4]byte, bool) {
@@ -139,8 +193,172 @@ func (t *IcmpTunnel) resolveDst() ([4]byte, bool) {
 	return [4]byte{}, false
 }
 
-// txPollLoop — single goroutine polls all TUN queues, batches ICMP sends.
+// txPollLoop — single raw fd; RunOwned avoids GetICMPFrame alloc on plain ICMP.
 func (t *IcmpTunnel) txPollLoop(rawFd int) {
+	if t.wire.On {
+		t.txPollLoopWire(rawFd)
+		return
+	}
+
+	poller := platform.NewTunPollerH(t.tun, &t.stop, icmpHdrRoom)
+	defer poller.Close()
+
+	var batch platform.IcmpTxBatch
+	bsz := platform.PerfBatchSize()
+	useDedup := t.tun.QueueCount() > 1
+
+	flush := func() {
+		if batch.N() == 0 {
+			return
+		}
+		platform.StatAdd(platform.StatICMPTxSend, uint64(batch.N()))
+		if nerr := platform.IcmpSendBatch(rawFd, &batch); nerr > 0 {
+			wire.NoteWireTxErr(nerr)
+		}
+		for i := 0; i < batch.N(); i++ {
+			platform.PutBuf(batch.Frame(i))
+			batch.SetFrame(i, nil)
+		}
+		batch.Reset()
+	}
+
+	poller.RunOwned(
+		func() {
+			platform.StatInc(platform.StatICMPTxPoll)
+			if batch.N() > 0 {
+				flush()
+			}
+		},
+		func(buf []byte, n int) bool {
+			platform.StatInc(platform.StatICMPTxRead)
+			dst, ok := t.resolveDst()
+			if !ok {
+				platform.StatInc(platform.StatICMPTxNoDst)
+				platform.PutBuf(buf)
+				return !t.stop.Stopped()
+			}
+			payload := buf[icmpHdrRoom : icmpHdrRoom+n]
+			if useDedup && t.txDedup.Dup(payload) {
+				platform.StatInc(platform.StatICMPTxDedup)
+				platform.PutBuf(buf)
+				return !t.stop.Stopped()
+			}
+			seq := uint16(t.seq.Add(1))
+			built := platform.BuildICMPFrame(buf, icmpTunID, seq, payload)
+			batch.Add(buf, len(built), dst, 0)
+			if batch.N() >= bsz {
+				flush()
+			}
+			return !t.stop.Stopped()
+		},
+	)
+	flush()
+}
+
+func (t *IcmpTunnel) txPollLoopMulti(rawFds []int) {
+	streams := len(rawFds)
+	chs := make([]chan []byte, streams)
+	for i := range chs {
+		chs[i] = make(chan []byte, icmpTxChanCap)
+		go t.icmpStreamWriter(rawFds[i], chs[i])
+	}
+
+	poller := platform.NewTunPollerH(t.tun, &t.stop, icmpHdrRoom)
+	defer func() {
+		poller.Close()
+		for _, ch := range chs {
+			close(ch)
+		}
+	}()
+
+	useDedup := t.tun.QueueCount() > 1
+
+	poller.RunOwned(
+		nil,
+		func(buf []byte, n int) bool {
+			platform.StatInc(platform.StatICMPTxRead)
+			payload := buf[icmpHdrRoom : icmpHdrRoom+n]
+			if useDedup && t.txDedup.Dup(payload) {
+				platform.StatInc(platform.StatICMPTxDedup)
+				platform.PutBuf(buf)
+				return !t.stop.Stopped()
+			}
+			binary.BigEndian.PutUint16(buf[:2], uint16(n))
+			slot := icmpStreamSlot(payload, streams)
+			for i := 0; i < streams; i++ {
+				idx := (slot + i) % streams
+				select {
+				case chs[idx] <- buf:
+					return !t.stop.Stopped()
+				default:
+				}
+			}
+			chs[slot] <- buf
+			return !t.stop.Stopped()
+		},
+	)
+}
+
+func (t *IcmpTunnel) icmpStreamWriter(rawFd int, ch <-chan []byte) {
+	bsz := platform.PerfBatchSize()
+	var batch platform.IcmpTxBatch
+	pollMs := time.Duration(platform.PerfPollMs()) * time.Millisecond
+
+	flush := func() {
+		if batch.N() == 0 {
+			return
+		}
+		platform.StatAdd(platform.StatICMPTxSend, uint64(batch.N()))
+		if nerr := platform.IcmpSendBatch(rawFd, &batch); nerr > 0 {
+			wire.NoteWireTxErr(nerr)
+		}
+		for i := 0; i < batch.N(); i++ {
+			platform.PutBuf(batch.Frame(i))
+			batch.SetFrame(i, nil)
+		}
+		batch.Reset()
+	}
+
+	timer := time.NewTimer(pollMs)
+	defer timer.Stop()
+
+	for {
+		select {
+		case buf, ok := <-ch:
+			if !ok {
+				flush()
+				return
+			}
+			n := int(binary.BigEndian.Uint16(buf[:2]))
+			dst, ok := t.resolveDst()
+			if !ok {
+				platform.StatInc(platform.StatICMPTxNoDst)
+				platform.PutBuf(buf)
+				continue
+			}
+			seq := uint16(t.seq.Add(1))
+			payload := buf[icmpHdrRoom : icmpHdrRoom+n]
+			built := platform.BuildICMPFrame(buf, icmpTunID, seq, payload)
+			batch.Add(buf, len(built), dst, 0)
+			if batch.N() >= bsz {
+				flush()
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(pollMs)
+			}
+		case <-timer.C:
+			flush()
+			timer.Reset(pollMs)
+		}
+	}
+}
+
+// txPollLoopWire — wire/mangle path keeps separate frame pool (IPv4 header room).
+func (t *IcmpTunnel) txPollLoopWire(rawFd int) {
 	poller := platform.NewTunPoller(t.tun, &t.stop)
 	defer poller.Close()
 
@@ -317,7 +535,11 @@ func (t *IcmpTunnel) doClean() {
 		}
 		t.done = nil
 	}
-	if t.rawFd > 0 {
+	if len(t.rawTxFds) > 0 {
+		platform.CloseFDs(t.rawTxFds)
+		t.rawTxFds = nil
+		t.rawFd = 0
+	} else if t.rawFd > 0 {
 		unix.Close(t.rawFd)
 		t.rawFd = 0
 	}

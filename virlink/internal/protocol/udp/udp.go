@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -21,10 +22,11 @@ import (
 const udpRawSubnet = "10.20.42.0/24"
 
 type UdpTunnel struct {
-	cfg       *config.Config
-	tun       *platform.TunDev
-	udpConn   *net.UDPConn
-	rawFd     int
+	cfg        *config.Config
+	tun        *platform.TunDev
+	udpConn    *net.UDPConn
+	udpStreams []*net.UDPConn
+	rawFd      int
 	rawRxFd   int
 	lockFd    *os.File
 	done chan struct{}
@@ -98,13 +100,9 @@ func (t *UdpTunnel) Up() error {
 		platform.LogOK(fmt.Sprintf("raw UDP (IPPROTO_RAW) :%d", port))
 		wire.LogWireSpoof(t.cfg, t.wire)
 	} else {
-		t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{Port: port})
-		if err != nil {
-			return fmt.Errorf("udp :%d: %w", port, err)
+		if err := t.openPlainUDP(port); err != nil {
+			return err
 		}
-		platform.TuneUDPConn(t.udpConn)
-		t.lastPeer.Store(&net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port})
-		platform.LogOK(fmt.Sprintf("UDP :%d", port))
 	}
 
 	platform.AddMSS(c, dev)
@@ -114,18 +112,169 @@ func (t *UdpTunnel) Up() error {
 		go t.rxLoopRaw(t.rawRxFd, t.tun.Fd0(), port)
 		go t.txPollLoopRaw(t.rawFd, port)
 	} else {
-		conn := t.udpConn
-		// Plain UDP: ReadFromUDP/WriteToUDP — recvmmsg/sendmmsg batch path drops wire
-		// traffic on some hosts (rx_recv=0, hs=waiting). Keep this path for reliability.
-		go t.rxLoopBlocking(conn, t.tun.Fd0())
-		go t.txPollLoopUnbatched(conn)
+		tun0 := t.tun.Fd0()
+		streams := len(t.udpStreams)
+		if streams > 1 {
+			for _, c := range t.udpStreams {
+				go t.rxLoopBlocking(c, tun0)
+			}
+			go t.txPollLoopMulti(t.udpStreams)
+		} else {
+			go t.rxLoopBlocking(t.udpConn, tun0)
+			go t.txPollLoop(t.udpConn)
+		}
 	}
 
-	platform.Done(dev, addr, peer,
-		fmt.Sprintf("transport : UDP :%d  poller×1", port),
+	transport := fmt.Sprintf("transport : UDP :%d  poller×1", port)
+	if len(t.udpStreams) > 1 {
+		transport = fmt.Sprintf("transport : UDP ×%d streams  poller×1 :%d", len(t.udpStreams), port)
+	}
+	platform.Done(dev, addr, peer, transport,
 		"test      : ping -c3 "+peer,
 	)
 	return nil
+}
+
+func (t *UdpTunnel) openPlainUDP(port int) error {
+	c := t.cfg
+	streams := platform.PerfTcpStreams()
+	dst := &net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port}
+
+	if c.Mode == "client" && streams > 1 {
+		conns := make([]*net.UDPConn, streams)
+		for i := 0; i < streams; i++ {
+			uc, err := platform.ListenUDPReusePort(port)
+			if err != nil {
+				for j := 0; j < i; j++ {
+					conns[j].Close()
+				}
+				return fmt.Errorf("udp :%d stream %d: %w", port, i, err)
+			}
+			platform.TuneUDPConn(uc)
+			if err := platform.ConnectUDP(uc, dst); err != nil {
+				uc.Close()
+				for j := 0; j < i; j++ {
+					conns[j].Close()
+				}
+				return fmt.Errorf("udp connect %s:%d: %w", c.RemoteIP, port, err)
+			}
+			conns[i] = uc
+		}
+		t.udpStreams = conns
+		t.udpConn = conns[0]
+		t.lastPeer.Store(dst)
+		platform.LogOK(fmt.Sprintf("UDP :%d  streams=%d", port, streams))
+		return nil
+	}
+
+	uc, err := net.ListenUDP("udp4", &net.UDPAddr{Port: port})
+	if err != nil {
+		return fmt.Errorf("udp :%d: %w", port, err)
+	}
+	platform.TuneUDPConn(uc)
+	t.udpConn = uc
+	t.lastPeer.Store(dst)
+	platform.LogOK(fmt.Sprintf("UDP :%d", port))
+	return nil
+}
+
+func udpStreamSlot(data []byte, streams int) int {
+	if streams <= 1 {
+		return 0
+	}
+	return int(platform.HashIPPacket(data) % uint32(streams))
+}
+
+const udpTxChanCap = 32
+
+func (t *UdpTunnel) txPollLoopMulti(conns []*net.UDPConn) {
+	streams := len(conns)
+	chs := make([]chan []byte, streams)
+	for i := range chs {
+		chs[i] = make(chan []byte, udpTxChanCap)
+		go t.udpStreamWriter(conns[i], chs[i])
+	}
+
+	poller := platform.NewTunPollerH(t.tun, &t.stop, 0)
+	defer func() {
+		poller.Close()
+		for _, ch := range chs {
+			close(ch)
+		}
+	}()
+
+	poller.RunOwned(
+		nil,
+		func(buf []byte, n int) bool {
+			platform.StatInc(platform.StatUDPTxRead)
+			payload := buf[:n]
+			slot := udpStreamSlot(payload, streams)
+			for i := 0; i < streams; i++ {
+				idx := (slot + i) % streams
+				select {
+				case chs[idx] <- buf:
+					return !t.stop.Stopped()
+				default:
+				}
+			}
+			chs[slot] <- buf
+			return !t.stop.Stopped()
+		},
+	)
+}
+
+func (t *UdpTunnel) udpStreamWriter(conn *net.UDPConn, ch <-chan []byte) {
+	bsz := platform.PerfBatchSize()
+	batch := make([][]byte, 0, bsz)
+	pollMs := time.Duration(platform.PerfPollMs()) * time.Millisecond
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		var sent uint64
+		for _, pkt := range batch {
+			if _, err := conn.Write(pkt); err != nil {
+				if !t.stop.Stopped() {
+					platform.LogDebug("udp tx: " + err.Error())
+				}
+			} else {
+				sent++
+			}
+			platform.PutBuf(pkt)
+		}
+		if sent > 0 {
+			platform.StatAdd(platform.StatUDPTxSend, sent)
+		}
+		batch = batch[:0]
+	}
+
+	timer := time.NewTimer(pollMs)
+	defer timer.Stop()
+
+	for {
+		select {
+		case buf, ok := <-ch:
+			if !ok {
+				flush()
+				return
+			}
+			batch = append(batch, buf)
+			if len(batch) >= bsz {
+				flush()
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(pollMs)
+			}
+		case <-timer.C:
+			flush()
+			timer.Reset(pollMs)
+		}
+	}
 }
 
 func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
@@ -504,45 +653,6 @@ func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 	flush()
 }
 
-func (t *UdpTunnel) wireDst() *net.UDPAddr {
-	if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
-		return p
-	}
-	if t.cfg.Mode == "client" {
-		return &net.UDPAddr{
-			IP:   net.IPv4(t.peerIP[0], t.peerIP[1], t.peerIP[2], t.peerIP[3]),
-			Port: t.cfg.Transport.Port,
-		}
-	}
-	return nil
-}
-
-func (t *UdpTunnel) txPollLoopUnbatched(conn *net.UDPConn) {
-	// RunOwned reads all TUN queues (like tcp); WriteToUDP avoids sendmmsg wire bugs.
-	poller := platform.NewTunPollerH(t.tun, &t.stop, 0)
-	defer poller.Close()
-
-	poller.RunOwned(
-		func() { platform.StatInc(platform.StatUDPTxPoll) },
-		func(buf []byte, n int) bool {
-			platform.StatInc(platform.StatUDPTxRead)
-			dst := t.wireDst()
-			if dst == nil {
-				platform.StatInc(platform.StatUDPTxNoDst)
-				platform.PutBuf(buf)
-				return !t.stop.Stopped()
-			}
-			if _, err := conn.WriteToUDP(buf[:n], dst); err != nil && !t.stop.Stopped() {
-				platform.LogDebug("udp tx: " + err.Error())
-			} else if err == nil {
-				platform.StatInc(platform.StatUDPTxSend)
-			}
-			platform.PutBuf(buf)
-			return !t.stop.Stopped()
-		},
-	)
-}
-
 func (t *UdpTunnel) Down() error {
 	t.doClean()
 	platform.LogOK("udp tunnel torn down")
@@ -556,7 +666,13 @@ func (t *UdpTunnel) doClean() {
 		close(t.done)
 		t.done = nil
 	}
-	if t.udpConn != nil {
+	if len(t.udpStreams) > 0 {
+		for _, c := range t.udpStreams {
+			c.Close()
+		}
+		t.udpStreams = nil
+		t.udpConn = nil
+	} else if t.udpConn != nil {
 		t.udpConn.Close()
 		t.udpConn = nil
 	}

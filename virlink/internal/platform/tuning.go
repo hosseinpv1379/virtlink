@@ -238,6 +238,21 @@ func perDevParams(dev string) []sysctlParam {
 	}
 }
 
+// clearICMPEchoIgnoreAll drops icmp_echo_ignore_all if something else enabled it.
+// Not saved/restored — we never want overlay ping broken while virlink runs.
+func clearICMPEchoIgnoreAll() {
+	key := "net.ipv4.icmp_echo_ignore_all"
+	val, err := readSysctl(key)
+	if err != nil || val != "1" {
+		return
+	}
+	if err := nlSysctl(key, "0"); err != nil {
+		warn("tuning " + key + ": " + err.Error())
+		return
+	}
+	logOK("cleared " + key + " (was blocking overlay ICMP echo replies)")
+}
+
 func ApplyTunnelTuning(cfg *config.Config, devs ...string) {
 	applyPerfFromConfig(cfg)
 
@@ -322,10 +337,9 @@ func (tt *tunnelTuning) applyLocked() {
 		}
 	}
 
-	// Do NOT set net.ipv4.icmp_echo_ignore_all here. It is global and breaks overlay
-	// ping (ICMP echo/reply through TUN) for udp/tcp and all other tunnels on this
-	// host. Wire-side duplicate ICMP replies for the icmp tunnel are filtered in
-	// userspace (protocol/icmp rxLoop).
+	// Do NOT set net.ipv4.icmp_echo_ignore_all — global, breaks overlay ping on all
+	// tunnels. Duplicate wire ICMP is filtered in userspace (protocol/icmp rxLoop).
+	clearICMPEchoIgnoreAll()
 
 	for _, p := range params {
 		tt.set(p.k, p.v)
