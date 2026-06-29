@@ -1,8 +1,8 @@
 // tun_poll.go — single-goroutine TUN TX reader (all queues via one poll loop).
 //
-// fds[0] stays blocking (same fd as WriteFd for wire→TUN inject). It is
-// never SetNonblock — only read when poll/FIONREAD says data is waiting.
-// fds[1..] are SetNonblock and drained in a loop.
+// fds[0] stays blocking (same fd as WriteFd for wire→TUN inject). It is never
+// SetNonblock; drain all pending packets via FIONREAD+read loops. fds[1..]
+// are SetNonblock and drained until EAGAIN.
 package virlink
 
 import (
@@ -39,7 +39,6 @@ func newTunPollerH(tun *TunDev, stop *stoppedFlag, hdrRoom int) *tunPoller {
 	}
 	p.pollFds = make([]unix.PollFd, len(tun.fds))
 	for i, q := range tun.fds {
-		// q0 is WriteFd — must stay blocking; q1.. are read-only aux queues.
 		if i > 0 {
 			_ = unix.SetNonblock(int(q.Fd()), true)
 		}
@@ -61,17 +60,20 @@ func (p *tunPoller) queueBlocking(qIdx int) bool {
 
 func (p *tunPoller) drainQueue(q *os.File, qIdx int, onPkt func(pkt []byte, n int) bool) (got, exit bool) {
 	if p.queueBlocking(qIdx) {
-		n, err := q.Read(p.buf)
-		if err != nil || n == 0 {
-			if err != nil && !p.stop.stopped() {
-				logWarn("tun read: " + err.Error())
+		for tunPending(int(q.Fd())) > 0 {
+			n, err := q.Read(p.buf)
+			if err != nil || n == 0 {
+				if err != nil && !p.stop.stopped() {
+					logWarn("tun read: " + err.Error())
+				}
+				break
 			}
-			return false, false
+			got = true
+			if !onPkt(p.buf[:n], n) {
+				return got, true
+			}
 		}
-		if !onPkt(p.buf[:n], n) {
-			return true, true
-		}
-		return true, false
+		return got, false
 	}
 	for {
 		n, err := tunReadNB(q, p.buf)
@@ -94,19 +96,22 @@ func (p *tunPoller) drainQueue(q *os.File, qIdx int, onPkt func(pkt []byte, n in
 
 func (p *tunPoller) drainQueueOwned(q *os.File, qIdx int, onPkt func(buf []byte, n int) bool) (got, exit bool) {
 	if p.queueBlocking(qIdx) {
-		buf := getBuf()
-		n, err := q.Read(buf[p.hdrRoom:])
-		if err != nil || n == 0 {
-			putBuf(buf)
-			if err != nil && !p.stop.stopped() {
-				logWarn("tun read: " + err.Error())
+		for tunPending(int(q.Fd())) > 0 {
+			buf := getBuf()
+			n, err := q.Read(buf[p.hdrRoom:])
+			if err != nil || n == 0 {
+				putBuf(buf)
+				if err != nil && !p.stop.stopped() {
+					logWarn("tun read: " + err.Error())
+				}
+				break
 			}
-			return false, false
+			got = true
+			if !onPkt(buf, n) {
+				return got, true
+			}
 		}
-		if !onPkt(buf, n) {
-			return true, true
-		}
-		return true, false
+		return got, false
 	}
 	for {
 		buf := getBuf()
@@ -138,9 +143,6 @@ func (p *tunPoller) Run(onEmpty func(), onPkt func(pkt []byte, n int) bool) {
 			eager = false
 			got := false
 			for i, q := range p.tun.fds {
-				if p.queueBlocking(i) {
-					continue // q0 only read after poll reports POLLIN
-				}
 				g, exit := p.drainQueue(q, i, onPkt)
 				if exit {
 					return
@@ -183,9 +185,6 @@ func (p *tunPoller) RunOwned(onEmpty func(), onPkt func(buf []byte, n int) bool)
 			eager = false
 			got := false
 			for i, q := range p.tun.fds {
-				if p.queueBlocking(i) {
-					continue
-				}
 				g, exit := p.drainQueueOwned(q, i, onPkt)
 				if exit {
 					return
