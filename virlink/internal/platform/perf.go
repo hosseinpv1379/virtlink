@@ -97,11 +97,11 @@ func initUserspacePerfDefaults(c *config.Config) {
 	case "icmp":
 		perf.batchSize = 64
 		perf.pollMs = 3
-		perf.tcpStreams = userspaceTcpStreams()
+		perf.tcpStreams = 1
 	case "udp":
 		perf.batchSize = 64
 		perf.pollMs = 3
-		perf.tcpStreams = userspaceTcpStreams() // parallel wire sockets (see [tuning] tcp_streams)
+		perf.tcpStreams = 1
 	case "bip":
 		// Match ICMP batch size — sendmmsg is equally effective here.
 		perf.batchSize = 64
@@ -200,8 +200,8 @@ func ApplyPerfFromConfig(c *config.Config) {
 		}
 	}
 
-	// When only tun_queues is raised for tcp/tcpmux/udp/icmp, scale streams to match unless set explicitly.
-	if (isTcpUserspaceTunnel(c.Tunnel.Type) || c.Tunnel.Type == "udp" || c.Tunnel.Type == "icmp") &&
+	// When only tun_queues is raised for tcp/tcpmux, scale streams to match unless set explicitly.
+	if isTcpUserspaceTunnel(c.Tunnel.Type) &&
 		t.TcpStreams == 0 && t.TunQueues > 0 && perf.tcpStreams < perf.tunQueues {
 		perf.tcpStreams = perf.tunQueues
 	}
@@ -226,16 +226,10 @@ func applyWirePerfBoost(c *config.Config) {
 		perf.tunQueues = maxInt(perf.tunQueues, userspaceQueues())
 		perf.batchSize = maxInt(perf.batchSize, 64)
 		perf.pollMs = minInt(perf.pollMs, 3)
-		n := clampInt(userspaceCPU(), 4, MaxPerfQueues)
-		perf.tcpStreams = maxInt(perf.tcpStreams, n)
 	case "udp", "bip":
 		perf.tunQueues = maxInt(perf.tunQueues, userspaceQueues())
 		perf.batchSize = maxInt(perf.batchSize, 32)
 		perf.pollMs = minInt(perf.pollMs, 5)
-		if c.Tunnel.Type == "udp" {
-			n := clampInt(userspaceCPU(), 4, MaxPerfQueues)
-			perf.tcpStreams = maxInt(perf.tcpStreams, n)
-		}
 	}
 }
 
