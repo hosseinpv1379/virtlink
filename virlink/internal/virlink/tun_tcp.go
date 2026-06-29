@@ -131,13 +131,11 @@ func (t *TcpTunnel) pickConn(data []byte) net.Conn {
 }
 
 // tcpTxChanCap is the per-stream TX channel capacity.
-// Intentionally small: 64 slots × ~1442 bytes ≈ 90 KB per stream.
-// Large channels hide backpressure from the inner TCP: frames queue here while
-// the outer TCP is slow, inflating the inner RTT and causing retransmits.
-// Together with TCP_NOTSENT_LOWAT (256 KB), total unsent buffering per stream
-// is ~350 KB — roughly 2-3× BDP on a typical VPN link, enough to keep the
-// wire saturated without causing RTT inflation.
-const tcpTxChanCap = 64
+// 32 slots × ~1442 bytes ≈ 46 KB per stream.
+// Together with TCP_NOTSENT_LOWAT (64 KB), total unsent buffering per stream
+// is ~110 KB — enough to keep the wire saturated (≥ BDP for most VPN paths)
+// without hiding congestion from the inner TCP.
+const tcpTxChanCap = 32
 
 // txPollLoop reads TUN packets and dispatches them into per-stream buffered
 // channels. Each stream runs its own txStreamWriter goroutine that accumulates

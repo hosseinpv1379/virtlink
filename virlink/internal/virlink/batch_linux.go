@@ -251,14 +251,15 @@ func icmpSendBatch(rawFd int, b *icmpTxBatch) int { return mmsgSendBatch(rawFd, 
 // Falls back to the regular SO_RCVBUF / SO_SNDBUF on EPERM.
 //
 // TCP_NOTSENT_LOWAT is the critical setting for TCP-over-TCP tunnels.
-// Without it the kernel accepts up to SO_SNDBUF bytes (e.g. 8 MB) into its
-// send buffer regardless of whether the outer TCP has actually transmitted
-// them. The inner TCP then sees a 640 ms+ artificial RTT (8 MB / 10 Mbps)
-// and hammers RTO retransmits. With TCP_NOTSENT_LOWAT = 256 KB the kernel
-// only allows 256 KB of unsent data; writes block once that is reached,
-// which propagates back-pressure up through our channel → TUN poller →
-// kernel TUN ring → inner TCP CWND reduction.
-const tcpNotSentLowat = 256 * 1024
+// Without it the kernel accepts up to SO_SNDBUF (e.g. 8 MB) regardless of
+// whether the outer TCP has transmitted it yet. The inner TCP then sees
+// RTT = buffer_size / wire_bandwidth and hammers RTO retransmits.
+// With 64 KB the queuing delay is ≤ 64 KB / wire_bandwidth:
+//   • 100 Mbps wire →   5 ms extra RTT  (negligible)
+//   •  10 Mbps wire →  51 ms extra RTT  (acceptable)
+//   •   5 Mbps wire → 102 ms extra RTT  (manageable)
+// 64 KB = ~4 × BDP at 5 Mbps / 100 ms RTT, enough to keep the wire full.
+const tcpNotSentLowat = 64 * 1024
 
 func tuneTCPConnForce(tc *net.TCPConn) {
 	sc, err := tc.SyscallConn()
