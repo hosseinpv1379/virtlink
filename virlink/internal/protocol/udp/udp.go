@@ -102,10 +102,7 @@ func (t *UdpTunnel) Up() error {
 			return fmt.Errorf("udp :%d: %w", port, err)
 		}
 		platform.TuneUDPConn(t.udpConn)
-		if c.Mode == "client" {
-			dst := &net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port}
-			t.lastPeer.Store(dst)
-		}
+		t.lastPeer.Store(&net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port})
 		platform.LogOK(fmt.Sprintf("UDP :%d", port))
 	}
 
@@ -117,8 +114,10 @@ func (t *UdpTunnel) Up() error {
 		go t.txPollLoopRaw(t.rawFd, port)
 	} else {
 		conn := t.udpConn
-		go t.rxLoop(conn, t.tun.Fd0())
-		go t.txPollLoop(conn)
+		// Plain UDP: ReadFromUDP/WriteToUDP are more reliable than recvmmsg/sendmmsg
+		// on some kernels and avoid silent batch TX/RX failures (rx_recv=0, hs=waiting).
+		go t.rxLoopBlocking(conn, t.tun.Fd0())
+		go t.txPollLoopUnbatched(conn)
 	}
 
 	platform.Done(dev, addr, peer, fmt.Sprintf("transport : UDP :%d  poller×1", port))
@@ -355,14 +354,14 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 				continue
 			}
 			if t.cfg.Mode == "server" {
-				// Network byte-order port from RawSockaddrInet4.
-				saPort := uint16(sa.Port>>8) | uint16(sa.Port<<8)
+				// From4() already converts RawSockaddrInet4.Port to host order.
+				saPort := uint16(sa.Port)
 				if sa.Addr != lastPeerAddr || saPort != lastPeerPort {
 					lastPeerAddr = sa.Addr
 					lastPeerPort = saPort
 					t.lastPeer.Store(&net.UDPAddr{
 						IP:   net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]),
-						Port: int(saPort),
+						Port: sa.Port,
 					})
 				}
 			}
@@ -494,6 +493,19 @@ func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 	flush()
 }
 
+func (t *UdpTunnel) wireDst() *net.UDPAddr {
+	if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
+		return p
+	}
+	if t.cfg.Mode == "client" {
+		return &net.UDPAddr{
+			IP:   net.IPv4(t.peerIP[0], t.peerIP[1], t.peerIP[2], t.peerIP[3]),
+			Port: t.cfg.Transport.Port,
+		}
+	}
+	return nil
+}
+
 func (t *UdpTunnel) txPollLoopUnbatched(conn *net.UDPConn) {
 	poller := platform.NewTunPoller(t.tun, &t.stop)
 	defer poller.Close()
@@ -502,10 +514,7 @@ func (t *UdpTunnel) txPollLoopUnbatched(conn *net.UDPConn) {
 		func() { platform.StatInc(platform.StatUDPTxPoll) },
 		func(pkt []byte, n int) bool {
 			platform.StatInc(platform.StatUDPTxRead)
-			var dst *net.UDPAddr
-			if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
-				dst = p
-			}
+			dst := t.wireDst()
 			if dst == nil {
 				platform.StatInc(platform.StatUDPTxNoDst)
 				return true
