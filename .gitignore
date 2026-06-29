@@ -10,6 +10,7 @@ Makefile
 
 # ── user-generated files ──────────────────────────────────────────────────────
 configs/
+examples/
 /var/run/virlink/
 /var/log/virlink/
 
