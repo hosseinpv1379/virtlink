@@ -199,7 +199,7 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 			NoteTunnelAlive()
 			batch.add(payload)
 		}
-		if batch.len() >= bsz {
+		if batch.len() > 0 {
 			flush()
 		}
 	}
@@ -364,7 +364,7 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 			NoteTunnelAlive()
 			batch.add(pkt)
 		}
-		if batch.len() >= bsz {
+		if batch.len() > 0 {
 			flush()
 		}
 	}

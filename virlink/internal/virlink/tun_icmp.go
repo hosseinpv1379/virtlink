@@ -292,7 +292,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 			}
 			batch.add(inner)
 		}
-		if batch.len() >= bsz {
+		if batch.len() > 0 {
 			flush()
 		}
 	}

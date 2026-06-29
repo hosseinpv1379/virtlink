@@ -168,7 +168,7 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 			NoteTunnelAlive()
 			batch.add(inner)
 		}
-		if batch.len() >= bsz {
+		if batch.len() > 0 {
 			flush()
 		}
 	}

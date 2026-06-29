@@ -195,6 +195,9 @@ func diagCause(tunnelType, mode, hs string, p pipeStats) string {
 	}
 
 	if len(hints) == 0 {
+		if p.rxRecv > 0 && p.rxWrite == 0 {
+			return "wire packets received but not injected into TUN — check tun_err counter or upgrade (write fd bug)"
+		}
 		if hs == "connected" {
 			return "pipeline healthy"
 		}
