@@ -2,6 +2,7 @@
 virlink/virlink
 virlink/virlink-release
 virlink/virlink-test
+virlink/virlink-linux-amd64
 virlink/test/virlink-test
 virlink_new
 

@@ -310,6 +310,16 @@ func (tt *tunnelTuning) applyLocked() {
 		}
 	}
 
+	// ICMP tunnel only: stop the kernel from auto-replying to echo requests.
+	// The tunnel encapsulates data as ICMP echo requests; if the kernel also
+	// answers each one with an echo reply it doubles wire traffic, floods the
+	// raw socket RX buffer (RAM climbs to SO_RCVBUFFORCE) and burns CPU parsing
+	// and discarding those replies — exactly the "CPU/RAM fill up" symptom.
+	// Restored to its previous value on teardown (tt.set saves the old value).
+	if cfg.Tunnel.Type == "icmp" {
+		params = append(params, sysctlParam{"net.ipv4.icmp_echo_ignore_all", "1"})
+	}
+
 	for _, p := range params {
 		tt.set(p.k, p.v)
 	}
