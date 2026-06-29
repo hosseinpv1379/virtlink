@@ -164,7 +164,12 @@ func profileReport() {
 	var sumRate float64
 	for i := 0; i < statMax; i++ {
 		cur := statCounts[i].Load()
-		delta := cur - profSnap.vals[i]
+		var delta uint64
+		if cur >= profSnap.vals[i] {
+			delta = cur - profSnap.vals[i]
+		} else {
+			delta = cur
+		}
 		if delta == 0 {
 			continue
 		}
@@ -275,7 +280,12 @@ func profileSnapshotJSON() profileJSON {
 	var sumRate float64
 	for i := 0; i < statMax; i++ {
 		cur := statCounts[i].Load()
-		delta := cur - profSnap.vals[i]
+		var delta uint64
+		if cur >= profSnap.vals[i] {
+			delta = cur - profSnap.vals[i]
+		} else {
+			delta = cur
+		}
 		if delta == 0 {
 			continue
 		}

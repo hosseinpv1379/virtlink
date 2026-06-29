@@ -134,7 +134,7 @@ func initUserspacePerfDefaults(c *config.Config) {
 			perf.pollMs = 50
 		}
 	case "hysteria2":
-		perf.tunQueues = clampInt(userspaceCPU(), 2, 4)
+		perf.tunQueues = 1
 		perf.sockBuf = 64 << 20
 		perf.batchSize = 64
 		perf.pollMs = 3
