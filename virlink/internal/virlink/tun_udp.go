@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -136,7 +137,8 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 		if err != nil {
 			statInc(statUDPRxDropWrite)
 			if !t.stop.stopped() {
-				logWarn(fmt.Sprintf("udp tun write: %v (dropped %d pkt)", err, n))
+				logDiagOnce("udp:tun_write", 15*time.Second,
+					fmt.Sprintf("UDP TUN write failed: %v (%d pkt dropped)", err, n))
 			}
 		} else {
 			statAdd(statUDPRxWrite, uint64(n))
@@ -308,7 +310,8 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 		if err != nil {
 			statInc(statUDPRxDropWrite)
 			if !t.stop.stopped() {
-				logWarn(fmt.Sprintf("udp tun write: %v (dropped %d pkt)", err, n))
+				logDiagOnce("udp:tun_write", 15*time.Second,
+					fmt.Sprintf("UDP TUN write failed: %v (%d pkt dropped)", err, n))
 			}
 		} else {
 			statAdd(statUDPRxWrite, uint64(n))
@@ -402,7 +405,8 @@ func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 		if err := tunWrite(tun, buf[:n]); err != nil {
 			statInc(statUDPRxDropWrite)
 			if !t.stop.stopped() {
-				logWarn(fmt.Sprintf("udp tun write: %v", err))
+				logDiagOnce("udp:tun_write", 15*time.Second,
+					fmt.Sprintf("UDP TUN write failed: %v", err))
 			}
 		} else {
 			statInc(statUDPRxWrite)
@@ -417,7 +421,7 @@ func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 	rawFd, err := udpConnFD(conn)
 	if err != nil {
-		logWarn("udp tx batch: " + err.Error())
+		logDiagOnce("udp:tx_batch", 30*time.Second, "UDP sendmmsg unavailable: "+err.Error()+" (fallback path)")
 		t.txPollLoopUnbatched(conn)
 		return
 	}

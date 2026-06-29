@@ -87,7 +87,7 @@ func runDaemon(cfg *Config, tun Tunnel) int {
 		for {
 			select {
 			case <-ticker.C:
-				printHeartbeat(tun, fwdRules, startedAt, hm)
+				printHeartbeat(cfg, tun, fwdRules, startedAt, hm)
 			case <-stopHB:
 				return
 			}
@@ -117,7 +117,7 @@ func runDaemon(cfg *Config, tun Tunnel) int {
 
 // ── heartbeat ─────────────────────────────────────────────────────────────────
 
-func printHeartbeat(tun Tunnel, fwdRules []ForwardRule, since time.Time, hm *HealthMgr) {
+func printHeartbeat(cfg *Config, tun Tunnel, fwdRules []ForwardRule, since time.Time, hm *HealthMgr) {
 	dev := tun.DevName()
 	uptime := time.Since(since)
 
@@ -177,6 +177,7 @@ func printHeartbeat(tun Tunnel, fwdRules []ForwardRule, since time.Time, hm *Hea
 	msg := fmtHeartbeat(dev, linkState, hsState, lastProbe,
 		rxB, txB, rxPkt, txPkt, uptime)
 	logInfo(msg)
+	logTunnelDiag(cfg.Tunnel.Type, cfg.Tunnel.Mode, hsState)
 	wireLogHeartbeat()
 }
 

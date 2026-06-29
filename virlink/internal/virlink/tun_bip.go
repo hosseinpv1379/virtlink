@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -121,7 +122,8 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 			return
 		}
 		if err != nil && !t.stop.stopped() {
-			logWarn("tun write: " + err.Error())
+			logDiagOnce("bip:tun_write", 15*time.Second,
+				fmt.Sprintf("BIP TUN write failed: %v (%d pkt dropped)", err, n))
 		} else if err == nil {
 			statAdd(statBIPRxWrite, uint64(n))
 		}

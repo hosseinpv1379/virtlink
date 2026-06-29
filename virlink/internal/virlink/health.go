@@ -88,12 +88,11 @@ func (h *HealthMgr) markRx() {
 }
 
 // NoteTunnelAlive marks the tunnel as alive based on wire traffic (not overlay UDP probes).
-// Overlay probes traverse stack→TUN→wire→TUN→stack and can fail independently of the
-// tunnel; marking alive on valid wire RX keeps hs=connected when data actually flows.
 func NoteTunnelAlive() {
 	if h := activeTunnelHealth.Load(); h != nil {
 		h.markRx()
 	}
+	logInfoOnce("tunnel:wire:rx", 24*time.Hour, "first valid packet from peer on wire (RX path OK)")
 }
 
 var activeTunnelHealth atomic.Pointer[HealthMgr]

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -230,7 +231,8 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 		if err != nil {
 			statInc(statICMPRxDropWrite)
 			if !t.stop.stopped() {
-				logWarn(fmt.Sprintf("icmp tun write: %v (dropped %d pkt)", err, n))
+				logDiagOnce("icmp:tun_write", 15*time.Second,
+					fmt.Sprintf("ICMP TUN write failed: %v (%d pkt dropped)", err, n))
 			}
 		} else {
 			statAdd(statICMPRxWrite, uint64(n))

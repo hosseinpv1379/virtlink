@@ -127,18 +127,14 @@ func statInc(id int) {
 	if id < 0 || id >= statMax {
 		return
 	}
-	if profEnabled.Load() {
-		statCounts[id].Add(1)
-	}
+	statCounts[id].Add(1)
 }
 
 func statAdd(id int, n uint64) {
 	if id < 0 || id >= statMax || n == 0 {
 		return
 	}
-	if profEnabled.Load() {
-		statCounts[id].Add(n)
-	}
+	statCounts[id].Add(n)
 }
 
 type statRate struct {
@@ -224,6 +220,21 @@ func profileHints(rows []statRate, elapsed float64) []string {
 	}
 	if rates["icmp.rx_drop_peer"]+rates["icmp.rx_drop_proto"] > 50 {
 		hints = append(hints, "many icmp drops — check peer IP / second tunnel instance running")
+	}
+	if rates["udp.rx_drop"]+rates["icmp.rx_drop_peer"] > 10 {
+		hints = append(hints, "RX filter drops — wrong remote_ip or [mangle] wire src/dst mismatch")
+	}
+	if rates["udp.rx_drop_write"]+rates["icmp.rx_drop_write"]+rates["bip.rx_drop_write"] > 0 {
+		hints = append(hints, "TUN write failures — packets received on wire but not injected into overlay")
+	}
+	if rates["udp.tx_nodst"]+rates["icmp.tx_nodst"]+rates["bip.tx_nodst"] > 0 {
+		hints = append(hints, "TX nodst — server has not learned client address yet; client must send first")
+	}
+	if rates["udp.tx_read"] > 0 && rates["udp.tx_send"] == 0 {
+		hints = append(hints, "UDP read from TUN but wire send=0 — check [diag] wire TX failed")
+	}
+	if rates["udp.rx_recv"] > 0 && rates["udp.rx_write"] == 0 {
+		hints = append(hints, "UDP wire recv but tun write=0 — injection path broken")
 	}
 	if rates["tcp.tx_noconn"] > send && send > 0 {
 		hints = append(hints, "tcp.tx_noconn high — TCP streams not connected yet")
