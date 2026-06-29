@@ -18,10 +18,13 @@ type Config struct {
 }
 
 func LoadConfig(path string) (*Config, error) {
-	var c Config
-	if _, err := toml.DecodeFile(path, &c); err != nil {
+	var wrapper struct {
+		Webpanel Config `toml:"webpanel"`
+	}
+	if _, err := toml.DecodeFile(path, &wrapper); err != nil {
 		return nil, fmt.Errorf("webpanel config: %w", err)
 	}
+	c := wrapper.Webpanel
 	if c.Listen == "" {
 		c.Listen = "0.0.0.0:8787"
 	}

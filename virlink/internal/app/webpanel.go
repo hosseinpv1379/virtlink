@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"virlink/internal/config"
 	"virlink/internal/platform"
 	"virlink/internal/webpanel"
 )
@@ -18,7 +19,7 @@ func runWebPanel(cfgPath string) int {
 		return 1
 	}
 
-	platform.InitLogger(nil)
+	platform.InitLogger(&config.LoggingCfg{Level: "info"})
 	platform.LogInfo("virlink web panel starting")
 
 	ctx, cancel := context.WithCancel(context.Background())
