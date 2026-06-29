@@ -19,7 +19,8 @@ const (
 	// tcpRxBufSize sizes the bufio.Reader used by TCP/TCPMUX rx loops.
 	// Coalesces many frame-header + frame-payload reads into one socket
 	// read syscall instead of (at least) two syscalls per frame.
-	tcpRxBufSize = 64 << 10
+	// 256 KB allows ~170 × 1500-byte frames per socket read at full throughput.
+	tcpRxBufSize = 256 << 10
 )
 
 var pktPool = sync.Pool{

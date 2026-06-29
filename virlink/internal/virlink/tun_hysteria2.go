@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const hysteria2Subnet = "10.20.52.0/30"
@@ -203,7 +204,65 @@ func (t *Hysteria2Tunnel) Up() error {
 	return nil
 }
 
+// rxLoopServer receives IP packets from hysteria's UDP forwarding port and writes
+// them to the TUN device in batches (recvmmsg → tunWritev).
 func (t *Hysteria2Tunnel) rxLoopServer(conn *net.UDPConn, tun *os.File) {
+	rawFd, err := udpConnFD(conn)
+	if err != nil {
+		t.rxLoopServerBlocking(conn, tun)
+		return
+	}
+	_ = unix.SetNonblock(rawFd, true)
+
+	var rb rxMmsgBatch
+	rb.init(perfBatchSize())
+	defer rb.release()
+
+	bsz := perfBatchSize()
+	batch := newTunRxBatch(bsz)
+	pollMs := perfPollMs()
+
+	flush := func() {
+		n, ferr := batch.flush(tun)
+		if n > 0 && ferr == nil {
+			statAdd(statUDPRxWrite, uint64(n))
+		}
+	}
+	defer flush()
+
+	for !t.stop.stopped() {
+		got, rerr := rb.recv(rawFd)
+		if got == 0 {
+			if t.stop.stopped() {
+				return
+			}
+			if rerr == unix.EAGAIN || rerr == unix.EWOULDBLOCK || rerr == nil {
+				flush()
+				_ = pollFD(rawFd, unix.POLLIN, pollMs)
+				continue
+			}
+			continue
+		}
+		for i := 0; i < got; i++ {
+			pkt := rb.data(i)
+			// Update last peer from the recvmmsg source address.
+			sa := rb.from4(i)
+			portBE := sa.Port
+			t.lastPeer.Store(&net.UDPAddr{
+				IP:   net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]),
+				Port: int(portBE>>8 | (portBE&0xff)<<8),
+			})
+			statInc(statUDPRxRecv)
+			batch.add(pkt)
+		}
+		if batch.len() >= bsz {
+			flush()
+		}
+	}
+}
+
+// rxLoopServerBlocking is the single-packet fallback when recvmmsg is unavailable.
+func (t *Hysteria2Tunnel) rxLoopServerBlocking(conn *net.UDPConn, tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
 	for {
@@ -224,7 +283,66 @@ func (t *Hysteria2Tunnel) rxLoopServer(conn *net.UDPConn, tun *os.File) {
 	}
 }
 
+// txPollLoopServer drains the TUN device and sends IP packets to the hysteria
+// wrap client via sendmmsg.
 func (t *Hysteria2Tunnel) txPollLoopServer(conn *net.UDPConn) {
+	rawFd, err := udpConnFD(conn)
+	if err != nil {
+		t.txPollLoopServerUnbatched(conn)
+		return
+	}
+
+	poller := newTunPollerH(t.tun, &t.stop, 0)
+	defer poller.close()
+
+	var batch icmpTxBatch
+	bsz := perfBatchSize()
+
+	flush := func() {
+		if batch.n == 0 {
+			return
+		}
+		statAdd(statUDPTxSend, uint64(batch.n))
+		if nerr := mmsgSendBatch(rawFd, &batch); nerr > 0 {
+			noteWireTxErr(nerr)
+		}
+		for i := 0; i < batch.n; i++ {
+			putBuf(batch.frames[i])
+			batch.frames[i] = nil
+		}
+		batch.reset()
+	}
+
+	poller.RunOwned(
+		func() {
+			statInc(statUDPTxPoll)
+			if batch.n > 0 {
+				flush()
+			}
+		},
+		func(buf []byte, n int) bool {
+			statInc(statUDPTxRead)
+			p, ok := t.lastPeer.Load().(*net.UDPAddr)
+			if !ok || p == nil {
+				statInc(statUDPTxNoDst)
+				putBuf(buf)
+				return true
+			}
+			var dst [4]byte
+			copy(dst[:], p.IP.To4())
+			port := uint16(p.Port)
+			batch.add(buf, n, dst, port)
+			if batch.n >= bsz {
+				flush()
+			}
+			return !t.stop.stopped()
+		},
+	)
+	flush()
+}
+
+// txPollLoopServerUnbatched is the single-packet fallback for txPollLoopServer.
+func (t *Hysteria2Tunnel) txPollLoopServerUnbatched(conn *net.UDPConn) {
 	poller := newTunPoller(t.tun, &t.stop)
 	defer poller.close()
 
@@ -247,7 +365,57 @@ func (t *Hysteria2Tunnel) txPollLoopServer(conn *net.UDPConn) {
 	)
 }
 
+// rxLoopClient receives IP packets forwarded back by hysteria (client side) and
+// writes them to TUN in batches.
 func (t *Hysteria2Tunnel) rxLoopClient(conn *net.UDPConn, tun *os.File) {
+	rawFd, err := udpConnFD(conn)
+	if err != nil {
+		t.rxLoopClientBlocking(conn, tun)
+		return
+	}
+	_ = unix.SetNonblock(rawFd, true)
+
+	var rb rxMmsgBatch
+	rb.init(perfBatchSize())
+	defer rb.release()
+
+	bsz := perfBatchSize()
+	batch := newTunRxBatch(bsz)
+	pollMs := perfPollMs()
+
+	flush := func() {
+		n, ferr := batch.flush(tun)
+		if n > 0 && ferr == nil {
+			statAdd(statUDPRxWrite, uint64(n))
+		}
+	}
+	defer flush()
+
+	for !t.stop.stopped() {
+		got, rerr := rb.recv(rawFd)
+		if got == 0 {
+			if t.stop.stopped() {
+				return
+			}
+			if rerr == unix.EAGAIN || rerr == unix.EWOULDBLOCK || rerr == nil {
+				flush()
+				_ = pollFD(rawFd, unix.POLLIN, pollMs)
+				continue
+			}
+			continue
+		}
+		statAdd(statUDPRxRecv, uint64(got))
+		for i := 0; i < got; i++ {
+			batch.add(rb.data(i))
+		}
+		if batch.len() >= bsz {
+			flush()
+		}
+	}
+}
+
+// rxLoopClientBlocking is the single-packet fallback for rxLoopClient.
+func (t *Hysteria2Tunnel) rxLoopClientBlocking(conn *net.UDPConn, tun *os.File) {
 	buf := getBuf()
 	defer putBuf(buf)
 	for {
@@ -267,7 +435,65 @@ func (t *Hysteria2Tunnel) rxLoopClient(conn *net.UDPConn, tun *os.File) {
 	}
 }
 
+// txPollLoopClient drains the TUN device and sends IP packets toward the hysteria
+// udpForwarding port via sendmmsg.
 func (t *Hysteria2Tunnel) txPollLoopClient(conn *net.UDPConn) {
+	rawFd, err := udpConnFD(conn)
+	if err != nil {
+		t.txPollLoopClientUnbatched(conn)
+		return
+	}
+
+	dst := t.wrapAddr
+	if dst == nil {
+		return
+	}
+	var dstArr [4]byte
+	copy(dstArr[:], dst.IP.To4())
+	dstPort := uint16(dst.Port)
+
+	poller := newTunPollerH(t.tun, &t.stop, 0)
+	defer poller.close()
+
+	var batch icmpTxBatch
+	bsz := perfBatchSize()
+
+	flush := func() {
+		if batch.n == 0 {
+			return
+		}
+		statAdd(statUDPTxSend, uint64(batch.n))
+		if nerr := mmsgSendBatch(rawFd, &batch); nerr > 0 {
+			noteWireTxErr(nerr)
+		}
+		for i := 0; i < batch.n; i++ {
+			putBuf(batch.frames[i])
+			batch.frames[i] = nil
+		}
+		batch.reset()
+	}
+
+	poller.RunOwned(
+		func() {
+			statInc(statUDPTxPoll)
+			if batch.n > 0 {
+				flush()
+			}
+		},
+		func(buf []byte, n int) bool {
+			statInc(statUDPTxRead)
+			batch.add(buf, n, dstArr, dstPort)
+			if batch.n >= bsz {
+				flush()
+			}
+			return !t.stop.stopped()
+		},
+	)
+	flush()
+}
+
+// txPollLoopClientUnbatched is the single-packet fallback for txPollLoopClient.
+func (t *Hysteria2Tunnel) txPollLoopClientUnbatched(conn *net.UDPConn) {
 	poller := newTunPoller(t.tun, &t.stop)
 	defer poller.close()
 	dst := t.wrapAddr

@@ -127,11 +127,14 @@ func (t *TcpTunnel) pickConn(data []byte) net.Conn {
 }
 
 // txPollLoop drains the TUN poller and batches consecutive same-stream frames
-// into one net.Buffers.WriteTo (single writev syscall) instead of one syscall
-// per packet. Frames are copied into pooled buffers since the poller reuses
-// its read buffer across packets within a drain burst.
+// into one net.Buffers.WriteTo (single writev syscall).
+//
+// Uses RunOwned with hdrRoom=2: the poller reads each TUN packet into buf[2:],
+// leaving buf[0:2] for the 2-byte length prefix. This eliminates the per-packet
+// copy that was needed when the poller reused a single shared read buffer.
 func (t *TcpTunnel) txPollLoop() {
-	poller := newTunPoller(t.tun, &t.stop)
+	// hdrRoom=2 reserves the 2-byte TCP length header at the start of each buffer.
+	poller := newTunPollerH(t.tun, &t.stop, 2)
 	defer poller.close()
 
 	bsz := perfBatchSize()
@@ -157,24 +160,26 @@ func (t *TcpTunnel) txPollLoop() {
 		curConn = nil
 	}
 
-	poller.Run(
+	// buf is owned; payload is at buf[2:2+n]; buf[0:2] is the header slot.
+	poller.RunOwned(
 		func() { flush() },
-		func(pkt []byte, n int) bool {
+		func(buf []byte, n int) bool {
 			statInc(statTCPTxRead)
-			c := t.pickConn(pkt[:n])
+			payload := buf[2 : 2+n]
+			c := t.pickConn(payload)
 			if c == nil {
 				statInc(statTCPTxNoConn)
-				return true
+				putBuf(buf)
+				return !t.stop.stopped()
 			}
 			if curConn != nil && c != curConn {
 				flush()
 			}
 			curConn = c
-			frame := getBuf()
-			binary.BigEndian.PutUint16(frame[:2], uint16(n))
-			copy(frame[2:2+n], pkt[:n])
-			bufs = append(bufs, frame[:2+n])
-			pooled = append(pooled, frame)
+			// Write length prefix into the reserved header slot — no copy of payload.
+			binary.BigEndian.PutUint16(buf[:2], uint16(n))
+			bufs = append(bufs, buf[:2+n])
+			pooled = append(pooled, buf)
 			if len(pooled) >= bsz {
 				flush()
 			}

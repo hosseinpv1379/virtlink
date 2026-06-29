@@ -95,13 +95,16 @@ func initUserspacePerfDefaults(c *Config) {
 	case "icmp":
 		perf.batchSize = 64
 	case "udp", "bip":
-		perf.batchSize = 32
+		// Match ICMP batch size — sendmmsg is equally effective here.
+		perf.batchSize = 64
 	case "tcp", "tcpmux":
 		// tun_queues feeds the TUN poller; tcp_streams feeds parallel carrier TCP sockets.
-		perf.pollMs = 5
+		// 3 ms poll keeps latency low while batching consecutive packets efficiently.
+		perf.pollMs = 3
 	case "udp-obfs":
 		perf.sockBuf = 32 << 20
 		perf.tunQueues = clampInt(userspaceCPU(), 2, 4)
+		perf.batchSize = 64
 		perf.pollMs = 10
 	case "openvpn", "openvpnmultu":
 		perf.tunQueues = 1
@@ -115,7 +118,14 @@ func initUserspacePerfDefaults(c *Config) {
 		default:
 			perf.pollMs = 50
 		}
-	case "hysteria2", "wireguard", "amneziawg":
+	case "hysteria2":
+		// Wrap path is loopback UDP — low latency, use smaller poll interval.
+		// More queues let the kernel spread TUN→wire traffic.
+		perf.tunQueues = clampInt(userspaceCPU(), 2, 4)
+		perf.sockBuf = 64 << 20
+		perf.batchSize = 64
+		perf.pollMs = 10
+	case "wireguard", "amneziawg":
 		perf.tunQueues = 1
 		perf.sockBuf = defSockBufMB << 20
 		perf.tcpStreams = 1

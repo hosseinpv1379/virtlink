@@ -166,11 +166,14 @@ func (t *TcpMuxTunnel) pickConn(data []byte) net.Conn {
 }
 
 // txPollLoop drains the TUN poller and batches consecutive same-stream frames
-// into one net.Buffers.WriteTo (single writev syscall) instead of one syscall
-// per packet. Frames are copied into pooled buffers since the poller reuses
-// its read buffer across packets within a drain burst.
+// into one net.Buffers.WriteTo (single writev syscall).
+//
+// Uses RunOwned with hdrRoom=6: the poller reads each TUN packet into buf[6:],
+// leaving buf[0:6] for the 6-byte wire header (2 len + 4 flow_hash).
+// This eliminates the per-packet copy that was needed with a shared read buffer.
 func (t *TcpMuxTunnel) txPollLoop() {
-	poller := newTunPoller(t.tun, &t.stop)
+	// hdrRoom=6: 2-byte payload length + 4-byte flow hash.
+	poller := newTunPollerH(t.tun, &t.stop, 6)
 	defer poller.close()
 
 	bsz := perfBatchSize()
@@ -196,30 +199,32 @@ func (t *TcpMuxTunnel) txPollLoop() {
 		curConn = nil
 	}
 
-	poller.Run(
+	// buf is owned; payload is at buf[6:6+n]; buf[0:6] is the header slot.
+	poller.RunOwned(
 		func() { flush() },
-		func(pkt []byte, n int) bool {
+		func(buf []byte, n int) bool {
 			statInc(statTCPTxRead)
 			if n > 0xffff {
 				logDebug(fmt.Sprintf("tcpmux tx: frame too large: %d", n))
+				putBuf(buf)
 				return !t.stop.stopped()
 			}
-			data := pkt[:n]
-			c := t.pickConn(data)
+			payload := buf[6 : 6+n]
+			c := t.pickConn(payload)
 			if c == nil {
 				statInc(statTCPTxNoConn)
-				return true
+				putBuf(buf)
+				return !t.stop.stopped()
 			}
 			if curConn != nil && c != curConn {
 				flush()
 			}
 			curConn = c
-			frame := getBuf()
-			binary.BigEndian.PutUint16(frame[0:2], uint16(n))
-			binary.BigEndian.PutUint32(frame[2:6], tcpMuxFlowHash(data, t.hashSeed))
-			copy(frame[tcpMuxHashHdrLen+2:tcpMuxHashHdrLen+2+n], data)
-			bufs = append(bufs, frame[:tcpMuxHashHdrLen+2+n])
-			pooled = append(pooled, frame)
+			// Write 6-byte header into the reserved slot — no copy of payload.
+			binary.BigEndian.PutUint16(buf[0:2], uint16(n))
+			binary.BigEndian.PutUint32(buf[2:6], tcpMuxFlowHash(payload, t.hashSeed))
+			bufs = append(bufs, buf[:tcpMuxHashHdrLen+2+n])
+			pooled = append(pooled, buf)
 			if len(pooled) >= bsz {
 				flush()
 			}

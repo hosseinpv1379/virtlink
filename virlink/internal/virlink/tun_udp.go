@@ -399,6 +399,10 @@ func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 	}
 }
 
+// txPollLoop sends TUN packets to the UDP peer via sendmmsg batching.
+//
+// Uses RunOwned with hdrRoom=0: the poller's owned buffer IS the UDP payload,
+// so batch.add receives it directly — no intermediate getBuf+copy per packet.
 func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 	rawFd, err := udpConnFD(conn)
 	if err != nil {
@@ -407,7 +411,7 @@ func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 		return
 	}
 
-	poller := newTunPoller(t.tun, &t.stop)
+	poller := newTunPollerH(t.tun, &t.stop, 0)
 	defer poller.close()
 
 	var batch icmpTxBatch
@@ -432,29 +436,15 @@ func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 		haveDst = false
 	}
 
-	addPkt := func(dst [4]byte, port uint16, payload []byte) {
-		if haveDst && (dst != curDst || port != curPort) {
-			flush()
-		}
-		curDst = dst
-		curPort = port
-		haveDst = true
-		frame := getBuf()
-		n := copy(frame, payload)
-		batch.add(frame, n, dst, port)
-		if batch.n >= bsz {
-			flush()
-		}
-	}
-
-	poller.Run(
+	poller.RunOwned(
 		func() {
 			statInc(statUDPTxPoll)
 			if batch.n > 0 {
 				flush()
 			}
 		},
-		func(pkt []byte, n int) bool {
+		// buf is owned; payload is buf[0:n] (hdrRoom=0). Use buf directly — no copy.
+		func(buf []byte, n int) bool {
 			statInc(statUDPTxRead)
 			var dst [4]byte
 			var port uint16
@@ -466,9 +456,20 @@ func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 				port = uint16(p.Port)
 			} else {
 				statInc(statUDPTxNoDst)
-				return true
+				putBuf(buf)
+				return !t.stop.stopped()
 			}
-			addPkt(dst, port, pkt[:n])
+			if haveDst && (dst != curDst || port != curPort) {
+				flush()
+			}
+			curDst = dst
+			curPort = port
+			haveDst = true
+			// buf IS the frame — owned, no extra allocation or copy.
+			batch.add(buf, n, dst, port)
+			if batch.n >= bsz {
+				flush()
+			}
 			return !t.stop.stopped()
 		},
 	)
