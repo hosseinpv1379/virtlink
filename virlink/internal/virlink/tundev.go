@@ -2,13 +2,12 @@
 //
 // IFF_MULTI_QUEUE gives N file descriptors for the same interface.
 // The kernel load-balances outbound packets (stack → userspace) across
-// queues, so N parallel txLoop goroutines can read at N× the rate of one.
-// Falls back to a single queue when the kernel rejects multi-queue.
+// all N queues. fds[0] is used for wire→TUN writes (blocking) AND is
+// included in the TX poller read set. fds[1..] are O_NONBLOCK read-only.
 //
-// Wire→TUN injection uses a dedicated write queue fd (writeFd). The TX poller
-// sets the read queue fds O_NONBLOCK; O_NONBLOCK is per file-description, so a
-// dup() of a read fd would also become non-blocking and TUN writes return
-// EAGAIN — the exact "rx_recv>0 rx_write=0" failure mode.
+// Never open a write-only queue fd: the kernel hashes stack→userspace TX
+// across every queue, so an unread queue drops ~1/N of all outbound packets
+// (ping probes, health checks, etc.).
 package virlink
 
 import (
@@ -25,34 +24,26 @@ const (
 	tunSetIff = uintptr(0x400454ca)
 )
 
-// TunDev holds read queue fds (poller) and a separate blocking writeFd (RX inject).
+// TunDev holds N queue fds. fds[0] is the blocking inject fd (WriteFd) and
+// the first TX-poller read queue; fds[1..] are additional read queues.
 type TunDev struct {
-	fds     []*os.File // read queues only — poller sets these O_NONBLOCK
-	writeFd *os.File   // dedicated queue, never read, never O_NONBLOCK
-	queues  int        // number of read queues
+	fds    []*os.File
+	queues int
 }
 
 func (t *TunDev) Close() {
-	if t.writeFd != nil {
-		t.writeFd.Close()
-		t.writeFd = nil
-	}
 	for _, f := range t.fds {
 		if f != nil {
 			f.Close()
 		}
 	}
+	t.fds = nil
 }
 
 func (t *TunDev) Fd0() *os.File { return t.fds[0] }
 
-// WriteFd returns the blocking fd for injecting packets into the TUN (RX path).
-func (t *TunDev) WriteFd() *os.File {
-	if t.writeFd != nil {
-		return t.writeFd
-	}
-	return t.fds[0]
-}
+// WriteFd returns fds[0] for wire→TUN injection (never O_NONBLOCK).
+func (t *TunDev) WriteFd() *os.File { return t.fds[0] }
 
 func (t *TunDev) QueueCount() int {
 	if t == nil {
@@ -81,21 +72,16 @@ func openTunMulti(name string, n int) (*TunDev, error) {
 	return td, err
 }
 
-// openTunMultiTry opens readQueues read fds + 1 dedicated write-only queue fd.
-// Queue 0 is the write fd (kernel always accepts inject on the primary queue);
-// queues 1..N are read-only for the TX poller (O_NONBLOCK, never written).
-func openTunMultiTry(name string, readQueues int) (*TunDev, error) {
-	if readQueues < 1 {
-		readQueues = 1
+func openTunMultiTry(name string, n int) (*TunDev, error) {
+	if n < 1 {
+		n = 1
 	}
-	// +1 queue: q0 = wire→TUN inject (blocking), q1.. = stack→userspace read.
-	totalQ := readQueues + 1
 	td := &TunDev{
-		fds:    make([]*os.File, 0, readQueues),
-		queues: readQueues,
+		fds:    make([]*os.File, 0, n),
+		queues: n,
 	}
-	useMQ := totalQ > 1
-	for i := 0; i < totalQ; i++ {
+	useMQ := n > 1
+	for i := 0; i < n; i++ {
 		fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
 		if err != nil {
 			td.Close()
@@ -114,12 +100,7 @@ func openTunMultiTry(name string, readQueues int) (*TunDev, error) {
 			td.Close()
 			return nil, fmt.Errorf("TUNSETIFF %s q%d: %w", name, i, errno)
 		}
-		f := os.NewFile(uintptr(fd), fmt.Sprintf("%s-q%d", name, i))
-		if i == 0 {
-			td.writeFd = f
-		} else {
-			td.fds = append(td.fds, f)
-		}
+		td.fds = append(td.fds, os.NewFile(uintptr(fd), fmt.Sprintf("%s-q%d", name, i)))
 	}
 	if l, err := netlink.LinkByName(name); err == nil {
 		_ = netlink.LinkSetTxQLen(l, perfTxQLen())
@@ -151,7 +132,6 @@ func tunWrite(fd *os.File, pkt []byte) error {
 }
 
 // tunReadNB reads one packet from a non-blocking TUN fd.
-// Returns (0, EAGAIN) when no data is available.
 func tunReadNB(fd *os.File, buf []byte) (int, error) {
 	n, err := fd.Read(buf)
 	if err != nil {
