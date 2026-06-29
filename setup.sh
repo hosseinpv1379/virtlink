@@ -42,7 +42,7 @@ SCRIPT_DEBUG=0
 
 # Kernel vs userspace tunnel classification
 readonly -a KERNEL_TUNNEL_KEYS=(
-  gre-fou ipip-fou bonded-gre-fou l2tpv3 gre-fou-ipsec gre
+  gre-fou ipip-fou bonded-gre-fou l2tpv3 gre-fou-ipsec gre ipip
 )
 readonly -a USERSPACE_TUNNEL_KEYS=(
   icmp udp bip tcp tcpmux udp-obfs openvpn openvpnmultu hysteria2 wireguard amneziawg
@@ -1445,6 +1445,7 @@ bonded-gre-fou — Dual GRE-FOU ECMP                 2× bandwidth
 l2tpv3         — L2TPv3 over UDP                   Layer-2 tunnel
 gre-fou-ipsec  — GRE-FOU + IPsec ESP               encrypted + FOU
 gre            — Kernel GRE (proto 47)             no UDP wrapper
+ipip           — Kernel IPIP (proto 4)             minimal overhead · wire spoof
 EOF
 }
 
@@ -1493,6 +1494,7 @@ dispatch_tunnel_generator() {
     udp-obfs)       gen_udp_obfs ;;
     gre-fou-ipsec)  gen_ipsec    ;;
     gre)            gen_gre      ;;
+    ipip)           gen_ipip     ;;
     tcp)            gen_tcp      ;;
     tcpmux)         gen_tcpmux   ;;
     openvpn)        gen_openvpn  ;;
@@ -2031,15 +2033,40 @@ add_forward_section() {
   if [[ "$mode" == "client" ]]; then
     cat >> "$cfg" << 'EOF'
 
-# ── port forwarding (client only) ─────────────────────────────────────────────
+# ── port forwarding (client only, iptables DNAT) ────────────────────────────────
 [forward]
 enabled = false
 rules   = [
-  # "1000:2000",    # :1000 → peer:2000
+  # "1000:2000",    # :1000 → peer overlay:2000
   # "8080:80/tcp",
 ]
 EOF
   fi
+}
+
+add_relay_section() {
+  local cfg="$1" mode="$2"
+  cat >> "$cfg" << 'EOF'
+
+# ── virlink userspace relay (overlay TCP :7900+hash, flexible rules) ─────────
+[relay]
+enabled = false
+port = 0
+default_dst = ""
+rules = [
+  # client examples (server only needs enabled=true):
+  # "1000:1.1.1.1:1000",
+  # "443:444",
+  # "443:443",
+  # "2.2.2.2:1000=1000:1.1.1.1",
+  # "8080:80/tcp",
+]
+EOF
+}
+
+add_portforward_sections() {
+  add_forward_section "$1" "$2"
+  add_relay_section "$1" "$2"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2063,7 +2090,7 @@ mtu       = ${mtu}
 EOF
   write_transport "$cfg" "$port" "fou" "10"
   write_tuning    "$cfg" "false" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "gre-fou" "$port"
 }
@@ -2086,7 +2113,7 @@ mtu       = ${mtu}
 EOF
   write_transport "$cfg" "$port" "fou" "10"
   write_tuning    "$cfg" "false" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "ipip-fou" "$port"
 }
@@ -2115,7 +2142,7 @@ proto              = "fou"
 heartbeat_interval = 10
 EOF
   write_tuning "$cfg" "true" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "bonded-gre-fou" "$port1"
 }
@@ -2148,7 +2175,7 @@ client_session_id = 1000
 server_session_id = 2000
 EOF
   write_tuning "$cfg" "false" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "l2tpv3" "$port"
 }
@@ -2198,7 +2225,7 @@ padding = ${padding}
 encryption = true
 EOF
   write_userspace_tuning "$cfg" "udp-obfs" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "udp-obfs" "$port"
 }
@@ -2248,7 +2275,7 @@ auth_key_out = "${authout}"
 auth_key_in  = "${authin}"
 EOF
   write_tuning "$cfg" "false" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "gre-fou-ipsec" "$port"
 }
@@ -2270,9 +2297,31 @@ mtu       = ${mtu}
 EOF
   write_transport_no_port "$cfg" "10"
   write_tuning "$cfg" "false" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "gre" "0"
+}
+
+gen_ipip() {
+  local name mode local_ip remote_ip cidr mtu cfg
+  collect_base_inputs name mode local_ip remote_ip cidr
+  prompt mtu "MTU" "1480"
+  cfg="${CONFIGS_DIR}/${name}.toml"
+  cat > "$cfg" << EOF
+# virlink — ${name}  (kernel IPIP, IP proto 4)
+[tunnel]
+type      = "ipip"
+mode      = "${mode}"
+local_ip  = "${local_ip}"
+remote_ip = "${remote_ip}"
+cidr      = "${cidr}"
+mtu       = ${mtu}
+EOF
+  write_transport_no_port "$cfg" "10"
+  write_tuning "$cfg" "false" "$name"
+  add_portforward_sections "$cfg" "$mode"
+  LAST_CFG_PATH="$cfg"
+  virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "ipip" "0"
 }
 
 # ── OpenVPN PKI + config helpers ─────────────────────────────────────────────
@@ -3249,7 +3298,7 @@ dco    = ${dco_toml}
 encryption = true
 EOF
   write_openvpn_tuning "$cfg" "openvpn" false "$name" "$perf"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
   if [[ "$mode" == "server" ]]; then
@@ -3384,7 +3433,7 @@ workers  = ${workers}
 encryption = true
 EOF
   write_openvpn_tuning "$cfg" "openvpnmultu" true "$name" "$perf"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
   if [[ "$mode" == "server" ]]; then
@@ -3459,7 +3508,7 @@ virlink_make_client_toml() {
     -e 's|/awg-server\.conf|/awg-client.conf|g' \
     "$out"
   if ! grep -q '^\[forward\]' "$out"; then
-    add_forward_section "$out" client
+    add_portforward_sections "$out" client
   fi
 }
 
@@ -3964,7 +4013,7 @@ dev    = "${dev}"
 encryption = true
 EOF
   write_userspace_tuning "$cfg" "hysteria2" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
   if [[ "$mode" == "server" ]]; then
@@ -4201,7 +4250,7 @@ dev    = "${dev}"
 encryption = true
 EOF
   write_openvpn_tuning "$cfg" "wireguard" false "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
   if [[ "$mode" == "server" ]]; then
@@ -4568,7 +4617,7 @@ dev    = "${dev}"
 encryption = true
 EOF
   write_openvpn_tuning "$cfg" "amneziawg" false "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
   if [[ "$mode" == "server" ]]; then
@@ -4619,7 +4668,7 @@ mtu       = ${mtu}
 EOF
   write_transport "$cfg" "$port" "tcp" "10"
   write_userspace_tuning "$cfg" "tcp" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "tcp" "$port"
 }
@@ -4649,7 +4698,7 @@ hash = "${hash}"
 EOF
   write_transport "$cfg" "$port" "tcp" "10"
   write_userspace_tuning "$cfg" "tcpmux" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "tcpmux" "$port"
 }
@@ -4672,7 +4721,7 @@ mtu       = ${mtu}
 EOF
   write_transport "$cfg" "$port" "udp" "10"
   write_userspace_tuning "$cfg" "udp" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "udp" "$port"
 }
@@ -4696,7 +4745,7 @@ mtu       = ${mtu}
 EOF
   write_transport_no_port "$cfg" "10"
   write_userspace_tuning "$cfg" "icmp" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "icmp" "0"
 }
@@ -4720,7 +4769,7 @@ mtu       = ${mtu}
 EOF
   write_transport_no_port "$cfg" "10"
   write_userspace_tuning "$cfg" "bip" "$name"
-  add_forward_section "$cfg" "$mode"
+  add_portforward_sections "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "bip" "0"
 }
@@ -4807,7 +4856,8 @@ menu_tunnel_management() {
     "status    — show status, logs, and systemctl" \
     "edit      — open config in editor" \
     "logs      — tail / follow / search logs" \
-    "forward   — add port forwarding rule" \
+    "forward   — add iptables port forward rule" \
+    "relay     — add virlink userspace relay rule" \
     "remove    — delete tunnel + service"
   action="$(label_key "$action")"
 
@@ -4846,6 +4896,9 @@ menu_tunnel_management() {
       ;;
     forward)
       _manage_forward "$name"
+      ;;
+    relay)
+      _manage_relay "$name"
       ;;
   esac
   blank
@@ -4927,6 +4980,33 @@ menu_remove_core() {
 }
 
 # Sub-handlers (formerly top-level menu items)
+_manage_relay() {
+  local name="$1"
+  local cfg="${CONFIGS_DIR}/${name}.toml"
+  blank
+  echo -e "  ${W}Formats:${NC}"
+  echo -e "    1000:1.1.1.1:1000     listen :1000 → egress 1.1.1.1:1000"
+  echo -e "    443:444               listen :443  → default_dst:444"
+  echo -e "    2.2.2.2:1000=1000:1.1.1.1   bind IP + ports"
+  echo -e "    suffix /tcp or /udp for one protocol"
+  local rule default_dst
+  prompt rule "Rule" ""
+  [[ -z "$rule" ]] && return
+  if ! grep -q '^\[relay\]' "$cfg"; then
+    add_relay_section "$cfg" client
+  fi
+  sed -i "s/^enabled = false/enabled = true/" "$cfg"
+  sed -i "/^\[relay\]/,/^\[/ s/^default_dst = \"\"/default_dst = \"${REMOTE_IP:-}\"/" "$cfg" 2>/dev/null || true
+  if grep -q '^\[relay\]' "$cfg"; then
+    sed -i "/^rules.*=.*\[/a\\  \"${rule}\"," "$cfg"
+    ok "Relay rule added: $rule"
+  fi
+  if tunnel_is_running "$name" && confirm "Restart tunnel to apply"; then
+    require_root
+    tunnel_restart "$name" || true
+  fi
+}
+
 _manage_forward() {
   local name="$1"
   local cfg="${CONFIGS_DIR}/${name}.toml"
