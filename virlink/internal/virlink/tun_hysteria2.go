@@ -173,7 +173,7 @@ func (t *Hysteria2Tunnel) Up() error {
 		}
 	}
 
-	tun0 := t.tun.Fd0()
+	tun0 := t.tun.WriteFd()
 	if c.Mode == "server" {
 		go t.rxLoopServer(t.udpConn, tun0)
 		go t.txPollLoopServer(t.udpConn)

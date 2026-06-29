@@ -93,7 +93,7 @@ func (t *BipTunnel) Up() error {
 	t.done = make(chan struct{})
 
 	rawFd := t.rawFd
-	go t.rxLoop(rawFd, t.tun.Fd0())
+	go t.rxLoop(rawFd, t.tun.WriteFd())
 	go t.txPollLoop(rawFd)
 
 	done(dev, addr, peer,
@@ -163,6 +163,7 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 				t.lastSrc.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
 			}
 			statInc(statBIPRxRecv)
+			NoteTunnelAlive()
 			batch.add(inner)
 		}
 		if batch.len() >= bsz {

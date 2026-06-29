@@ -87,6 +87,23 @@ func (h *HealthMgr) markRx() {
 	h.rxCount.Add(1)
 }
 
+// NoteTunnelAlive marks the tunnel as alive based on wire traffic (not overlay UDP probes).
+// Overlay probes traverse stack→TUN→wire→TUN→stack and can fail independently of the
+// tunnel; marking alive on valid wire RX keeps hs=connected when data actually flows.
+func NoteTunnelAlive() {
+	if h := activeTunnelHealth.Load(); h != nil {
+		h.markRx()
+	}
+}
+
+var activeTunnelHealth atomic.Pointer[HealthMgr]
+
+// BindTunnelHealth registers the process health manager for wire-level keepalive.
+func BindTunnelHealth(h *HealthMgr) { activeTunnelHealth.Store(h) }
+
+// UnbindTunnelHealth clears the wire-level health binding on shutdown.
+func UnbindTunnelHealth() { activeTunnelHealth.Store(nil) }
+
 // LastSeenAge returns how long ago the last probe was received.
 // Returns -1 if no probe has ever been received.
 func (h *HealthMgr) LastSeenAge() time.Duration {

@@ -168,7 +168,7 @@ func (t *UdpObfsTunnel) Up() error {
 	// to signal cleanup, but goroutines hold their own ref so they never
 	// dereference a nil pointer — they simply get an error and check t.done.
 	gcm := t.gcm
-	go t.rxLoop(t.udpConn, t.tun.Fd0(), gcm, mask)
+	go t.rxLoop(t.udpConn, t.tun.WriteFd(), gcm, mask)
 	go t.txPollLoop(t.udpConn, gcm, mask, fixedPeer)
 
 	logOK(fmt.Sprintf("encrypt=AES-256-GCM  mask=%s  padding=%v", mask, c.Obfs.Padding))

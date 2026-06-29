@@ -53,6 +53,8 @@ func runDaemon(cfg *Config, tun Tunnel) int {
 	var hm *HealthMgr
 	if !cfg.Health.Disabled {
 		hm = NewHealthMgr(startedAt, ivDur)
+		BindTunnelHealth(hm)
+		defer UnbindTunnelHealth()
 		hm.Start(plainIP(tun.OverlayIP()), tun.PeerIP(), cfg.Health.Port, cfg.Health.HTTPPort, tun)
 	}
 

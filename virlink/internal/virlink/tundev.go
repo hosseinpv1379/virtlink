@@ -21,12 +21,20 @@ const (
 )
 
 // TunDev holds one or more TUN queue file descriptors.
+// writeFd is a blocking dup of queue 0 used only for wire→TUN injection (RX loops).
+// The TX poller sets the queue fds non-blocking for reads; sharing the same fd for
+// writes caused EAGAIN drops and unreliable POLLOUT polling on the TUN char device.
 type TunDev struct {
-	fds    []*os.File
-	queues int
+	fds     []*os.File
+	writeFd *os.File
+	queues  int
 }
 
 func (t *TunDev) Close() {
+	if t.writeFd != nil {
+		t.writeFd.Close()
+		t.writeFd = nil
+	}
 	for _, f := range t.fds {
 		if f != nil {
 			f.Close()
@@ -35,6 +43,14 @@ func (t *TunDev) Close() {
 }
 
 func (t *TunDev) Fd0() *os.File { return t.fds[0] }
+
+// WriteFd returns the blocking fd for injecting packets into the TUN (RX path).
+func (t *TunDev) WriteFd() *os.File {
+	if t.writeFd != nil {
+		return t.writeFd
+	}
+	return t.fds[0]
+}
 
 func (t *TunDev) QueueCount() int {
 	if t == nil {
@@ -86,6 +102,14 @@ func openTunMultiTry(name string, n int) (*TunDev, error) {
 		}
 		td.fds = append(td.fds, os.NewFile(uintptr(fd), fmt.Sprintf("%s-q%d", name, i)))
 	}
+	if len(td.fds) > 0 {
+		wfd, err := unix.Dup(int(td.fds[0].Fd()))
+		if err != nil {
+			td.Close()
+			return nil, fmt.Errorf("dup tun write fd: %w", err)
+		}
+		td.writeFd = os.NewFile(uintptr(wfd), name+"-write")
+	}
 	if l, err := netlink.LinkByName(name); err == nil {
 		_ = netlink.LinkSetTxQLen(l, perfTxQLen())
 	}
@@ -93,23 +117,11 @@ func openTunMultiTry(name string, n int) (*TunDev, error) {
 }
 
 func tunWrite(fd *os.File, pkt []byte) error {
-	return tunWriteOne(int(fd.Fd()), pkt)
-}
-
-// tunWriteOne injects one packet into the TUN device.
-//
-// The TX poller sets the TUN queue fds non-blocking (for reads), and the RX
-// loop writes to the same fd, so a write can return EAGAIN when the kernel's
-// TUN rx queue is momentarily full. Instead of dropping the packet (which left
-// the overlay with rx_write=0 and the handshake stuck on "waiting"), we wait
-// for the fd to become writable and retry. Empty packets are skipped so a
-// zero-length datagram never turns into a no-op "successful" write.
-func tunWriteOne(rawFd int, pkt []byte) error {
 	if len(pkt) == 0 {
 		return nil
 	}
-	pfd := []unix.PollFd{{Fd: int32(rawFd), Events: unix.POLLOUT}}
-	for attempt := 0; attempt < 1024; attempt++ {
+	rawFd := int(fd.Fd())
+	for {
 		_, err := unix.Write(rawFd, pkt)
 		if err == nil {
 			return nil
@@ -117,14 +129,8 @@ func tunWriteOne(rawFd int, pkt []byte) error {
 		if err == unix.EINTR {
 			continue
 		}
-		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-			// Wait up to 100 ms for the TUN to drain, then retry.
-			_, _ = unix.Poll(pfd, 100)
-			continue
-		}
 		return err
 	}
-	return unix.EAGAIN
 }
 
 // tunReadNB reads one packet from a non-blocking TUN fd.

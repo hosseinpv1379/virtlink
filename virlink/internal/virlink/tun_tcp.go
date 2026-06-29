@@ -85,7 +85,7 @@ func (t *TcpTunnel) Up() error {
 	addMSS(c, dev)
 	t.done = make(chan struct{})
 
-	tun0 := t.tun.Fd0()
+	tun0 := t.tun.WriteFd()
 	go t.txPollLoop()
 
 	streams := perfTcpStreams()

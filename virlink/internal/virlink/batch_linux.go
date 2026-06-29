@@ -153,9 +153,8 @@ func icmpWireCarrierType(pkt []byte, wireOn bool) byte {
 // with a brief sleep+retry so that transient kernel alloc_skb failures (GFP_ATOMIC
 // under memory pressure) do not silently drop received packets.
 func tunWritev(fd *os.File, bufs [][]byte) error {
-	rawFd := int(fd.Fd())
 	for _, buf := range bufs {
-		if err := tunWriteOne(rawFd, buf); err != nil {
+		if err := tunWrite(fd, buf); err != nil {
 			return err
 		}
 	}

@@ -104,11 +104,11 @@ func (t *UdpTunnel) Up() error {
 
 	if t.wire.on {
 		rawFd := t.rawFd
-		go t.rxLoopRaw(rawFd, t.tun.Fd0(), port)
+		go t.rxLoopRaw(rawFd, t.tun.WriteFd(), port)
 		go t.txPollLoopRaw(rawFd, port)
 	} else {
 		conn := t.udpConn
-		go t.rxLoop(conn, t.tun.Fd0())
+		go t.rxLoop(conn, t.tun.WriteFd())
 		go t.txPollLoop(conn)
 	}
 
@@ -194,6 +194,7 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 				t.lastRoute.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
 			}
 			statInc(statUDPRxRecv)
+			NoteTunnelAlive()
 			batch.add(payload)
 		}
 		if batch.len() >= bsz {
@@ -357,6 +358,7 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 				}
 			}
 			statInc(statUDPRxRecv)
+			NoteTunnelAlive()
 			batch.add(pkt)
 		}
 		if batch.len() >= bsz {
@@ -396,6 +398,7 @@ func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 			t.lastPeer.Store(src)
 		}
 		statInc(statUDPRxRecv)
+		NoteTunnelAlive()
 		if err := tunWrite(tun, buf[:n]); err != nil {
 			statInc(statUDPRxDropWrite)
 			if !t.stop.stopped() {

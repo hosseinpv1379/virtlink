@@ -114,7 +114,7 @@ func (t *IcmpTunnel) Up() error {
 	t.done = make(chan struct{})
 
 	rawFd := t.rawFd
-	go t.rxLoop(rawFd, t.tun.Fd0())
+	go t.rxLoop(rawFd, t.tun.WriteFd())
 	go t.txPollLoop(rawFd)
 
 	done(dev, addr, peer,
@@ -278,6 +278,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 				continue
 			}
 			statInc(statICMPRxRecv)
+			NoteTunnelAlive()
 			seq := binary.BigEndian.Uint16(icmp[6:8])
 			if t.dedup.dup(seq) {
 				statInc(statICMPRxDropSeq)
