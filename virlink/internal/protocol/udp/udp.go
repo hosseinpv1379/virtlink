@@ -115,8 +115,10 @@ func (t *UdpTunnel) Up() error {
 		go t.txPollLoopRaw(t.rawFd, port)
 	} else {
 		conn := t.udpConn
-		go t.rxLoop(conn, t.tun.Fd0())
-		go t.txPollLoop(conn)
+		// Plain UDP: ReadFromUDP/WriteToUDP — recvmmsg/sendmmsg batch path drops wire
+		// traffic on some hosts (rx_recv=0, hs=waiting). Keep this path for reliability.
+		go t.rxLoopBlocking(conn, t.tun.Fd0())
+		go t.txPollLoopUnbatched(conn)
 	}
 
 	platform.Done(dev, addr, peer,
@@ -516,23 +518,26 @@ func (t *UdpTunnel) wireDst() *net.UDPAddr {
 }
 
 func (t *UdpTunnel) txPollLoopUnbatched(conn *net.UDPConn) {
-	poller := platform.NewTunPoller(t.tun, &t.stop)
+	// RunOwned reads all TUN queues (like tcp); WriteToUDP avoids sendmmsg wire bugs.
+	poller := platform.NewTunPollerH(t.tun, &t.stop, 0)
 	defer poller.Close()
 
-	poller.Run(
+	poller.RunOwned(
 		func() { platform.StatInc(platform.StatUDPTxPoll) },
-		func(pkt []byte, n int) bool {
+		func(buf []byte, n int) bool {
 			platform.StatInc(platform.StatUDPTxRead)
 			dst := t.wireDst()
 			if dst == nil {
 				platform.StatInc(platform.StatUDPTxNoDst)
-				return true
+				platform.PutBuf(buf)
+				return !t.stop.Stopped()
 			}
-			if _, err := conn.WriteToUDP(pkt[:n], dst); err != nil && !t.stop.Stopped() {
+			if _, err := conn.WriteToUDP(buf[:n], dst); err != nil && !t.stop.Stopped() {
 				platform.LogDebug("udp tx: " + err.Error())
 			} else if err == nil {
 				platform.StatInc(platform.StatUDPTxSend)
 			}
+			platform.PutBuf(buf)
 			return !t.stop.Stopped()
 		},
 	)
