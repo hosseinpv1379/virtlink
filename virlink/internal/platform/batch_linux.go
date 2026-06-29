@@ -1,0 +1,315 @@
+//go:build linux
+
+// batch_linux.go — sendmmsg batching for ICMP TX (linux only).
+package platform
+
+import (
+	"net"
+	"os"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+const icmpBatchMax = maxPerfBatch
+
+type mmsghdr struct {
+	Hdr unix.Msghdr
+	Len uint32
+	_   [4]byte
+}
+
+func sendmmsg(fd int, msgs []mmsghdr) (int, error) {
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+	n, _, e := unix.Syscall6(unix.SYS_SENDMMSG,
+		uintptr(fd),
+		uintptr(unsafe.Pointer(&msgs[0])),
+		uintptr(len(msgs)), 0, 0, 0)
+	if e != 0 {
+		return 0, e
+	}
+	return int(n), nil
+}
+
+func recvmmsg(fd int, msgs []mmsghdr, flags int) (int, error) {
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+	n, _, e := unix.Syscall6(unix.SYS_RECVMMSG,
+		uintptr(fd),
+		uintptr(unsafe.Pointer(&msgs[0])),
+		uintptr(len(msgs)),
+		uintptr(flags), 0, 0)
+	if e != 0 {
+		return int(n), e
+	}
+	return int(n), nil
+}
+
+// RxMmsgBatch receives up to nbufs datagrams per recvmmsg syscall (wire/UDP RX).
+type RxMmsgBatch struct {
+	nbufs int
+	bufs  [icmpBatchMax][]byte
+	iovs  [icmpBatchMax]unix.Iovec
+	addrs [icmpBatchMax]unix.RawSockaddrInet4
+	msgs  [icmpBatchMax]mmsghdr
+}
+
+func (b *RxMmsgBatch) init(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > icmpBatchMax {
+		n = icmpBatchMax
+	}
+	b.nbufs = n
+	for i := 0; i < n; i++ {
+		if b.bufs[i] == nil {
+			b.bufs[i] = getBuf()
+		}
+		b.iovs[i].Base = &b.bufs[i][0]
+		b.iovs[i].Len = uint64(len(b.bufs[i]))
+		b.msgs[i].Hdr.Iov = &b.iovs[i]
+		b.msgs[i].Hdr.Iovlen = 1
+		b.msgs[i].Hdr.Name = (*byte)(unsafe.Pointer(&b.addrs[i]))
+		b.msgs[i].Hdr.Namelen = unix.SizeofSockaddrInet4
+		b.msgs[i].Len = 0
+	}
+}
+
+func (b *RxMmsgBatch) release() {
+	for i := 0; i < icmpBatchMax; i++ {
+		if b.bufs[i] != nil {
+			putBuf(b.bufs[i])
+			b.bufs[i] = nil
+		}
+	}
+}
+
+// recv drains up to nbufs packets with one recvmmsg (MSG_DONTWAIT).
+// msg_namelen must be reset before every recvmmsg — the kernel overwrites it
+// on return and subsequent receives fail silently if it is stale.
+func (b *RxMmsgBatch) recv(fd int) (int, error) {
+	for i := 0; i < b.nbufs; i++ {
+		b.msgs[i].Hdr.Namelen = unix.SizeofSockaddrInet4
+	}
+	return recvmmsg(fd, b.msgs[:b.nbufs], unix.MSG_DONTWAIT)
+}
+
+func (b *RxMmsgBatch) data(i int) []byte {
+	return b.bufs[i][:b.msgs[i].Len]
+}
+
+func (b *RxMmsgBatch) from4(i int) *unix.SockaddrInet4 {
+	p := b.addrs[i].Port
+	return &unix.SockaddrInet4{
+		Port: int(p>>8 | p<<8),
+		Addr: b.addrs[i].Addr,
+	}
+}
+
+// installICMPFilter drops all ICMP types except echo request (type 8) at the socket.
+func installICMPFilter(fd int) error {
+	var filter [32]byte // 256 types
+	for t := 0; t < 256; t++ {
+		if t != icmpEchoReq {
+			filter[t/8] |= 1 << (t % 8)
+		}
+	}
+	return unix.SetsockoptString(fd, unix.IPPROTO_ICMP, unix.ICMP_FILTER, string(filter[:]))
+}
+
+// icmpWireCarrierType returns the ICMP type byte for a raw RX buffer, or 255 if unknown.
+func icmpWireCarrierType(pkt []byte, wireOn bool) byte {
+	pkt = trimIPv4Packet(pkt)
+	icmp, ok := parseIcmpWirePacket(pkt, wireOn)
+	if !ok || len(icmp) == 0 {
+		return 255
+	}
+	return icmp[0]
+}
+
+// tunWritev writes each buffer as a separate packet to the TUN device.
+//
+// CRITICAL: TUN requires one write() syscall per IP packet. writev() concatenates
+// all iovecs into a single data stream that TUN treats as ONE packet. Sending
+// N packets via a single writev() produces one oversized, invalid "packet" that
+// the kernel's IP stack silently discards — causing catastrophic packet loss
+// whenever two or more packets arrive together (i.e. any time bandwidth > ~1 pps).
+//
+// Each packet must be written with its own write() call. The syscall overhead is
+// negligible: at 100 Mbps / 1320-byte MTU = ~9500 pkt/s × 200 ns ≈ 0.2% CPU.
+//
+// We use unix.Write directly (not fd.Write) because the TUN fd is set to
+// O_NONBLOCK by the TX poller. Go's *os.File.Write on a non-pollable fd (TUN is
+// a character device, not a network socket — not registered in Go's netpoller)
+// returns EAGAIN immediately without retry. unix.Write lets us handle EAGAIN
+// with a brief sleep+retry so that transient kernel alloc_skb failures (GFP_ATOMIC
+// under memory pressure) do not silently drop received packets.
+func tunWritev(fd *os.File, bufs [][]byte) error {
+	rawFd := int(fd.Fd())
+	for _, buf := range bufs {
+		const maxRetries = 32
+		for i := 0; ; i++ {
+			_, err := unix.Write(rawFd, buf)
+			if err == nil {
+				break
+			}
+			if err == unix.EINTR {
+				continue
+			}
+			if (err == unix.EAGAIN || err == unix.EWOULDBLOCK) && i < maxRetries {
+				// Transient: kernel alloc_skb failed with GFP_ATOMIC.
+				// Sleep 1 ms to allow memory reclaim then retry.
+				unix.Nanosleep(&unix.Timespec{Nsec: 1_000_000}, nil)
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// tunRxBatch accumulates inbound (wire → TUN) packets so a burst of datagrams
+// drained from one rx loop iteration costs one tunWritev instead of one
+// Write per packet. Payloads are copied into pooled buffers since the rx
+// loop's read buffer is reused for the next recvfrom before the batch flushes.
+type tunRxBatch struct {
+	bufs   [][]byte
+	pooled [][]byte
+}
+
+// newTunRxBatch pre-allocates slice backing arrays sized to cap so the first
+// append in a burst loop does not trigger a runtime growth allocation.
+func newTunRxBatch(cap int) tunRxBatch {
+	return tunRxBatch{
+		bufs:   make([][]byte, 0, cap),
+		pooled: make([][]byte, 0, cap),
+	}
+}
+
+func (b *tunRxBatch) add(payload []byte) {
+	frame := getBuf()
+	n := copy(frame, payload)
+	b.bufs = append(b.bufs, frame[:n])
+	b.pooled = append(b.pooled, frame)
+}
+
+// addOwned takes ownership of frame (already filled); avoids an extra copy on TCP RX.
+func (b *tunRxBatch) addOwned(frame []byte, n int) {
+	b.bufs = append(b.bufs, frame[:n])
+	b.pooled = append(b.pooled, frame)
+}
+
+func (b *tunRxBatch) len() int { return len(b.bufs) }
+
+// flush writes the batch in one tunWritev call and returns the packet count
+// that was flushed (0 if the batch was already empty).
+func (b *tunRxBatch) flush(tun *os.File) (int, error) {
+	n := len(b.bufs)
+	if n == 0 {
+		return 0, nil
+	}
+	err := tunWritev(tun, b.bufs)
+	for _, p := range b.pooled {
+		putBuf(p)
+	}
+	b.bufs = b.bufs[:0]
+	b.pooled = b.pooled[:0]
+	return n, err
+}
+
+// icmpTxBatch holds up to icmpBatchMax frames ready for sendmmsg.
+type icmpTxBatch struct {
+	n      int
+	frames [icmpBatchMax][]byte
+	lens   [icmpBatchMax]int
+	ports  [icmpBatchMax]uint16 // host order; 0 for raw IP sockets
+	iovs   [icmpBatchMax]unix.Iovec
+	addrs  [icmpBatchMax]unix.RawSockaddrInet4
+	msgs   [icmpBatchMax]mmsghdr
+}
+
+func (b *icmpTxBatch) reset() { b.n = 0 }
+
+func (b *icmpTxBatch) add(frame []byte, pktLen int, dst [4]byte, port uint16) {
+	i := b.n
+	b.frames[i] = frame
+	b.lens[i] = pktLen
+	b.ports[i] = port
+	portBE := port
+	if port != 0 {
+		portBE = (port << 8) | (port >> 8)
+	}
+	b.addrs[i] = unix.RawSockaddrInet4{Family: unix.AF_INET, Port: portBE, Addr: dst}
+	b.iovs[i].Base = &frame[0]
+	b.iovs[i].Len = uint64(pktLen)
+	b.msgs[i].Hdr.Name = (*byte)(unsafe.Pointer(&b.addrs[i]))
+	b.msgs[i].Hdr.Namelen = unix.SizeofSockaddrInet4
+	b.msgs[i].Hdr.Iov = &b.iovs[i]
+	b.msgs[i].Hdr.Iovlen = 1
+	b.n++
+}
+
+// mmsgSendBatch sends batched raw/UDP frames via sendmmsg; falls back to Sendto per packet.
+// Returns the number of packets that failed to send.
+func mmsgSendBatch(rawFd int, b *icmpTxBatch) int {
+	if b.n == 0 {
+		return 0
+	}
+	errs := 0
+	sent, err := sendmmsg(rawFd, b.msgs[:b.n])
+	if err != nil && sent <= 0 {
+		sent = 0
+	}
+	for i := sent; i < b.n; i++ {
+		sa := &unix.SockaddrInet4{Addr: b.addrs[i].Addr}
+		if p := b.ports[i]; p != 0 {
+			sa.Port = int(p)
+		}
+		if e := unix.Sendto(rawFd, b.frames[i][:b.lens[i]], 0, sa); e != nil && e != unix.EAGAIN {
+			errs++
+		}
+	}
+	return errs
+}
+
+// icmpSendBatch is an alias for mmsgSendBatch (ICMP TX path).
+func icmpSendBatch(rawFd int, b *icmpTxBatch) int { return mmsgSendBatch(rawFd, b) }
+
+// tuneTCPConnForce sets TCP socket buffers using SO_RCVBUFFORCE / SO_SNDBUFFORCE,
+// which bypass net.core.rmem_max / wmem_max (require CAP_NET_ADMIN / root).
+// Falls back to the regular SO_RCVBUF / SO_SNDBUF on EPERM.
+//
+// TCP_NOTSENT_LOWAT is the critical setting for TCP-over-TCP tunnels.
+// Without it the kernel accepts up to SO_SNDBUF (e.g. 8 MB) regardless of
+// whether the outer TCP has transmitted it yet. The inner TCP then sees
+// RTT = buffer_size / wire_bandwidth and hammers RTO retransmits.
+// With 64 KB the queuing delay is ≤ 64 KB / wire_bandwidth:
+//   • 100 Mbps wire →   5 ms extra RTT  (negligible)
+//   •  10 Mbps wire →  51 ms extra RTT  (acceptable)
+//   •   5 Mbps wire → 102 ms extra RTT  (manageable)
+// 64 KB = ~4 × BDP at 5 Mbps / 100 ms RTT, enough to keep the wire full.
+const tcpNotSentLowat = 64 * 1024
+
+func tuneTCPConnForce(tc *net.TCPConn) {
+	sc, err := tc.SyscallConn()
+	if err != nil {
+		_ = tc.SetReadBuffer(perfSockBuf())
+		_ = tc.SetWriteBuffer(perfSockBuf())
+		return
+	}
+	bufSize := perfSockBuf()
+	_ = sc.Control(func(fd uintptr) {
+		if e := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, bufSize); e != nil {
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, bufSize)
+		}
+		if e := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, bufSize); e != nil {
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, bufSize)
+		}
+		// Limit unsent-data queue to prevent bufferbloat in TCP-over-TCP tunnels.
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, tcpNotSentLowat)
+	})
+}

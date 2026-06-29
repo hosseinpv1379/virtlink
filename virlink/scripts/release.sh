@@ -12,8 +12,8 @@ VERSION="${1:?Usage: $0 vX.Y.Z [release notes]}"
 NOTES="${2:-Release ${VERSION}}"
 
 TAG="${VERSION#v}"
-if ! grep -q "const version = \"${TAG}\"" internal/virlink/cli.go; then
-  echo "error: internal/virlink/cli.go version does not match ${TAG}" >&2
+if ! grep -q "const version = \"${TAG}\"" internal/app/cli.go; then
+  echo "error: internal/app/cli.go version does not match ${TAG}" >&2
   exit 1
 fi
 
