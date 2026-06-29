@@ -118,9 +118,10 @@ func initUserspacePerfDefaults(c *config.Config) {
 		perf.pollMs = 3
 	case "udp-obfs":
 		perf.sockBuf = 32 << 20
-		perf.tunQueues = clampInt(userspaceCPU(), 2, 4)
+		perf.tunQueues = 1
 		perf.batchSize = 64
-		perf.pollMs = 10
+		perf.pollMs = 3
+		perf.tcpStreams = 1
 	case "openvpn", "openvpnmultu":
 		perf.tunQueues = 1
 		perf.sockBuf = defSockBufMB << 20

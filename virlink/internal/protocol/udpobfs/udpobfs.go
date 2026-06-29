@@ -34,7 +34,6 @@ import (
 	"sync/atomic"
 
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
 
 const obfsSubnet = "10.20.20.0/24"
@@ -167,11 +166,10 @@ func (t *UdpObfsTunnel) Up() error {
 	}
 
 	// ── goroutines ────────────────────────────────────────────────────────────
-	// Capture local references NOW. doClean() will nil out t.udpConn / t.tunFd
-	// to signal cleanup, but goroutines hold their own ref so they never
-	// dereference a nil pointer — they simply get an error and check t.done.
+	// ReadFromUDP RX + batched WriteToUDP TX (recvmmsg/sendmmsg on *net.UDPConn
+	// is unreliable on some kernels — same fix as plain UDP tunnel).
 	gcm := t.gcm
-	go t.rxLoop(t.udpConn, t.tun.Fd0(), gcm, mask)
+	go t.rxLoopBlocking(t.udpConn, t.tun.Fd0(), gcm, mask)
 	go t.txPollLoop(t.udpConn, gcm, mask, fixedPeer)
 
 	platform.LogOK(fmt.Sprintf("encrypt=AES-256-GCM  mask=%s  padding=%v", mask, c.Obfs.Padding))
@@ -185,25 +183,13 @@ func (t *UdpObfsTunnel) Up() error {
 	return nil
 }
 
-// rxLoop: UDP → decrypt → TUN (recvmmsg + tunWritev batching).
-func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD, mask string) {
-	rawFd, err := platform.UdpConnFD(conn)
-	if err != nil {
-		t.rxLoopBlocking(conn, tun, gcm, mask)
-		return
-	}
-	_ = unix.SetNonblock(rawFd, true)
-
-	var rb platform.RxMmsgBatch
-	rb.Init(platform.PerfBatchSize())
-	defer rb.Release()
+// rxLoopBlocking: UDP → decrypt → TUN (ReadFromUDP + batched tunWrite).
+func (t *UdpObfsTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD, mask string) {
+	buf := platform.GetBuf()
+	defer platform.PutBuf(buf)
 
 	bsz := platform.PerfBatchSize()
-	pollMs := platform.PerfPollMs()
-	idleMs := pollMs
 	batch := platform.NewTunRxBatch(bsz)
-	var lastPeerAddr [4]byte
-	var lastPeerPort uint16
 
 	flush := func() {
 		n, err := batch.Flush(tun)
@@ -217,52 +203,6 @@ func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD,
 	defer flush()
 
 	for {
-		got, err := rb.Recv(rawFd)
-		if got == 0 {
-			if t.stop.Stopped() {
-				return
-			}
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == nil {
-				flush()
-				_ = platform.PollFD(rawFd, unix.POLLIN, idleMs)
-				idleMs = platform.IdleBackoff(idleMs, pollMs)
-				continue
-			}
-			if err == unix.EINTR {
-				continue
-			}
-			continue
-		}
-		idleMs = pollMs
-		for i := 0; i < got; i++ {
-			pkt := rb.Data(i)
-			sa := rb.From4(i)
-			plain, derr := obfsDecrypt(pkt, gcm, mask, t.cfg.Obfs.Padding)
-			if derr != nil {
-				platform.LogDebug(fmt.Sprintf("rx from %v: %v", sa, derr))
-				continue
-			}
-			saPort := uint16(sa.Port>>8) | uint16(sa.Port<<8)
-			if sa.Addr != lastPeerAddr || saPort != lastPeerPort {
-				lastPeerAddr = sa.Addr
-				lastPeerPort = saPort
-				t.lastPeer.Store(&net.UDPAddr{
-					IP:   net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]),
-					Port: int(saPort),
-				})
-			}
-			batch.Add(plain)
-		}
-		if batch.Len() >= bsz {
-			flush()
-		}
-	}
-}
-
-func (t *UdpObfsTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD, mask string) {
-	buf := platform.GetBuf()
-	defer platform.PutBuf(buf)
-	for {
 		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if t.stop.Stopped() {
@@ -270,119 +210,83 @@ func (t *UdpObfsTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File, gcm ciph
 			}
 			continue
 		}
-		pkt, err := obfsDecrypt(buf[:n], gcm, mask, t.cfg.Obfs.Padding)
-		if err != nil {
-			platform.LogDebug(fmt.Sprintf("rx from %s: %v", src, err))
+		pkt, derr := obfsDecrypt(buf[:n], gcm, mask, t.cfg.Obfs.Padding)
+		if derr != nil {
+			platform.LogDebug(fmt.Sprintf("rx from %s: %v", src, derr))
 			continue
 		}
 		t.lastPeer.Store(src)
-		if err := platform.TunWrite(tun, pkt); err != nil && !t.stop.Stopped() {
-			platform.LogWarn("tun write: " + err.Error())
+		batch.Add(pkt)
+		if batch.Len() >= bsz {
+			flush()
 		}
 	}
 }
 
 func (t *UdpObfsTunnel) txPollLoop(conn *net.UDPConn, gcm cipher.AEAD, mask string, fixed *net.UDPAddr) {
-	rawFd, err := platform.UdpConnFD(conn)
-	if err != nil {
-		t.txPollLoopUnbatched(conn, gcm, mask, fixed)
-		return
-	}
-
 	poller := platform.NewTunPoller(t.tun, &t.stop)
 	defer poller.Close()
 
-	var batch platform.IcmpTxBatch
 	bsz := platform.PerfBatchSize()
-	var curDst [4]byte
-	var curPort uint16
-	var haveDst bool
+	var curDst *net.UDPAddr
+	var frames [][]byte
+	var lens []int
 
 	flush := func() {
-		if batch.N() == 0 {
+		if len(frames) == 0 || curDst == nil {
 			return
 		}
-		if nerr := platform.MmsgSendBatch(rawFd, &batch); nerr > 0 {
-			platform.LogDebug(fmt.Sprintf("obfs tx batch: %d failed", nerr))
+		for i, fb := range frames {
+			if _, err := conn.WriteToUDP(fb[:lens[i]], curDst); err != nil && !t.stop.Stopped() {
+				platform.LogDebug("obfs tx: " + err.Error())
+			}
+			platform.PutBuf(fb)
 		}
-		for i := 0; i < batch.N(); i++ {
-			platform.PutBuf(batch.Frame(i))
-			batch.SetFrame(i, nil)
-		}
-		batch.Reset()
-		haveDst = false
+		frames = frames[:0]
+		lens = lens[:0]
+		curDst = nil
 	}
 
-	addPkt := func(dst [4]byte, port uint16, payload []byte) {
-		if haveDst && (dst != curDst || port != curPort) {
-			flush()
+	resolveDst := func() *net.UDPAddr {
+		if fixed != nil {
+			return fixed
 		}
-		curDst = dst
-		curPort = port
-		haveDst = true
-		frameBuf := platform.GetBuf()
-		frame, encErr := obfsEncrypt(frameBuf, payload, gcm, mask, t.cfg.Obfs.Padding)
-		if encErr != nil {
-			platform.PutBuf(frameBuf)
-			return
+		if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
+			return p
 		}
-		batch.Add(frameBuf, len(frame), dst, port)
-		if batch.N() >= bsz {
-			flush()
-		}
+		return nil
 	}
 
 	poller.Run(
 		func() {
-			if batch.N() > 0 {
+			if len(frames) > 0 {
 				flush()
 			}
 		},
 		func(pkt []byte, n int) bool {
-			var dst [4]byte
-			var port uint16
-			if fixed != nil {
-				copy(dst[:], fixed.IP.To4())
-				port = uint16(fixed.Port)
-			} else if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
-				copy(dst[:], p.IP.To4())
-				port = uint16(p.Port)
-			} else {
+			dst := resolveDst()
+			if dst == nil {
 				return true
 			}
-			addPkt(dst, port, pkt[:n])
+			if curDst != nil && (curDst.IP.String() != dst.IP.String() || curDst.Port != dst.Port) {
+				flush()
+			}
+			curDst = dst
+			frameBuf := platform.GetBuf()
+			frame, encErr := obfsEncrypt(frameBuf, pkt[:n], gcm, mask, t.cfg.Obfs.Padding)
+			if encErr != nil {
+				platform.PutBuf(frameBuf)
+				return true
+			}
+			frames = append(frames, frameBuf)
+			lens = append(lens, len(frame))
+			if len(frames) >= bsz {
+				flush()
+			}
 			return !t.stop.Stopped()
 		},
 	)
 	flush()
-}
-
-func (t *UdpObfsTunnel) txPollLoopUnbatched(conn *net.UDPConn, gcm cipher.AEAD, mask string, fixed *net.UDPAddr) {
-	poller := platform.NewTunPoller(t.tun, &t.stop)
-	defer poller.Close()
-
-	poller.Run(nil, func(pkt []byte, n int) bool {
-		frameBuf := platform.GetBuf()
-		frame, err := obfsEncrypt(frameBuf, pkt[:n], gcm, mask, t.cfg.Obfs.Padding)
-		if err != nil {
-			platform.PutBuf(frameBuf)
-			return true
-		}
-		dst := fixed
-		if dst == nil {
-			if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
-				dst = p
-			} else {
-				platform.PutBuf(frameBuf)
-				return true
-			}
-		}
-		if _, err := conn.WriteToUDP(frame, dst); err != nil && !t.stop.Stopped() {
-			platform.LogDebug("obfs tx: " + err.Error())
-		}
-		platform.PutBuf(frameBuf)
-		return !t.stop.Stopped()
-	})
 }
 
 func (t *UdpObfsTunnel) Down() error {

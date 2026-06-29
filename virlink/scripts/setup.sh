@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # virlink — kernel & userspace tunnel manager  (setup & management)
 # Public install: https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh
-set -euo pipefail
+#
+# Safety flags:
+#   -E  ERR trap is inherited by functions, command substitutions and subshells
+#   -e  exit immediately on an unguarded command failure
+#   -u  treat unset variables as an error
+#   -o pipefail  a pipeline fails if any stage fails
+set -Eeuo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.6.8"
+SCRIPT_VERSION="1.7.0"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@mioopython"
 AUTHOR="Hossein"
@@ -39,46 +45,134 @@ readonly -a USERSPACE_TUNNEL_KEYS=(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# UI — colors & formatting
+# UI — colors, icons & formatting
 # ══════════════════════════════════════════════════════════════════════════════
-R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
-B='\033[0;34m' C='\033[0;36m' W='\033[1;37m'
-DIM='\033[2m' BOLD='\033[1m' NC='\033[0m'
+# Colors are enabled only when output is attached to a terminal and NO_COLOR is
+# unset, so redirected/piped output stays clean and machine-parseable.
+if [[ -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]] && { [[ -t 1 ]] || [[ -e /dev/tty ]]; }; then
+  R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'
+  B='\033[0;34m'; C='\033[0;36m'; W='\033[1;37m'
+  DIM='\033[2m';  BOLD='\033[1m';  NC='\033[0m'
+else
+  R=''; G=''; Y=''; B=''; C=''; W=''; DIM=''; BOLD=''; NC=''
+fi
+
+# Status icons — consistent two-space gutter across the whole installer.
+ICON_INFO="ℹ"; ICON_OK="✔"; ICON_WARN="⚠"; ICON_ERR="✖"; ICON_STEP="→"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# I/O helpers
+# Logging primitives
 # ══════════════════════════════════════════════════════════════════════════════
-tty_out()  { printf '%b'   "$@" > /dev/tty; }
-tty_line() { printf '%b\n' "$@" > /dev/tty; }
-
-info()  { echo -e "  ${C}→${NC} $*"; }
-ok()    { echo -e "  ${G}✓${NC} $*"; }
-warn()  { echo -e "  ${Y}⚠${NC} $*"; }
-err()   { echo -e "  ${R}✗${NC} $*" >&2; }
+info()  { echo -e "  ${C}${ICON_INFO}${NC} $*"; }
+ok()    { echo -e "  ${G}${ICON_OK}${NC} $*"; }
+warn()  { echo -e "  ${Y}${ICON_WARN}${NC} $*"; }
+err()   { echo -e "  ${R}${ICON_ERR}${NC} $*" >&2; }
+step()  { echo -e "  ${C}${ICON_STEP}${NC} $*"; }
 die()   { err "$*"; exit 1; }
 blank() { echo; }
 
 vinfo() { [[ "$SCRIPT_VERBOSE" == 1 ]] && info "$@"; }
-vrun()  { [[ "$SCRIPT_VERBOSE" == 1 ]] && info "→ $*"; "$@"; }
+vrun()  { [[ "$SCRIPT_VERBOSE" == 1 ]] && step "$*"; "$@"; }
 
-sep()   { echo -e "${DIM}══════════════════════════════════════════════════${NC}"; }
+sep()      { echo -e "${DIM}══════════════════════════════════════════════════${NC}"; }
 sep_thin() { echo -e "${DIM}────────────────────────────────────────────────${NC}"; }
 
-confirm() {
-  tty_out "  ${W}?${NC} $1 [y/N]: "
-  read -r ans < /dev/tty
-  [[ "${ans,,}" == "y" ]]
+# ══════════════════════════════════════════════════════════════════════════════
+# Error handling & diagnostics
+# ══════════════════════════════════════════════════════════════════════════════
+# Any unguarded failure (thanks to `set -Eeuo pipefail`) is routed here with the
+# failing command, line number and a call stack so problems are easy to triage.
+_on_err() {
+  local rc=$? line="${1:-?}" cmd="${2:-?}"
+  # Respect errexit state: stay silent inside intentional `set +e` regions.
+  # (Older bash, e.g. 3.2, fires ERR even when errexit is disabled.)
+  [[ "$-" == *e* ]] || return 0
+  set +x
+  tput cnorm 2>/dev/null || true
+  {
+    echo
+    echo -e "  ${R}${ICON_ERR} Unexpected failure${NC} ${DIM}(exit ${rc})${NC}"
+    echo -e "     ${DIM}command:${NC} ${cmd}"
+    echo -e "     ${DIM}at line:${NC} ${line}"
+    if (( ${#FUNCNAME[@]} > 1 )); then
+      echo -e "     ${DIM}stack:${NC}   ${FUNCNAME[*]:1}"
+    fi
+    echo -e "     ${DIM}Re-run with ${W}-x${NC}${DIM} for a full execution trace.${NC}"
+  } >&2
+  exit "$rc"
 }
 
+# Restore the cursor on any exit (the spinner may have hidden it).
+_on_exit() { tput cnorm 2>/dev/null || true; }
+
+trap '_on_err "$LINENO" "$BASH_COMMAND"' ERR
+trap '_on_exit' EXIT
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Spinner — clean feedback for long-running operations
+# ══════════════════════════════════════════════════════════════════════════════
+# Usage: with_spinner "message" command [args...]
+# On a TTY it animates a spinner while the command runs, hides the command's
+# output, and reveals it only if the command fails. On a non-TTY (or in debug
+# mode) it runs the command verbatim so logs and traces are preserved.
+with_spinner() {
+  local msg="$1"; shift
+  if [[ ! -t 1 || "${SCRIPT_DEBUG:-0}" == 1 ]]; then
+    step "$msg"
+    "$@"
+    return $?
+  fi
+
+  local tmp; tmp="$(mktemp 2>/dev/null || echo "/tmp/virlink.spin.$$")"
+  local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) rc=0 i=0 pid
+
+  # Reset errexit/ERR inside the worker so handled failures don't double-report.
+  ( set +e; trap - ERR; "$@" ) >"$tmp" 2>&1 &
+  pid=$!
+
+  tput civis 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %b%s%b %s' "$C" "${frames[i % ${#frames[@]}]}" "$NC" "$msg"
+    i=$(( i + 1 ))
+    sleep 0.1
+  done
+  if wait "$pid"; then rc=0; else rc=$?; fi
+  tput cnorm 2>/dev/null || true
+  printf '\r\033[K'
+
+  if (( rc == 0 )); then
+    ok "$msg"
+  else
+    err "${msg} ${DIM}(exit ${rc})${NC}"
+    sed 's/^/     /' "$tmp" >&2 || true
+  fi
+  rm -f "$tmp"
+  return "$rc"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# I/O helpers — prompts & interactive selection
+# ══════════════════════════════════════════════════════════════════════════════
+tty_out()  { printf '%b'   "$@" > /dev/tty; }
+tty_line() { printf '%b\n' "$@" > /dev/tty; }
+
+# Yes/No confirmation — defaults to "No" and tolerates EOF (Ctrl+D).
+confirm() {
+  tty_out "  ${W}?${NC} $1 ${DIM}[y/N]${NC}: "
+  local ans=""
+  read -r ans < /dev/tty || ans=""
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+}
+
+# Free-text prompt with an optional default value.
 prompt() {
-  local var="$1" msg="$2" def="${3:-}"
+  local var="$1" msg="$2" def="${3:-}" val=""
   if [[ -n "$def" ]]; then
     tty_out "  ${W}?${NC} $msg ${DIM}[$def]${NC}: "
   else
     tty_out "  ${W}?${NC} $msg: "
   fi
-  local val
-  read -r val < /dev/tty
+  read -r val < /dev/tty || val=""
   if [[ -z "$val" && -n "$def" ]]; then
     printf -v "$var" '%s' "$def"
   else
@@ -86,27 +180,26 @@ prompt() {
   fi
 }
 
+# Numbered single-choice menu; loops until a valid choice is entered.
 pick() {
   local var="$1"; shift
   local title="$1"; shift
-  local opts=("$@")
+  local opts=("$@") i n
   tty_line
   tty_line "  ${W}${title}${NC}"
   tty_line "${DIM}────────────────────────────────────────────────${NC}"
-  local i
   for i in "${!opts[@]}"; do
     tty_out "    ${C}$(printf '%2d' $((i+1)))${NC}  ${opts[$i]}\n"
   done
   tty_line
-  local n
   while true; do
     tty_out "  ${W}?${NC} Choose [1-${#opts[@]}]: "
-    read -r n < /dev/tty
+    read -r n < /dev/tty || die "No input received (EOF)."
     if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#opts[@]} )); then
       printf -v "$var" '%s' "${opts[$((n-1))]}"
-      return
+      return 0
     fi
-    tty_line "  ${Y}⚠${NC} Invalid choice, try again."
+    tty_line "  ${Y}${ICON_WARN}${NC} Invalid choice, try again."
   done
 }
 
@@ -138,6 +231,40 @@ press_enter() {
 # ══════════════════════════════════════════════════════════════════════════════
 # System info helpers
 # ══════════════════════════════════════════════════════════════════════════════
+# Normalized CPU architecture (amd64, arm64, armv7, 386, ...) — used to pick the
+# right release artifact when downloading third-party binaries.
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)  echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    armv7l|armv7)  echo armv7 ;;
+    armv6l)        echo armv6 ;;
+    i386|i686)     echo 386 ;;
+    *)             uname -m ;;
+  esac
+}
+
+# Kernel/OS family in lower case (linux, darwin, ...).
+detect_os() { uname -s | tr '[:upper:]' '[:lower:]'; }
+
+# Distribution id from /etc/os-release (debian, ubuntu, centos, alpine, ...).
+detect_distro() {
+  if [[ -r /etc/os-release ]]; then
+    ( set +e; . /etc/os-release 2>/dev/null; printf '%s\n' "${ID:-unknown}" )
+  else
+    echo unknown
+  fi
+}
+
+# Human-friendly OS label for the banner.
+os_pretty_name() {
+  if [[ -r /etc/os-release ]]; then
+    ( set +e; . /etc/os-release 2>/dev/null; printf '%s\n' "${PRETTY_NAME:-${NAME:-Linux}}" )
+  else
+    detect_os
+  fi
+}
+
 core_version() {
   local ver
   ver=$("$VIRLINK_BIN" --version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
@@ -246,6 +373,7 @@ show_banner() {
   echo -e "  ${DIM}IP Address:${NC}       ${W}${ip}${NC}"
   echo -e "  ${DIM}Location:${NC}         ${geo_loc}"
   echo -e "  ${DIM}Datacenter:${NC}       ${geo_dc}"
+  echo -e "  ${DIM}OS / Arch:${NC}        ${W}$(os_pretty_name)${NC} ${DIM}($(detect_arch))${NC}"
   echo -e "  ${DIM}Virtlink Core:${NC}    ${core_state}"
   sep
 
@@ -262,10 +390,10 @@ header() { show_banner; }
 # Download & install
 # ══════════════════════════════════════════════════════════════════════════════
 safe_download() {
-  local url="$1" dest="$2"
-  local tmp
+  local url="$1" dest="$2" tmp
   tmp=$(mktemp /tmp/virlink.XXXXXX) || die "mktemp failed"
-  if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 "$url" -o "$tmp"; then
+  if ! with_spinner "Downloading $(basename "$dest")" \
+       curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 "$url" -o "$tmp"; then
     rm -f "$tmp"
     die "Download failed: $url"
   fi
@@ -509,25 +637,31 @@ _pkg_install() {
     esac
   fi
 
-  info "Installing: ${seen[*]} (${mgr})..."
+  info "Installing via ${mgr}: ${seen[*]}"
   case "$mgr" in
     apt)
-      DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+      with_spinner "Refreshing apt package index" \
+        env DEBIAN_FRONTEND=noninteractive apt-get update -qq \
         || die "apt-get update failed"
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${seen[@]}" \
+      with_spinner "Installing ${seen[*]}" \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${seen[@]}" \
         || die "apt-get install failed for: ${seen[*]}"
       ;;
     dnf)
-      dnf install -y "${seen[@]}" || die "dnf install failed for: ${seen[*]}"
+      with_spinner "Installing ${seen[*]}" \
+        dnf install -y "${seen[@]}" || die "dnf install failed for: ${seen[*]}"
       ;;
     yum)
-      yum install -y "${seen[@]}" || die "yum install failed for: ${seen[*]}"
+      with_spinner "Installing ${seen[*]}" \
+        yum install -y "${seen[@]}" || die "yum install failed for: ${seen[*]}"
       ;;
     apk)
-      apk add --no-cache "${seen[@]}" || die "apk add failed for: ${seen[*]}"
+      with_spinner "Installing ${seen[*]}" \
+        apk add --no-cache "${seen[@]}" || die "apk add failed for: ${seen[*]}"
       ;;
     zypper)
-      zypper --non-interactive install -y "${seen[@]}" \
+      with_spinner "Installing ${seen[*]}" \
+        zypper --non-interactive install -y "${seen[@]}" \
         || die "zypper install failed for: ${seen[*]}"
       ;;
   esac
@@ -649,12 +783,11 @@ ensure_hysteria2_deps() {
   fi
   require_root
   ensure_cmd curl
-  local arch="" os="linux" ver url dest="/usr/local/bin/hysteria"
-  case "$(uname -m)" in
-    x86_64|amd64) arch="amd64" ;;
-    aarch64|arm64) arch="arm64" ;;
-    *) die "Unsupported CPU for Hysteria2: $(uname -m)" ;;
-  esac
+  local arch os ver url dest="/usr/local/bin/hysteria"
+  os="$(detect_os)"
+  arch="$(detect_arch)"
+  [[ "$arch" == "amd64" || "$arch" == "arm64" ]] \
+    || die "Unsupported CPU for Hysteria2: $(uname -m)"
   ver=$(curl -fsSL --connect-timeout 8 --max-time 15 \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
@@ -1278,6 +1411,325 @@ _userspace_tcp_streams() {
   echo "$n"
 }
 
+# ── Performance tuning wizard ───────────────────────────────────────────────────
+# Globals set by collect_tuning_inputs (written into config [tuning]).
+TUNING_MODE=""
+TUNING_SOCK_BUF_MB=""
+TUNING_TUN_QUEUES=""
+TUNING_BATCH_SIZE=""
+TUNING_POLL_MS=""
+TUNING_TX_QUEUE_LEN=""
+TUNING_TCP_STREAMS=""
+TUNING_CHANNEL_SIZE=""
+TUNING_PROFILE=""
+TUNING_PROFILE_INTERVAL=""
+TUNING_MULTIPATH="false"
+
+_detect_cpu_cores() {
+  local n
+  n=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
+  (( n < 1 )) && n=1
+  echo "$n"
+}
+
+_detect_ram_mb() {
+  local kb
+  kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 2097152)
+  echo $(( kb / 1024 ))
+}
+
+_tuning_host_class() {
+  local cpu ram
+  cpu=$(_detect_cpu_cores)
+  ram=$(_detect_ram_mb)
+  if (( cpu <= 2 && ram <= 2048 )); then
+    echo small
+  elif (( cpu <= 4 && ram <= 8192 )); then
+    echo medium
+  else
+    echo large
+  fi
+}
+
+_tuning_proto_family() {
+  case "$1" in
+    icmp|udp|bip|hysteria2) echo userspace ;;
+    tcp|tcpmux)             echo tcp ;;
+    udp-obfs)               echo obfs ;;
+    openvpn|openvpnmultu|wireguard|amneziawg) echo vpn ;;
+    *)                      echo kernel ;;
+  esac
+}
+
+_tuning_clamp() {
+  local v="$1" lo="$2" hi="$3"
+  (( v < lo )) && v=$lo
+  (( v > hi )) && v=$hi
+  echo "$v"
+}
+
+prompt_int() {
+  local var="$1" msg="$2" def="$3" lo="$4" hi="$5"
+  local val
+  while true; do
+    prompt val "$msg" "$def"
+    val="${val//[^0-9]/}"
+    [[ -z "$val" ]] && val="$def"
+    if (( val >= lo && val <= hi )); then
+      printf -v "$var" '%s' "$val"
+      return 0
+    fi
+    tty_line "  ${Y}⚠${NC} Enter an integer from ${lo} to ${hi}."
+  done
+}
+
+tuning_recommend() {
+  local proto="$1" multipath="${2:-false}" host cpu queues streams
+  host=$(_tuning_host_class)
+  cpu=$(_detect_cpu_cores)
+  queues=$(_userspace_queues)
+  streams=$(_userspace_tcp_streams)
+
+  TUNING_MODE="fast"
+  TUNING_MULTIPATH="$multipath"
+  TUNING_PROFILE="true"
+  TUNING_PROFILE_INTERVAL=30
+  TUNING_CHANNEL_SIZE=10000
+  TUNING_TX_QUEUE_LEN=10000
+  TUNING_TCP_STREAMS=1
+
+  case "$host" in
+    small)
+      TUNING_SOCK_BUF_MB=16
+      TUNING_TUN_QUEUES=1
+      TUNING_BATCH_SIZE=16
+      TUNING_POLL_MS=10
+      TUNING_TX_QUEUE_LEN=5000
+      ;;
+    medium)
+      TUNING_SOCK_BUF_MB=32
+      TUNING_TUN_QUEUES=$(( queues > 2 ? 2 : queues ))
+      TUNING_BATCH_SIZE=32
+      TUNING_POLL_MS=5
+      TUNING_TX_QUEUE_LEN=10000
+      ;;
+    large)
+      TUNING_SOCK_BUF_MB=64
+      TUNING_TUN_QUEUES=$queues
+      TUNING_BATCH_SIZE=64
+      TUNING_POLL_MS=3
+      TUNING_TX_QUEUE_LEN=10000
+      ;;
+  esac
+
+  case "$(_tuning_proto_family "$proto")" in
+    userspace)
+      TUNING_BATCH_SIZE=64
+      TUNING_POLL_MS=3
+      TUNING_TCP_STREAMS=1
+      if [[ "$proto" == "hysteria2" ]]; then
+        TUNING_TUN_QUEUES=1
+      fi
+      ;;
+    tcp)
+      # TCP-over-TCP: keep socket buffers small to avoid bufferbloat.
+      TUNING_SOCK_BUF_MB=8
+      TUNING_POLL_MS=3
+      TUNING_TCP_STREAMS=$streams
+      ;;
+    obfs)
+      TUNING_SOCK_BUF_MB=32
+      TUNING_TUN_QUEUES=1
+      TUNING_BATCH_SIZE=64
+      TUNING_POLL_MS=3
+      TUNING_TCP_STREAMS=1
+      ;;
+    vpn)
+      TUNING_TUN_QUEUES=1
+      TUNING_TCP_STREAMS=1
+      TUNING_SOCK_BUF_MB=32
+      TUNING_POLL_MS=50
+      TUNING_BATCH_SIZE=32
+      ;;
+    kernel)
+      TUNING_MODE="balanced"
+      TUNING_SOCK_BUF_MB=32
+      TUNING_TUN_QUEUES=1
+      TUNING_BATCH_SIZE=32
+      TUNING_POLL_MS=10
+      ;;
+  esac
+}
+
+tuning_apply_mode() {
+  case "$TUNING_MODE" in
+    fast)
+      TUNING_TX_QUEUE_LEN=10000
+      ;;
+    balanced)
+      TUNING_TX_QUEUE_LEN=10000
+      TUNING_POLL_MS=${TUNING_POLL_MS:-10}
+      ;;
+    latency)
+      TUNING_TX_QUEUE_LEN=5000
+      TUNING_POLL_MS=5
+      (( TUNING_POLL_MS > 5 )) && TUNING_POLL_MS=5
+      ;;
+    resource)
+      TUNING_SOCK_BUF_MB=16
+      TUNING_TUN_QUEUES=1
+      TUNING_BATCH_SIZE=16
+      TUNING_POLL_MS=20
+      TUNING_TX_QUEUE_LEN=2000
+      TUNING_TCP_STREAMS=1
+      ;;
+  esac
+}
+
+tuning_show_server_specs() {
+  local cpu ram host
+  cpu=$(_detect_cpu_cores)
+  ram=$(_detect_ram_mb)
+  host=$(_tuning_host_class)
+  blank
+  sep_thin
+  echo -e "  ${BOLD}Performance tuning${NC}"
+  info "Detected: ${cpu} CPU cores, ${ram} MB RAM"
+  case "$host" in
+    small)
+      info "Host class: small VPS (≤2 cores / ≤2 GB) — prefer resource or balanced mode"
+      ;;
+    medium)
+      info "Host class: medium VPS (3–4 cores / 2–8 GB) — fast mode usually works well"
+      ;;
+    large)
+      info "Host class: large server (5+ cores / 8+ GB) — fast mode + higher buffers"
+      ;;
+  esac
+}
+
+tuning_show_recommendation() {
+  local proto="$1"
+  info "Recommended for ${proto}: mode=${TUNING_MODE}  sock_buf=${TUNING_SOCK_BUF_MB}MB  tun_queues=${TUNING_TUN_QUEUES}  poll_ms=${TUNING_POLL_MS}"
+  case "$(_tuning_proto_family "$proto")" in
+    userspace|obfs)
+      info "  batch_size=${TUNING_BATCH_SIZE}  tx_queue_len=${TUNING_TX_QUEUE_LEN}"
+      ;;
+    tcp)
+      info "  batch_size=${TUNING_BATCH_SIZE}  tcp_streams=${TUNING_TCP_STREAMS}  tx_queue_len=${TUNING_TX_QUEUE_LEN}"
+      tty_line "  ${DIM}Note: tcp/tmux use small sock_buf (8 MB) — large buffers hurt TCP-in-TCP.${NC}"
+      ;;
+    vpn)
+      info "  tx_queue_len=${TUNING_TX_QUEUE_LEN}  poll_ms=${TUNING_POLL_MS}"
+      ;;
+    kernel)
+      info "  multipath=${TUNING_MULTIPATH}  channel_size=${TUNING_CHANNEL_SIZE}  tx_queue_len=${TUNING_TX_QUEUE_LEN}"
+      ;;
+  esac
+}
+
+collect_tuning_inputs() {
+  local proto="$1" multipath="${2:-false}" preset_mode="${3:-}"
+
+  tuning_recommend "$proto" "$multipath"
+  if [[ -n "$preset_mode" ]]; then
+    TUNING_MODE="$preset_mode"
+    tuning_apply_mode
+    ok "Tuning aligned with performance profile: mode=${TUNING_MODE} poll_ms=${TUNING_POLL_MS} tx_queue=${TUNING_TX_QUEUE_LEN}"
+    return 0
+  fi
+
+  tuning_show_server_specs
+  tuning_show_recommendation "$proto"
+
+  if confirm "Use recommended tuning values"; then
+    ok "Using recommended [tuning] for ${proto}"
+    return 0
+  fi
+
+  blank
+  info "Custom tuning — short guide:"
+  tty_line "  ${DIM}mode${NC}         fast = max Mbps · balanced = default · latency = low delay · resource = tiny VPS"
+  tty_line "  ${DIM}sock_buf_mb${NC}  UDP/ICMP: 32–64 on 1 Gbps links · TCP/tmux: keep 8 · micro VPS: 16"
+  tty_line "  ${DIM}tun_queues${NC}   parallel TUN readers — match CPU cores (1–8); ICMP/UDP/hy2: 1 is safest"
+  tty_line "  ${DIM}batch_size${NC}   packets per sendmmsg batch — 64 for throughput, 16 for low RAM"
+  tty_line "  ${DIM}poll_ms${NC}      idle poll interval — 3 = fast links, 10 = balanced, 20+ = save CPU"
+  tty_line "  ${DIM}tx_queue_len${NC} kernel TUN queue — 10000 fast · 5000 latency · 2000 resource"
+  tty_line "  ${DIM}tcp_streams${NC}  parallel TCP carriers (tcp/tmux only) — 4–8 on multi-core"
+  blank
+
+  pick TUNING_MODE "Tuning mode" \
+    "fast — max throughput (4+ cores, 4+ GB RAM recommended)" \
+    "balanced — general purpose (most links)" \
+    "latency — lower delay (gaming / VoIP overlays)" \
+    "resource — minimal CPU and RAM (1–2 core VPS)"
+  TUNING_MODE="$(label_key "$TUNING_MODE")"
+  tuning_apply_mode
+
+  case "$(_tuning_proto_family "$proto")" in
+    userspace|obfs|tcp)
+      prompt_int TUNING_SOCK_BUF_MB "Socket buffer (MB)" "$TUNING_SOCK_BUF_MB" 1 128
+      prompt_int TUNING_TUN_QUEUES "TUN reader queues" "$TUNING_TUN_QUEUES" 1 16
+      prompt_int TUNING_BATCH_SIZE "RX/TX batch size" "$TUNING_BATCH_SIZE" 1 128
+      prompt_int TUNING_POLL_MS "Idle poll interval (ms)" "$TUNING_POLL_MS" 1 1000
+      prompt_int TUNING_TX_QUEUE_LEN "TUN tx queue length" "$TUNING_TX_QUEUE_LEN" 100 100000
+      if [[ "$(_tuning_proto_family "$proto")" == "tcp" ]]; then
+        prompt_int TUNING_TCP_STREAMS "Parallel TCP streams" "$TUNING_TCP_STREAMS" 1 16
+      fi
+      ;;
+    vpn)
+      prompt_int TUNING_POLL_MS "Idle poll interval (ms)" "$TUNING_POLL_MS" 1 1000
+      prompt_int TUNING_TX_QUEUE_LEN "TUN tx queue length" "$TUNING_TX_QUEUE_LEN" 100 100000
+      ;;
+    kernel)
+      if confirm "Enable multipath ECMP (bonded-gre-fou only)"; then
+        TUNING_MULTIPATH="true"
+      else
+        TUNING_MULTIPATH="false"
+      fi
+      prompt_int TUNING_TX_QUEUE_LEN "TUN tx queue length" "$TUNING_TX_QUEUE_LEN" 100 100000
+      prompt_int TUNING_CHANNEL_SIZE "Channel buffer size" "$TUNING_CHANNEL_SIZE" 1000 100000
+      ;;
+  esac
+
+  if confirm "Enable runtime profiler (GET /profile stats)"; then
+    TUNING_PROFILE="true"
+    prompt_int TUNING_PROFILE_INTERVAL "Profiler interval (seconds)" "$TUNING_PROFILE_INTERVAL" 5 300
+  else
+    TUNING_PROFILE="false"
+  fi
+
+  blank
+  ok "Custom tuning: mode=${TUNING_MODE} sock_buf=${TUNING_SOCK_BUF_MB}MB tun_queues=${TUNING_TUN_QUEUES} poll_ms=${TUNING_POLL_MS}"
+}
+
+_tuning_health_port() {
+  local tun_name="${1:-}"
+  local hp=6543
+  [[ -n "$tun_name" ]] && hp=$(health_port_for_tunnel "$tun_name")
+  echo "$hp"
+}
+
+_tuning_logging_block() {
+  cat << EOF
+
+[logging]
+level            = "info"
+profile          = ${TUNING_PROFILE}
+profile_interval = ${TUNING_PROFILE_INTERVAL}
+EOF
+}
+
+_tuning_health_block() {
+  local hp="$1" disabled="${2:-false}"
+  cat << EOF
+
+[health]
+disabled = ${disabled}
+port     = ${hp}
+EOF
+}
+
 # FNV-1a health port offset — must match Go healthPortOffset + defaultHealthPort (6543).
 health_port_for_tunnel() {
   local name="$1"
@@ -1293,136 +1745,125 @@ health_port_for_tunnel() {
 
 write_userspace_tuning() {
   local file="$1" proto="$2" tun_name="${3:-}"
-  local queues streams hp=6543
-  [[ -n "$tun_name" ]] && hp=$(health_port_for_tunnel "$tun_name")
-  queues=$(_userspace_queues)
-  streams=$(_userspace_tcp_streams)
+  local hp streams
+
+  case "$proto" in
+    openvpn|openvpnmultu|wireguard|amneziawg)
+      write_openvpn_tuning "$file" "$proto" false "$tun_name"
+      return
+      ;;
+    *)
+      collect_tuning_inputs "$proto" false
+      ;;
+  esac
+
+  hp=$(_tuning_health_port "$tun_name")
+  streams=$(_tuning_clamp "${TUNING_TCP_STREAMS:-4}" 1 16)
   case "$proto" in
     icmp)
       cat >> "$file" << EOF
 
 [tuning]
 enabled      = true
-mode         = "fast"
-sock_buf_mb  = 64
-tun_queues   = ${queues}
-batch_size   = 64
-poll_ms      = 5
-tx_queue_len = 10000
-
-[logging]
-level            = "info"
-profile          = true
-profile_interval = 30
+mode         = "${TUNING_MODE}"
+sock_buf_mb  = ${TUNING_SOCK_BUF_MB}
+tun_queues   = ${TUNING_TUN_QUEUES}
+batch_size   = ${TUNING_BATCH_SIZE}
+poll_ms      = ${TUNING_POLL_MS}
+tx_queue_len = ${TUNING_TX_QUEUE_LEN}
 EOF
+      _tuning_logging_block >> "$file"
+      _tuning_health_block "$hp" false >> "$file"
       ;;
     udp|bip)
       cat >> "$file" << EOF
 
 [tuning]
 enabled      = true
-mode         = "fast"
-sock_buf_mb  = 64
-tun_queues   = ${queues}
-batch_size   = 32
-poll_ms      = 5
-tx_queue_len = 10000
-
-[logging]
-level            = "info"
-profile          = true
-profile_interval = 30
+mode         = "${TUNING_MODE}"
+sock_buf_mb  = ${TUNING_SOCK_BUF_MB}
+tun_queues   = ${TUNING_TUN_QUEUES}
+batch_size   = ${TUNING_BATCH_SIZE}
+poll_ms      = ${TUNING_POLL_MS}
+tx_queue_len = ${TUNING_TX_QUEUE_LEN}
 EOF
+      _tuning_logging_block >> "$file"
+      _tuning_health_block "$hp" false >> "$file"
       ;;
     tcp|tcpmux)
       cat >> "$file" << EOF
 
 [tuning]
 enabled      = true
-mode         = "fast"
-sock_buf_mb  = 64
-tun_queues   = ${queues}
+mode         = "${TUNING_MODE}"
+sock_buf_mb  = ${TUNING_SOCK_BUF_MB}
+tun_queues   = ${TUNING_TUN_QUEUES}
 tcp_streams  = ${streams}
-poll_ms      = 5
-tx_queue_len = 10000
-
-[logging]
-level            = "info"
-profile          = true
-profile_interval = 30
+batch_size   = ${TUNING_BATCH_SIZE}
+poll_ms      = ${TUNING_POLL_MS}
+tx_queue_len = ${TUNING_TX_QUEUE_LEN}
 EOF
-      ;;
-    openvpn|openvpnmultu)
-      write_openvpn_tuning "$file" "fast" false "$tun_name"
-      return
+      _tuning_logging_block >> "$file"
+      _tuning_health_block "$hp" false >> "$file"
       ;;
     hysteria2)
       cat >> "$file" << EOF
 
 [tuning]
 enabled      = true
-mode         = "fast"
-poll_ms      = 50
-tx_queue_len = 10000
-
-[logging]
-level            = "info"
-profile          = true
-profile_interval = 30
-
-[health]
-disabled = true
+mode         = "${TUNING_MODE}"
+sock_buf_mb  = ${TUNING_SOCK_BUF_MB}
+tun_queues   = ${TUNING_TUN_QUEUES}
+batch_size   = ${TUNING_BATCH_SIZE}
+poll_ms      = ${TUNING_POLL_MS}
+tx_queue_len = ${TUNING_TX_QUEUE_LEN}
 EOF
+      _tuning_logging_block >> "$file"
+      _tuning_health_block "$hp" true >> "$file"
       return
       ;;
-    wireguard)
-      write_openvpn_tuning "$file" "fast" false "$tun_name"
-      return
-      ;;
-    amneziawg)
-      write_openvpn_tuning "$file" "fast" false "$tun_name"
-      return
+    udp-obfs)
+      cat >> "$file" << EOF
+
+[tuning]
+enabled      = true
+mode         = "${TUNING_MODE}"
+sock_buf_mb  = ${TUNING_SOCK_BUF_MB}
+tun_queues   = ${TUNING_TUN_QUEUES}
+batch_size   = ${TUNING_BATCH_SIZE}
+poll_ms      = ${TUNING_POLL_MS}
+tx_queue_len = ${TUNING_TX_QUEUE_LEN}
+EOF
+      _tuning_logging_block >> "$file"
+      _tuning_health_block "$hp" false >> "$file"
       ;;
     *)
       write_tuning "$file" false "$tun_name"
       return
       ;;
   esac
-  cat >> "$file" << EOF
-
-[health]
-disabled = false
-port     = ${hp}
-EOF
 }
 
 write_tuning() {
   local file="$1" multipath="${2:-false}" tun_name="${3:-}"
-  local hp=6543
-  [[ -n "$tun_name" ]] && hp=$(health_port_for_tunnel "$tun_name")
+  local hp
+  collect_tuning_inputs "kernel" "$multipath"
+  hp=$(_tuning_health_port "$tun_name")
   cat >> "$file" << EOF
 
 [tuning]
 enabled      = true
-mode         = "balanced"
-multipath    = ${multipath}
-# sock_buf_mb  = 32     # socket buffer MB  (1–128, default 32)
-# tun_queues   = 4      # TUN readers       (1–16,  default = CPU count max 4)
-# batch_size   = 32     # ICMP sendmmsg     (1–128, default 32)
-# tx_queue_len = 10000  # TUN txqueuelen    (100–100000)
-# poll_ms      = 10     # idle poll ms      (adaptive backoff up to 50 ms)
-# tcp_streams  = 4      # TCP streams       (1–16,  default = tun_queues)
-channel_size  = 10_000
-
-[logging]
-level            = "info"
-profile          = true
-profile_interval = 30
-
-[health]
-disabled = false
-port     = ${hp}
+mode         = "${TUNING_MODE}"
+multipath    = ${TUNING_MULTIPATH}
+sock_buf_mb  = ${TUNING_SOCK_BUF_MB}
+tun_queues   = ${TUNING_TUN_QUEUES}
+batch_size   = ${TUNING_BATCH_SIZE}
+poll_ms      = ${TUNING_POLL_MS}
+tx_queue_len = ${TUNING_TX_QUEUE_LEN}
+channel_size = ${TUNING_CHANNEL_SIZE}
 EOF
+  _tuning_logging_block >> "$file"
+  _tuning_health_block "$hp" false >> "$file"
 }
 
 add_forward_section() {
@@ -1596,7 +2037,7 @@ padding = ${padding}
 [security]
 encryption = true
 EOF
-  write_tuning "$cfg" "false" "$name"
+  write_userspace_tuning "$cfg" "udp-obfs" "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
   virlink_server_write_manual_client "$name" "$mode" "$remote_ip" "$local_ip" "$cfg" "udp-obfs" "$port"
@@ -1747,29 +2188,22 @@ EOF
 }
 
 write_openvpn_tuning() {
-  local file="$1" perf="${2:-fast}" multipath="${3:-false}" tun_name="${4:-}"
-  local mode="fast" txql=10000 hb=20 poll=50 hp=6543
-  [[ -n "$tun_name" ]] && hp=$(health_port_for_tunnel "$tun_name")
-  case "$perf" in
-    resource) mode="resource"; txql=5000; hb=60; poll=100 ;;
-    latency)  mode="latency";  txql=8000; hb=10; poll=20 ;;
-  esac
+  local file="$1" proto="${2:-openvpn}" multipath="${3:-false}" tun_name="${4:-}" preset_mode="${5:-}"
+  local hp
+  collect_tuning_inputs "$proto" "$multipath" "$preset_mode"
+  hp=$(_tuning_health_port "$tun_name")
   cat >> "$file" << EOF
 
 [tuning]
 enabled      = true
-mode         = "${mode}"
-multipath    = ${multipath}
-tx_queue_len = ${txql}
-poll_ms      = ${poll}
-
-[logging]
-level = "info"
-
-[health]
-disabled = false
-port     = ${hp}
+mode         = "${TUNING_MODE}"
+multipath    = ${TUNING_MULTIPATH}
+sock_buf_mb  = ${TUNING_SOCK_BUF_MB}
+poll_ms      = ${TUNING_POLL_MS}
+tx_queue_len = ${TUNING_TX_QUEUE_LEN}
 EOF
+  _tuning_logging_block >> "$file"
+  _tuning_health_block "$hp" false >> "$file"
 }
 
 openvpn_cert_needs_openssl3_upgrade() {
@@ -2654,7 +3088,7 @@ dco    = ${dco_toml}
 [security]
 encryption = true
 EOF
-  write_openvpn_tuning "$cfg" "$perf" false "$name"
+  write_openvpn_tuning "$cfg" "openvpn" false "$name" "$perf"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
@@ -2789,7 +3223,7 @@ workers  = ${workers}
 [security]
 encryption = true
 EOF
-  write_openvpn_tuning "$cfg" "$perf" true "$name"
+  write_openvpn_tuning "$cfg" "openvpnmultu" true "$name" "$perf"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
@@ -3606,7 +4040,7 @@ dev    = "${dev}"
 [security]
 encryption = true
 EOF
-  write_openvpn_tuning "$cfg" "fast" false "$name"
+  write_openvpn_tuning "$cfg" "wireguard" false "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
@@ -3973,7 +4407,7 @@ dev    = "${dev}"
 [security]
 encryption = true
 EOF
-  write_openvpn_tuning "$cfg" "fast" false "$name"
+  write_openvpn_tuning "$cfg" "amneziawg" false "$name"
   add_forward_section "$cfg" "$mode"
   LAST_CFG_PATH="$cfg"
 
@@ -4471,7 +4905,7 @@ main() {
     echo -e "    ${C} 0${NC}  Exit"
     blank
     tty_out "  ${W}?${NC} Choose [0-6]: "
-    read -r choice < /dev/tty
+    read -r choice < /dev/tty || { blank; ok "Goodbye."; blank; exit 0; }
     case "$choice" in
       1) menu_create_tunnel ;;
       2) menu_tunnel_management ;;
@@ -4499,6 +4933,8 @@ while [[ $# -gt 0 && "$1" == -* ]]; do
     -x|--debug)   SCRIPT_DEBUG=1; set -x; shift ;;
     -h|--help)
       cat << EOF
+virlink ${SCRIPT_VERSION} — ${TAGLINE}
+
 Usage: $0 [-v|--verbose] [-x|--debug] [command] [name]
 
 Commands:
@@ -4506,15 +4942,19 @@ Commands:
   start NAME      start tunnel systemd service
   stop NAME       stop tunnel
   restart NAME    restart tunnel service
-  remove NAME     delete tunnel (service + config + log)
+  remove NAME     delete tunnel (service + config + log + PKI)
   status NAME     show tunnel status
-  logs NAME       show tunnel log (add -f to follow)
+  logs NAME       show tunnel log (add -f to follow, -n N for N lines)
   list            list configured tunnels
-  update          update virlink binary
+  update          update virlink binary + setup script
 
 Flags:
   -v, --verbose   extra install/setup logging
   -x, --debug     bash trace (set -x)
+  -h, --help      show this help and exit
+
+Environment:
+  NO_COLOR        disable colored output
 EOF
       exit 0
       ;;
@@ -4522,14 +4962,18 @@ EOF
   esac
 done
 
+# Each leaf command is guarded with `|| exit \$?` so that an expected non-zero
+# status (e.g. a tunnel that fails to start, or Ctrl+C while following logs)
+# exits cleanly with the command's own diagnostics rather than tripping the
+# generic ERR handler.
 case "${1:-menu}" in
-  start)   require_root; ensure_dirs; tunnel_start  "${2:?tunnel name required}" ;;
-  stop)    require_root; ensure_dirs; tunnel_stop   "${2:?tunnel name required}" ;;
-  restart) require_root; ensure_dirs; tunnel_restart "${2:?tunnel name required}" ;;
-  remove)  require_root; ensure_dirs; tunnel_remove_cli "${2:?tunnel name required}" "${@:3}" ;;
-  status)  tunnel_status "${2:?tunnel name required}" ;;
-  logs)    tunnel_logs   "${2:?tunnel name required}" "${@:3}" ;;
-  list)    list_tunnels ;;
+  start)   require_root; ensure_dirs; tunnel_start    "${2:?tunnel name required}" || exit $? ;;
+  stop)    require_root; ensure_dirs; tunnel_stop     "${2:?tunnel name required}" || exit $? ;;
+  restart) require_root; ensure_dirs; tunnel_restart  "${2:?tunnel name required}" || exit $? ;;
+  remove)  require_root; ensure_dirs; tunnel_remove_cli "${2:?tunnel name required}" "${@:3}" || exit $? ;;
+  status)  tunnel_status "${2:?tunnel name required}" || exit $? ;;
+  logs)    tunnel_logs   "${2:?tunnel name required}" "${@:3}" || exit $? ;;
+  list)    list_tunnels || exit $? ;;
   update)  require_root; check_update; do_update_all ;;
   menu)    main ;;
   *)       echo "Usage: $0 [-v|--verbose] [-x|--debug] [menu|start|stop|restart|remove|status|logs|list|update] [name]"; exit 1 ;;
