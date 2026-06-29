@@ -304,7 +304,7 @@ func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 		}
 		statInc(statTCPRxFrame)
 		batch.addOwned(frame, n)
-		if batch.len() >= bsz {
+		if batch.len() >= bsz || br.Buffered() == 0 {
 			flush()
 		}
 	}
