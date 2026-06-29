@@ -115,9 +115,9 @@ func (t *UdpTunnel) Up() error {
 		go t.txPollLoopRaw(t.rawFd, port)
 	} else {
 		conn := t.udpConn
-		// Plain UDP: ReadFromUDP/WriteToUDP — reliable path (no recvmmsg/sendmmsg batch).
+		// Plain UDP: reliable ReadFromUDP RX; batched WriteToUDP TX (single socket).
 		go t.rxLoopBlocking(conn, t.tun.Fd0())
-		go t.txPollLoopUnbatched(conn)
+		go t.txPollLoop(conn)
 	}
 
 	platform.Done(dev, addr, peer,
@@ -501,44 +501,6 @@ func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 		},
 	)
 	flush()
-}
-
-func (t *UdpTunnel) wireDst() *net.UDPAddr {
-	if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
-		return p
-	}
-	if t.cfg.Mode == "client" {
-		return &net.UDPAddr{
-			IP:   net.IPv4(t.peerIP[0], t.peerIP[1], t.peerIP[2], t.peerIP[3]),
-			Port: t.cfg.Transport.Port,
-		}
-	}
-	return nil
-}
-
-func (t *UdpTunnel) txPollLoopUnbatched(conn *net.UDPConn) {
-	poller := platform.NewTunPollerH(t.tun, &t.stop, 0)
-	defer poller.Close()
-
-	poller.RunOwned(
-		func() { platform.StatInc(platform.StatUDPTxPoll) },
-		func(buf []byte, n int) bool {
-			platform.StatInc(platform.StatUDPTxRead)
-			dst := t.wireDst()
-			if dst == nil {
-				platform.StatInc(platform.StatUDPTxNoDst)
-				platform.PutBuf(buf)
-				return !t.stop.Stopped()
-			}
-			if _, err := conn.WriteToUDP(buf[:n], dst); err != nil && !t.stop.Stopped() {
-				platform.LogDebug("udp tx: " + err.Error())
-			} else if err == nil {
-				platform.StatInc(platform.StatUDPTxSend)
-			}
-			platform.PutBuf(buf)
-			return !t.stop.Stopped()
-		},
-	)
 }
 
 func (t *UdpTunnel) Down() error {

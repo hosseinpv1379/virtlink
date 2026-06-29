@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	icmpSubnet  = "10.20.43.0/24"
-	icmpTunID   = uint16(0xCAFE)
-	icmpEchoReq = 8
+	icmpSubnet   = "10.20.43.0/24"
+	icmpTunID    = uint16(0xCAFE)
+	icmpEchoReq  = 8
+	icmpHdrRoom  = 8 // RunOwned: payload at buf[icmpHdrRoom:]
 )
 
 type IcmpTunnel struct {
@@ -141,6 +142,67 @@ func (t *IcmpTunnel) resolveDst() ([4]byte, bool) {
 
 // txPollLoop — single goroutine polls all TUN queues, batches ICMP sends.
 func (t *IcmpTunnel) txPollLoop(rawFd int) {
+	if t.wire.On {
+		t.txPollLoopWire(rawFd)
+		return
+	}
+
+	poller := platform.NewTunPollerH(t.tun, &t.stop, icmpHdrRoom)
+	defer poller.Close()
+
+	var batch platform.IcmpTxBatch
+	bsz := platform.PerfBatchSize()
+	useDedup := t.tun.QueueCount() > 1
+
+	flush := func() {
+		if batch.N() == 0 {
+			return
+		}
+		platform.StatAdd(platform.StatICMPTxSend, uint64(batch.N()))
+		if nerr := platform.IcmpSendBatch(rawFd, &batch); nerr > 0 {
+			wire.NoteWireTxErr(nerr)
+		}
+		for i := 0; i < batch.N(); i++ {
+			platform.PutBuf(batch.Frame(i))
+			batch.SetFrame(i, nil)
+		}
+		batch.Reset()
+	}
+
+	poller.RunOwned(
+		func() {
+			platform.StatInc(platform.StatICMPTxPoll)
+			if batch.N() > 0 {
+				flush()
+			}
+		},
+		func(buf []byte, n int) bool {
+			platform.StatInc(platform.StatICMPTxRead)
+			dst, ok := t.resolveDst()
+			if !ok {
+				platform.StatInc(platform.StatICMPTxNoDst)
+				platform.PutBuf(buf)
+				return !t.stop.Stopped()
+			}
+			payload := buf[icmpHdrRoom : icmpHdrRoom+n]
+			if useDedup && t.txDedup.Dup(payload) {
+				platform.StatInc(platform.StatICMPTxDedup)
+				platform.PutBuf(buf)
+				return !t.stop.Stopped()
+			}
+			seq := uint16(t.seq.Add(1))
+			built := platform.BuildICMPFrame(buf, icmpTunID, seq, payload)
+			batch.Add(buf, len(built), dst, 0)
+			if batch.N() >= bsz {
+				flush()
+			}
+			return !t.stop.Stopped()
+		},
+	)
+	flush()
+}
+
+func (t *IcmpTunnel) txPollLoopWire(rawFd int) {
 	poller := platform.NewTunPoller(t.tun, &t.stop)
 	defer poller.Close()
 
@@ -216,9 +278,8 @@ func (t *IcmpTunnel) txPollLoop(rawFd int) {
 }
 
 func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
-	var rb platform.RxMmsgBatch
-	rb.Init(platform.PerfBatchSize())
-	defer rb.Release()
+	buf := platform.GetBuf()
+	defer platform.PutBuf(buf)
 
 	peer := t.wire.WirePeer(t.peerIP)
 	local := t.localIP
@@ -244,12 +305,9 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 	defer flush()
 
 	for !t.stop.Stopped() {
-		got, err := rb.Recv(rawFd)
-		if got == 0 {
-			if t.stop.Stopped() {
-				return
-			}
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == nil {
+		n, sa, err := unix.Recvfrom(rawFd, buf, unix.MSG_DONTWAIT)
+		if err != nil {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				flush()
 				platform.StatInc(platform.StatICMPRxPoll)
 				_ = platform.PollFD(rawFd, unix.POLLIN, idleMs)
@@ -262,38 +320,43 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 			platform.LogWarn("icmp rx: " + err.Error())
 			continue
 		}
-		idleMs = pollMs
-		for i := 0; i < got; i++ {
-			pkt := platform.TrimIPv4Packet(rb.Data(i))
-			sa := rb.From4(i)
-			// Kernel echo replies (type 0) to our wire pings — not tunnel traffic.
-			if platform.IcmpWireCarrierType(pkt, t.wire.On) != icmpEchoReq {
-				continue
-			}
-			if !wire.AcceptWirePeer(pkt, sa, local, peer, t.wire.Src(), t.wire, unix.IPPROTO_ICMP) {
-				platform.StatInc(platform.StatICMPRxDropPeer)
-				continue
-			}
-			icmp, ok := platform.ParseIcmpWirePacket(pkt, t.wire.On)
-			if !ok {
-				continue
-			}
-			if icmp[0] != icmpEchoReq || binary.BigEndian.Uint16(icmp[4:6]) != icmpTunID {
-				platform.StatInc(platform.StatICMPRxDropProto)
-				continue
-			}
-			platform.StatInc(platform.StatICMPRxRecv)
-			seq := binary.BigEndian.Uint16(icmp[6:8])
-			if t.dedup.Dup(seq) {
-				platform.StatInc(platform.StatICMPRxDropSeq)
-				continue
-			}
-			inner := icmp[8:]
-			if t.cfg.Mode == "server" {
-				t.lastSrc.Store(wire.RememberPeerRoute(t.wire, sa.Addr, t.peerIP))
-			}
-			batch.Add(inner)
+		if n == 0 {
+			continue
 		}
+		idleMs = pollMs
+
+		from, ok := sa.(*unix.SockaddrInet4)
+		if !ok {
+			continue
+		}
+		pkt := platform.TrimIPv4Packet(buf[:n])
+		// Kernel echo replies (type 0) to real pings — not tunnel traffic.
+		if platform.IcmpWireCarrierType(pkt, t.wire.On) != icmpEchoReq {
+			continue
+		}
+		if !wire.AcceptWirePeer(pkt, from, local, peer, t.wire.Src(), t.wire, unix.IPPROTO_ICMP) {
+			platform.StatInc(platform.StatICMPRxDropPeer)
+			continue
+		}
+		icmp, ok := platform.ParseIcmpWirePacket(pkt, t.wire.On)
+		if !ok {
+			continue
+		}
+		if icmp[0] != icmpEchoReq || binary.BigEndian.Uint16(icmp[4:6]) != icmpTunID {
+			platform.StatInc(platform.StatICMPRxDropProto)
+			continue
+		}
+		platform.StatInc(platform.StatICMPRxRecv)
+		seq := binary.BigEndian.Uint16(icmp[6:8])
+		if t.dedup.Dup(seq) {
+			platform.StatInc(platform.StatICMPRxDropSeq)
+			continue
+		}
+		inner := icmp[8:]
+		if t.cfg.Mode == "server" {
+			t.lastSrc.Store(wire.RememberPeerRoute(t.wire, from.Addr, t.peerIP))
+		}
+		batch.Add(inner)
 		if batch.Len() >= bsz {
 			flush()
 		}
