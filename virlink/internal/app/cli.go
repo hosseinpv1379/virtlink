@@ -14,7 +14,7 @@ import (
 	"virlink/internal/platform"
 )
 
-const version = "3.3.15"
+const version = "3.3.16"
 
 func Main() {
 	cfgFile := flag.String("c", "", "path to config.toml (tunnel or web panel)")

@@ -1033,6 +1033,7 @@ webpanel_install() {
     port="${listen##*:}"
     [[ "$host" == "0.0.0.0" || "$host" == "::" ]] && host="<server-ip>"
     ok "Web panel running at ${W}http://${host}:${port}/${NC}"
+    info "Dashboard + speed test — all on this port (not overlay :6543)"
     info "Login: user=${user}  (password you just set)"
     info "Log: ${WEBPANEL_LOG}"
     info "Service: systemctl {status|restart|stop} ${WEBPANEL_SVC}"

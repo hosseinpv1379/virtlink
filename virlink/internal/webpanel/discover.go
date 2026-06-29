@@ -29,9 +29,10 @@ type TunnelRow struct {
 	PeerIP      string `json:"peer_ip"`
 	RemoteIP    string `json:"remote_ip"`
 	LocalIP     string `json:"local_ip"`
-	PanelURL    string `json:"panel_url"`
+	HTTPPort    int    `json:"http_port,omitempty"`
 	HealthError string `json:"health_error,omitempty"`
 	Uptime      string `json:"uptime,omitempty"`
+	BenchAvail  bool   `json:"bench_available"`
 }
 
 func DiscoverTunnels(configsDir string) ([]TunnelRow, error) {
@@ -78,7 +79,7 @@ func discoverOne(name, cfgPath string) (TunnelRow, error) {
 
 	if cfg.Health.Disabled {
 		row.Handshake = "n/a"
-		row.PanelURL = ""
+		row.BenchAvail = false
 		return row, nil
 	}
 
@@ -86,7 +87,8 @@ func discoverOne(name, cfgPath string) (TunnelRow, error) {
 	if httpPort == 0 {
 		httpPort = 6543
 	}
-	row.PanelURL = fmt.Sprintf("http://%s:%d/", row.OverlayIP, httpPort)
+	row.HTTPPort = httpPort
+	row.BenchAvail = row.Service == "running"
 
 	if row.Service != "running" {
 		row.Handshake = "stopped"
