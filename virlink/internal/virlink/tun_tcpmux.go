@@ -307,8 +307,6 @@ func (t *TcpMuxTunnel) connectOne(tun *os.File, slot int) {
 
 func (t *TcpMuxTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 	defer conn.Close()
-	buf := getBuf()
-	defer putBuf(buf)
 	br := bufio.NewReaderSize(conn, tcpRxBufSize)
 	bsz := perfBatchSize()
 	batch := newTunRxBatch(bsz)
@@ -327,7 +325,7 @@ func (t *TcpMuxTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 	defer flush()
 
 	for {
-		payload, _, err := tcpMuxReadFrame(br, buf)
+		frame, n, _, err := tcpMuxReadFrame(br)
 		if err != nil {
 			if !t.stop.stopped() {
 				logDebug(fmt.Sprintf("tcpmux rx stream %d: %v", slot, err))
@@ -336,27 +334,29 @@ func (t *TcpMuxTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 			return
 		}
 		statInc(statTCPRxFrame)
-		batch.add(payload)
+		batch.addOwned(frame, n)
 		if batch.len() >= bsz {
 			flush()
 		}
 	}
 }
 
-func tcpMuxReadFrame(r io.Reader, buf []byte) ([]byte, uint32, error) {
+func tcpMuxReadFrame(r io.Reader) (frame []byte, n int, flow uint32, err error) {
 	var hdr [6]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	n := int(binary.BigEndian.Uint16(hdr[0:2]))
-	flow := binary.BigEndian.Uint32(hdr[2:6])
-	if n == 0 || n > len(buf) {
-		return nil, 0, fmt.Errorf("tcpmux invalid frame len %d", n)
+	n = int(binary.BigEndian.Uint16(hdr[0:2]))
+	flow = binary.BigEndian.Uint32(hdr[2:6])
+	if n == 0 || n > maxPktBuf {
+		return nil, 0, 0, fmt.Errorf("tcpmux invalid frame len %d", n)
 	}
-	if _, err := io.ReadFull(r, buf[:n]); err != nil {
-		return nil, 0, err
+	frame = getBuf()
+	if _, err := io.ReadFull(r, frame[:n]); err != nil {
+		putBuf(frame)
+		return nil, 0, 0, err
 	}
-	return buf[:n], flow, nil
+	return frame, n, flow, nil
 }
 
 func (t *TcpMuxTunnel) Down() error {

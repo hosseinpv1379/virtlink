@@ -90,6 +90,27 @@ func openRawWire() (int, error) {
 	return fd, nil
 }
 
+// parseWireInner returns the payload after the IPv4 header for wire (IPPROTO_RAW)
+// receives, or the packet body when the kernel already stripped the IP header.
+func parseWireInner(pkt []byte, wireOn bool) (inner []byte, ok bool) {
+	if wireOn {
+		ihl, ok := parseIPv4Payload(pkt)
+		if !ok || len(pkt) <= ihl {
+			return nil, false
+		}
+		return pkt[ihl:], true
+	}
+	if len(pkt) >= ipHdrLen && pkt[0]>>4 == 4 {
+		if ihl, ok := parseIPv4Payload(pkt); ok && len(pkt) > ihl {
+			return pkt[ihl:], true
+		}
+	}
+	if len(pkt) == 0 {
+		return nil, false
+	}
+	return pkt, true
+}
+
 // parseIPv4Payload returns inner payload after the IPv4 header.
 func parseIPv4Payload(pkt []byte) (ihl int, ok bool) {
 	if len(pkt) < ipHdrLen {

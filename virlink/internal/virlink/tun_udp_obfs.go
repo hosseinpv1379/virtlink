@@ -222,9 +222,7 @@ func (t *UdpObfsTunnel) rxLoop(conn *net.UDPConn, tun *os.File, gcm cipher.AEAD,
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == nil {
 				flush()
 				_ = pollFD(rawFd, unix.POLLIN, idleMs)
-				if idleMs < 50 {
-					idleMs += pollMs
-				}
+				idleMs = idleBackoff(idleMs, pollMs)
 				continue
 			}
 			if err == unix.EINTR {

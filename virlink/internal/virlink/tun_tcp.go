@@ -263,8 +263,6 @@ func (t *TcpTunnel) connectOne(tun *os.File, slot int) {
 
 func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 	defer conn.Close()
-	buf := getBuf()
-	defer putBuf(buf)
 	br := bufio.NewReaderSize(conn, tcpRxBufSize)
 	var hdr [2]byte
 	bsz := perfBatchSize()
@@ -292,18 +290,20 @@ func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 			return
 		}
 		n := int(binary.BigEndian.Uint16(hdr[:]))
-		if n == 0 || n > len(buf) {
+		if n == 0 || n > maxPktBuf {
 			logWarn(fmt.Sprintf("tcp rx: invalid frame len %d", n))
 			return
 		}
-		if _, err := io.ReadFull(br, buf[:n]); err != nil {
+		frame := getBuf()
+		if _, err := io.ReadFull(br, frame[:n]); err != nil {
+			putBuf(frame)
 			if !t.stop.stopped() {
 				logDebug(fmt.Sprintf("tcp rx read stream %d: %v", slot, err))
 			}
 			return
 		}
 		statInc(statTCPRxFrame)
-		batch.add(buf[:n])
+		batch.addOwned(frame, n)
 		if batch.len() >= bsz {
 			flush()
 		}

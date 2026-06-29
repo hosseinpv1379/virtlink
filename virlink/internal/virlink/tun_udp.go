@@ -48,7 +48,7 @@ func (t *UdpTunnel) Up() error {
 	t.peerIP = ipTo4(c.RemoteIP)
 	t.localIP = ipTo4(c.LocalIP)
 	t.wire = wireSpoofFrom(c)
-	if c.Mode == "server" && t.wire.on {
+	if c.Mode == "server" {
 		t.lastRoute.Store(t.peerIP)
 	}
 
@@ -151,9 +151,7 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == nil {
 				flush()
 				_ = pollFD(rawFd, unix.POLLIN, idleMs)
-				if idleMs < 50 {
-					idleMs += pollMs
-				}
+				idleMs = idleBackoff(idleMs, pollMs)
 				continue
 			}
 			if err == unix.EINTR {
@@ -321,9 +319,7 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == nil {
 				flush()
 				_ = pollFD(rawFd, unix.POLLIN, idleMs)
-				if idleMs < 50 {
-					idleMs += pollMs
-				}
+				idleMs = idleBackoff(idleMs, pollMs)
 				continue
 			}
 			if err == unix.EINTR {

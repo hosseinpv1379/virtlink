@@ -54,7 +54,7 @@ func (t *IcmpTunnel) Up() error {
 	t.peerIP = ipTo4(c.RemoteIP)
 	t.localIP = ipTo4(c.LocalIP)
 	t.wire = wireSpoofFrom(c)
-	if c.Mode == "server" && t.wire.on {
+	if c.Mode == "server" {
 		t.lastSrc.Store(t.peerIP)
 	}
 
@@ -241,9 +241,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 				flush()
 				statInc(statICMPRxPoll)
 				_ = pollFD(rawFd, unix.POLLIN, idleMs)
-				if idleMs < 50 {
-					idleMs += pollMs
-				}
+				idleMs = idleBackoff(idleMs, pollMs)
 				continue
 			}
 			if err == unix.EINTR {
@@ -260,15 +258,10 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 				statInc(statICMPRxDropPeer)
 				continue
 			}
-			n := len(pkt)
-			if n < 20 {
+			icmp, ok := parseIcmpWirePacket(pkt, t.wire.on)
+			if !ok {
 				continue
 			}
-			ihl := int(pkt[0]&0xf) * 4
-			if n < ihl+8 {
-				continue
-			}
-			icmp := pkt[ihl:n]
 			if icmp[0] != icmpEchoReq || binary.BigEndian.Uint16(icmp[4:6]) != icmpTunID {
 				statInc(statICMPRxDropProto)
 				continue

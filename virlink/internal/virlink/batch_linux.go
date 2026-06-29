@@ -88,7 +88,12 @@ func (b *rxMmsgBatch) release() {
 }
 
 // recv drains up to nbufs packets with one recvmmsg (MSG_DONTWAIT).
+// msg_namelen must be reset before every recvmmsg — the kernel overwrites it
+// on return and subsequent receives fail silently if it is stale.
 func (b *rxMmsgBatch) recv(fd int) (int, error) {
+	for i := 0; i < b.nbufs; i++ {
+		b.msgs[i].Hdr.Namelen = unix.SizeofSockaddrInet4
+	}
 	return recvmmsg(fd, b.msgs[:b.nbufs], unix.MSG_DONTWAIT)
 }
 
@@ -97,7 +102,8 @@ func (b *rxMmsgBatch) data(i int) []byte {
 }
 
 func (b *rxMmsgBatch) from4(i int) *unix.SockaddrInet4 {
-	return (*unix.SockaddrInet4)(unsafe.Pointer(&b.addrs[i]))
+	// RawSockaddrInet4 and SockaddrInet4 have different layouts; read Addr directly.
+	return &unix.SockaddrInet4{Addr: b.addrs[i].Addr}
 }
 
 func tunWritev(fd *os.File, bufs [][]byte) error {
@@ -133,6 +139,12 @@ func newTunRxBatch(cap int) tunRxBatch {
 func (b *tunRxBatch) add(payload []byte) {
 	frame := getBuf()
 	n := copy(frame, payload)
+	b.bufs = append(b.bufs, frame[:n])
+	b.pooled = append(b.pooled, frame)
+}
+
+// addOwned takes ownership of frame (already filled); avoids an extra copy on TCP RX.
+func (b *tunRxBatch) addOwned(frame []byte, n int) {
 	b.bufs = append(b.bufs, frame[:n])
 	b.pooled = append(b.pooled, frame)
 }

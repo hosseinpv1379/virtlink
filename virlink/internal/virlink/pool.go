@@ -66,6 +66,28 @@ func buildICMPFrame(frame []byte, id, seq uint16, payload []byte) []byte {
 	return pkt
 }
 
+// parseIcmpWirePacket returns the ICMP header+payload from a raw-socket receive.
+// With wire spoof (IPPROTO_RAW) the buffer is a full IPv4 packet; with IPPROTO_ICMP
+// the kernel delivers starting at the ICMP header (no IP header on Linux).
+func parseIcmpWirePacket(pkt []byte, wireOn bool) (icmp []byte, ok bool) {
+	if wireOn {
+		ihl, ok := parseIPv4Payload(pkt)
+		if !ok || len(pkt) < ihl+icmpHdrLen {
+			return nil, false
+		}
+		return pkt[ihl:], true
+	}
+	if len(pkt) >= ipHdrLen && pkt[0]>>4 == 4 {
+		if ihl, ok := parseIPv4Payload(pkt); ok && len(pkt) >= ihl+icmpHdrLen {
+			return pkt[ihl:], true
+		}
+	}
+	if len(pkt) < icmpHdrLen {
+		return nil, false
+	}
+	return pkt, true
+}
+
 func icmpChecksum(b []byte) uint16 {
 	var sum uint32
 	for i := 0; i+1 < len(b); i += 2 {

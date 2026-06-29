@@ -6,6 +6,7 @@ package virlink
 
 import (
 	"errors"
+	"os"
 
 	"golang.org/x/sys/unix"
 )
@@ -37,38 +38,68 @@ func newTunPoller(tun *TunDev, stop *stoppedFlag) *tunPoller {
 
 func (p *tunPoller) close() { putBuf(p.buf) }
 
-// Run drains all ready queue fds, then blocks on poll until data or stop.
-// onEmpty is called before each blocking poll (stats). onPkt returns false to exit.
+// drainQueue reads all available packets from one TUN queue fd.
+// exit is true when onPkt requests the poller to stop.
+func (p *tunPoller) drainQueue(q *os.File, onPkt func(pkt []byte, n int) bool) (got, exit bool) {
+	for {
+		n, err := tunReadNB(q, p.buf)
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+			break
+		}
+		if err != nil || n == 0 {
+			if err != nil && !p.stop.stopped() {
+				logWarn("tun read: " + err.Error())
+			}
+			break
+		}
+		got = true
+		if !onPkt(p.buf[:n], n) {
+			return got, true
+		}
+	}
+	return got, false
+}
+
+// Run drains ready queue fds, then blocks on poll until data or stop.
+// After a poll timeout, skips the all-queue EAGAIN scan and polls again — this
+// avoids N×read(EAGAIN) syscalls per idle cycle when tun_queues > 1.
 func (p *tunPoller) Run(onEmpty func(), onPkt func(pkt []byte, n int) bool) {
+	idleCap := perfIdleCapMs()
+	eager := true
 	for !p.stop.stopped() {
-		got := false
-		for _, q := range p.tun.fds {
-			for {
-				n, err := tunReadNB(q, p.buf)
-				if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
-					break
-				}
-				if err != nil || n == 0 {
-					if err != nil && !p.stop.stopped() {
-						logWarn("tun read: " + err.Error())
-					}
-					break
-				}
-				got = true
-				if !onPkt(p.buf[:n], n) {
+		if eager {
+			eager = false
+			got := false
+			for _, q := range p.tun.fds {
+				g, exit := p.drainQueue(q, onPkt)
+				if exit {
 					return
 				}
+				if g {
+					got = true
+				}
 			}
-		}
-		if got {
-			p.idleMs = p.baseMs
-			continue
+			if got {
+				p.idleMs = p.baseMs
+				eager = true
+				continue
+			}
 		}
 		if onEmpty != nil {
 			onEmpty()
 		}
-		_, _ = unix.Poll(p.pollFds, p.idleMs)
-		if p.idleMs < 50 {
+		n, _ := unix.Poll(p.pollFds, p.idleMs)
+		if n > 0 {
+			for i := range p.pollFds {
+				if p.pollFds[i].Revents&unix.POLLIN != 0 {
+					if _, exit := p.drainQueue(p.tun.fds[i], onPkt); exit {
+						return
+					}
+				}
+			}
+			p.idleMs = p.baseMs
+			eager = true
+		} else if p.idleMs < idleCap {
 			p.idleMs += p.baseMs
 		}
 	}

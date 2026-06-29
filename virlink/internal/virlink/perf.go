@@ -87,7 +87,7 @@ func initUserspacePerfDefaults(c *Config) {
 		tunQueues:  queues,
 		batchSize:  defBatchSize,
 		txQLen:     defTxQLen,
-		pollMs:     5,
+		pollMs:     10, // 10ms idle poll — good CPU/bandwidth balance; wire boost can lower
 		tcpStreams: streams,
 	}
 
@@ -239,6 +239,22 @@ func perfBatchSize() int     { return perf.batchSize }
 func perfTxQLen() int         { return perf.txQLen }
 func perfPollMs() int         { return perf.pollMs }
 func perfTcpStreams() int     { return perf.tcpStreams }
+
+// perfIdleCapMs is the max adaptive idle poll backoff (TX poller + wire RX loops).
+func perfIdleCapMs() int {
+	if perf.pollMs >= 20 {
+		return 200
+	}
+	return 100
+}
+
+// idleBackoff increases idle poll interval up to perfIdleCapMs.
+func idleBackoff(idleMs, pollMs int) int {
+	if cap := perfIdleCapMs(); idleMs < cap {
+		return idleMs + pollMs
+	}
+	return idleMs
+}
 
 func perfSummary() string {
 	return fmt.Sprintf(
