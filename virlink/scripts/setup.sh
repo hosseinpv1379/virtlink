@@ -3145,7 +3145,8 @@ EOF
 
 hysteria2_write_client_yaml() {
   local dir="$1" port="$2" remote_ip="$3" client_ip="$4" server_ip="$5" mtu="$6" dev="$7" obfs="$8"
-  local wrap_port=$((10000 + port))
+  local wrap_listen=$((10000 + port))
+  local wrap_remote=$((10001 + port))
   local pass pin=""
   pass="$(tr -d '\n' < "${dir}/password")"
   if [[ -f "${dir}/pin.sha256" ]]; then
@@ -3173,8 +3174,8 @@ quic:
   maxIdleTimeout: 60s
 
 udpForwarding:
-  - listen: 127.0.0.1:${wrap_port}
-    remote: 127.0.0.1:${wrap_port}
+  - listen: 127.0.0.1:${wrap_listen}
+    remote: 127.0.0.1:${wrap_remote}
     timeout: 300s
 EOF
   if [[ -n "$obfs" ]]; then
@@ -3398,9 +3399,10 @@ EOF
   fi
 
   blank
-  local wrap_port=$((10000 + port))
+  local wrap_listen=$((10000 + port))
+  local wrap_remote=$((10001 + port))
   info "Overlay TUN: client ${client_ip}  ·  server ${server_ip}  (from ${cidr})"
-  info "UDP wrap port: 127.0.0.1:${wrap_port}  (10000 + QUIC port ${port})"
+  info "UDP wrap: hysteria listen 127.0.0.1:${wrap_listen}  →  server remote 127.0.0.1:${wrap_remote}"
   info "Test: ping peer overlay IP, or nc -u for UDP"
   info "Log: /var/log/virlink/${name}-hysteria2.log"
 }

@@ -48,13 +48,26 @@ func (t *Hysteria2Tunnel) DevName() string {
 func (t *Hysteria2Tunnel) OverlayIP() string { return core.OverlayAddr(t.cfg, hysteria2Subnet) }
 func (t *Hysteria2Tunnel) PeerIP() string    { return core.PeerAddr(t.cfg, hysteria2Subnet) }
 
-func hysteria2WrapPort(c *config.Config) int {
+func hysteria2WrapListenPort(c *config.Config) int {
 	port := c.Transport.Port
 	if port == 0 {
 		port = 443
 	}
 	return 10000 + port
 }
+
+// wrapRemotePort is where hysteria delivers on the server (virlink listens here).
+// Separate from listen port so client-side hysteria (listen) and server-side virlink
+// (remote target) never share the same local port role.
+func hysteria2WrapRemotePort(c *config.Config) int {
+	port := c.Transport.Port
+	if port == 0 {
+		port = 443
+	}
+	return 10001 + port
+}
+
+func hysteria2WrapPort(c *config.Config) int { return hysteria2WrapListenPort(c) }
 
 func cloneUDPAddr(a *net.UDPAddr) *net.UDPAddr {
 	if a == nil {
@@ -65,21 +78,6 @@ func cloneUDPAddr(a *net.UDPAddr) *net.UDPAddr {
 		c.IP = append([]byte(nil), a.IP...)
 	}
 	return &c
-}
-
-// wrapPayloadIsIP returns true when buf looks like a raw IPv4/IPv6 frame for TUN.
-func wrapPayloadIsIP(buf []byte, n int) bool {
-	if n < 20 {
-		return false
-	}
-	switch buf[0] >> 4 {
-	case 4:
-		return n >= int(buf[0]&0x0f)*4
-	case 6:
-		return n >= 40
-	default:
-		return false
-	}
 }
 
 func (t *Hysteria2Tunnel) Up() error {
@@ -102,7 +100,8 @@ func (t *Hysteria2Tunnel) Up() error {
 	if port == 0 {
 		port = 443
 	}
-	wrapPort := hysteria2WrapPort(c)
+	wrapListen := hysteria2WrapListenPort(c)
+	wrapRemote := hysteria2WrapRemotePort(c)
 	mtu := c.Tunnel.MTU
 	if mtu == 0 {
 		mtu = 1400
@@ -144,16 +143,6 @@ func (t *Hysteria2Tunnel) Up() error {
 	}
 	platform.LogOK(fmt.Sprintf("%s  %s  MTU=%d  queues=%d", dev, addr, mtu, t.tun.QueueCount()))
 
-	if c.Mode == "server" {
-		platform.Step(fmt.Sprintf("UDP wrap listener 127.0.0.1:%d...", wrapPort))
-		t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wrapPort})
-		if err != nil {
-			return fmt.Errorf("udp wrap :%d: %w", wrapPort, err)
-		}
-		platform.TuneUDPConn(t.udpConn)
-		platform.LogOK(fmt.Sprintf("UDP wrap 127.0.0.1:%d", wrapPort))
-	}
-
 	subcmd := "client"
 	if c.Mode == "server" {
 		subcmd = "server"
@@ -185,16 +174,26 @@ func (t *Hysteria2Tunnel) Up() error {
 		return err
 	}
 
+	if c.Mode == "server" {
+		platform.Step(fmt.Sprintf("UDP wrap listener 127.0.0.1:%d...", wrapRemote))
+		t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wrapRemote})
+		if err != nil {
+			return fmt.Errorf("udp wrap :%d: %w", wrapRemote, err)
+		}
+		platform.TuneUDPConn(t.udpConn)
+		platform.LogOK(fmt.Sprintf("UDP wrap 127.0.0.1:%d (remote target for hysteria)", wrapRemote))
+	}
+
 	if c.Mode == "client" {
-		// hysteria client binds udpForwarding on 127.0.0.1:wrapPort — we send there from an ephemeral port.
-		platform.Step(fmt.Sprintf("UDP wrap socket → hysteria 127.0.0.1:%d...", wrapPort))
+		// hysteria client binds udpForwarding on listen port — we send there from an ephemeral port.
+		platform.Step(fmt.Sprintf("UDP wrap socket → hysteria 127.0.0.1:%d...", wrapListen))
 		t.udpConn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 		if err != nil {
 			return fmt.Errorf("udp wrap socket: %w", err)
 		}
 		platform.TuneUDPConn(t.udpConn)
-		t.wrapAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wrapPort}
-		platform.LogOK(fmt.Sprintf("UDP wrap → 127.0.0.1:%d", wrapPort))
+		t.wrapAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wrapListen}
+		platform.LogOK(fmt.Sprintf("UDP wrap → hysteria 127.0.0.1:%d (remote on server :%d)", wrapListen, wrapRemote))
 	}
 
 	tun0 := t.tun.Fd0()
@@ -206,9 +205,9 @@ func (t *Hysteria2Tunnel) Up() error {
 		go t.txPollLoopClient(t.udpConn)
 	}
 
-	if c.Mode == "client" {
+	if c.Mode == "client" || c.Mode == "server" {
 		platform.Step("rp_filter=2 (Hysteria2 TUN)...")
-		t.applyHysteria2ClientRpFilter()
+		t.applyHysteria2RpFilter()
 	}
 
 	platform.Step(fmt.Sprintf("tuning (%s)...", platform.TuningModeLabel(c)))
@@ -216,10 +215,10 @@ func (t *Hysteria2Tunnel) Up() error {
 	platform.AddMSS(c, dev)
 
 	platform.LogOK(fmt.Sprintf("hysteria2 running  pid=%d  dev=%s", t.cmd.Process.Pid, dev))
-	platform.LogOK(fmt.Sprintf("overlay %s  peer %s  wrap :%d", addr, peer, wrapPort))
+	platform.LogOK(fmt.Sprintf("overlay %s  peer %s  wrap listen:%d remote:%d", addr, peer, wrapListen, wrapRemote))
 
 	platform.Done(dev, addr, peer,
-		fmt.Sprintf("transport : Hysteria2 QUIC :%d  wrap UDP :%d", port, wrapPort),
+		fmt.Sprintf("transport : Hysteria2 QUIC :%d  wrap listen:%d remote:%d", port, wrapListen, wrapRemote),
 		"config    : "+hy.Config,
 		"log       : "+logPath,
 		"test      : ping -c3 "+peer,
@@ -247,9 +246,6 @@ func (t *Hysteria2Tunnel) rxLoopServer(conn *net.UDPConn, tun *os.File) {
 		}
 		t.lastPeer.Store(cloneUDPAddr(src))
 		platform.StatInc(platform.StatUDPRxRecv)
-		if !wrapPayloadIsIP(buf, n) {
-			continue
-		}
 		if err := platform.TunWrite(tun, buf[:n]); err != nil && !t.stop.Stopped() {
 			platform.LogWarn("tun write: " + err.Error())
 		} else {
@@ -301,9 +297,6 @@ func (t *Hysteria2Tunnel) rxLoopClient(conn *net.UDPConn, tun *os.File) {
 			continue
 		}
 		platform.StatInc(platform.StatUDPRxRecv)
-		if !wrapPayloadIsIP(buf, n) {
-			continue
-		}
 		if err := platform.TunWrite(tun, buf[:n]); err != nil && !t.stop.Stopped() {
 			platform.LogWarn("tun write: " + err.Error())
 		} else {
@@ -343,7 +336,7 @@ func (t *Hysteria2Tunnel) Down() error {
 	return nil
 }
 
-func (t *Hysteria2Tunnel) applyHysteria2ClientRpFilter() {
+func (t *Hysteria2Tunnel) applyHysteria2RpFilter() {
 	for _, k := range []string{"net.ipv4.conf.default.rp_filter", "net.ipv4.conf.all.rp_filter"} {
 		prev, err := platform.ReadSysctl(k)
 		entry := platform.SavedSysctl{Key: k, Ok: err == nil}
@@ -357,7 +350,7 @@ func (t *Hysteria2Tunnel) applyHysteria2ClientRpFilter() {
 	}
 }
 
-func (t *Hysteria2Tunnel) restoreHysteria2ClientRpFilter() {
+func (t *Hysteria2Tunnel) restoreHysteria2RpFilter() {
 	for i := len(t.savedRpFilter) - 1; i >= 0; i-- {
 		s := t.savedRpFilter[i]
 		if s.Ok {
@@ -370,7 +363,7 @@ func (t *Hysteria2Tunnel) restoreHysteria2ClientRpFilter() {
 func (t *Hysteria2Tunnel) doClean() {
 	t.stop.Stop()
 	t.stopProcess()
-	t.restoreHysteria2ClientRpFilter()
+	t.restoreHysteria2RpFilter()
 	if t.udpConn != nil {
 		t.udpConn.Close()
 		t.udpConn = nil
