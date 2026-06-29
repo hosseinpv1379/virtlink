@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
-	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -94,7 +93,7 @@ func (t *BipTunnel) Up() error {
 	t.done = make(chan struct{})
 
 	rawFd := t.rawFd
-	go t.rxLoop(rawFd, t.tun.WriteFd())
+	go t.rxLoop(rawFd, t.tun.Fd0())
 	go t.txPollLoop(rawFd)
 
 	done(dev, addr, peer,
@@ -117,8 +116,15 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 	batch := newTunRxBatch(bsz)
 
 	flush := func() {
-		written, total, err := batch.flush(tun)
-		reportTunRxFlush(written, total, err, statBIPRxWrite, statBIPRxDropWrite, "bip:tun_write", "BIP", &t.stop)
+		n, err := batch.flush(tun)
+		if n == 0 {
+			return
+		}
+		if err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
+		} else if err == nil {
+			statAdd(statBIPRxWrite, uint64(n))
+		}
 	}
 	defer flush()
 
@@ -157,10 +163,9 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 				t.lastSrc.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
 			}
 			statInc(statBIPRxRecv)
-			logInfoOnce("tunnel:wire:rx", 24*time.Hour, "first valid packet from peer on wire (RX path OK)")
 			batch.add(inner)
 		}
-		if batch.len() > 0 {
+		if batch.len() >= bsz {
 			flush()
 		}
 	}

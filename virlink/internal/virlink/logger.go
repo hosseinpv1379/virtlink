@@ -46,7 +46,6 @@ func initLogger(cfg *LoggingCfg) {
 		globalLevel = lvlInfo
 	}
 	initProfiler(&Config{Logging: *cfg})
-	initDiagSnap()
 }
 
 func levelAllows(min logLevel) bool { return globalLevel >= min }
@@ -327,7 +326,6 @@ const (
 	cYellow = "\033[33m"
 	cBlue   = "\033[34m"
 	cCyan   = "\033[36m"
-	cMagenta = "\033[35m"
 )
 
 func color(c, s string) string {

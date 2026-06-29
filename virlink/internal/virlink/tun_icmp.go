@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
-	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -115,7 +114,7 @@ func (t *IcmpTunnel) Up() error {
 	t.done = make(chan struct{})
 
 	rawFd := t.rawFd
-	go t.rxLoop(rawFd, t.tun.WriteFd())
+	go t.rxLoop(rawFd, t.tun.Fd0())
 	go t.txPollLoop(rawFd)
 
 	done(dev, addr, peer,
@@ -224,8 +223,18 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 	batch := newTunRxBatch(bsz)
 
 	flush := func() {
-		written, total, err := batch.flush(tun)
-		reportTunRxFlush(written, total, err, statICMPRxWrite, statICMPRxDropWrite, "icmp:tun_write", "ICMP", &t.stop)
+		n, err := batch.flush(tun)
+		if n == 0 {
+			return
+		}
+		if err != nil {
+			statInc(statICMPRxDropWrite)
+			if !t.stop.stopped() {
+				logWarn(fmt.Sprintf("icmp tun write: %v (dropped %d pkt)", err, n))
+			}
+		} else {
+			statAdd(statICMPRxWrite, uint64(n))
+		}
 	}
 	defer flush()
 
@@ -269,7 +278,6 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 				continue
 			}
 			statInc(statICMPRxRecv)
-			logInfoOnce("tunnel:wire:rx", 24*time.Hour, "first valid packet from peer on wire (RX path OK)")
 			seq := binary.BigEndian.Uint16(icmp[6:8])
 			if t.dedup.dup(seq) {
 				statInc(statICMPRxDropSeq)
@@ -281,7 +289,7 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 			}
 			batch.add(inner)
 		}
-		if batch.len() > 0 {
+		if batch.len() >= bsz {
 			flush()
 		}
 	}

@@ -130,7 +130,7 @@ func (t *TcpMuxTunnel) Up() error {
 	addMSS(c, dev)
 	t.done = make(chan struct{})
 
-	tun0 := t.tun.WriteFd()
+	tun0 := t.tun.Fd0()
 	go t.txPollLoop()
 
 	streams := perfTcpStreams()
@@ -370,8 +370,15 @@ func (t *TcpMuxTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 	batch := newTunRxBatch(bsz)
 
 	flush := func() {
-		written, total, err := batch.flush(tun)
-		reportTunRxFlush(written, total, err, statTCPRxWrite, -1, "tcpmux:tun_write", "TCPMUX", &t.stop)
+		n, err := batch.flush(tun)
+		if n == 0 {
+			return
+		}
+		if err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
+		} else if err == nil {
+			statAdd(statTCPRxWrite, uint64(n))
+		}
 	}
 	defer flush()
 

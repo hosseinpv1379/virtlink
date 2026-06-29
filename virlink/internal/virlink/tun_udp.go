@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"sync/atomic"
-	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -105,11 +104,11 @@ func (t *UdpTunnel) Up() error {
 
 	if t.wire.on {
 		rawFd := t.rawFd
-		go t.rxLoopRaw(rawFd, t.tun.WriteFd(), port)
+		go t.rxLoopRaw(rawFd, t.tun.Fd0(), port)
 		go t.txPollLoopRaw(rawFd, port)
 	} else {
 		conn := t.udpConn
-		go t.rxLoop(conn, t.tun.WriteFd())
+		go t.rxLoop(conn, t.tun.Fd0())
 		go t.txPollLoop(conn)
 	}
 
@@ -130,8 +129,18 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 	batch := newTunRxBatch(bsz)
 
 	flush := func() {
-		written, total, err := batch.flush(tun)
-		reportTunRxFlush(written, total, err, statUDPRxWrite, statUDPRxDropWrite, "udp:tun_write", "UDP", &t.stop)
+		n, err := batch.flush(tun)
+		if n == 0 {
+			return
+		}
+		if err != nil {
+			statInc(statUDPRxDropWrite)
+			if !t.stop.stopped() {
+				logWarn(fmt.Sprintf("udp tun write: %v (dropped %d pkt)", err, n))
+			}
+		} else {
+			statAdd(statUDPRxWrite, uint64(n))
+		}
 	}
 	defer flush()
 
@@ -185,10 +194,9 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 				t.lastRoute.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
 			}
 			statInc(statUDPRxRecv)
-			logInfoOnce("tunnel:wire:rx", 24*time.Hour, "first valid packet from peer on wire (RX path OK)")
 			batch.add(payload)
 		}
-		if batch.len() > 0 {
+		if batch.len() >= bsz {
 			flush()
 		}
 	}
@@ -292,8 +300,18 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 	var lastPeerPort uint16
 
 	flush := func() {
-		written, total, err := batch.flush(tun)
-		reportTunRxFlush(written, total, err, statUDPRxWrite, statUDPRxDropWrite, "udp:tun_write", "UDP", &t.stop)
+		n, err := batch.flush(tun)
+		if n == 0 {
+			return
+		}
+		if err != nil {
+			statInc(statUDPRxDropWrite)
+			if !t.stop.stopped() {
+				logWarn(fmt.Sprintf("udp tun write: %v (dropped %d pkt)", err, n))
+			}
+		} else {
+			statAdd(statUDPRxWrite, uint64(n))
+		}
 	}
 	defer flush()
 
@@ -327,8 +345,8 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 				continue
 			}
 			if t.cfg.Mode == "server" {
-				// from4 already returns the port in host byte order.
-				saPort := uint16(sa.Port)
+				// Network byte-order port from RawSockaddrInet4.
+				saPort := uint16(sa.Port>>8) | uint16(sa.Port<<8)
 				if sa.Addr != lastPeerAddr || saPort != lastPeerPort {
 					lastPeerAddr = sa.Addr
 					lastPeerPort = saPort
@@ -339,10 +357,9 @@ func (t *UdpTunnel) rxLoop(conn *net.UDPConn, tun *os.File) {
 				}
 			}
 			statInc(statUDPRxRecv)
-			logInfoOnce("tunnel:wire:rx", 24*time.Hour, "first valid packet from peer on wire (RX path OK)")
 			batch.add(pkt)
 		}
-		if batch.len() > 0 {
+		if batch.len() >= bsz {
 			flush()
 		}
 	}
@@ -382,12 +399,10 @@ func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 		if err := tunWrite(tun, buf[:n]); err != nil {
 			statInc(statUDPRxDropWrite)
 			if !t.stop.stopped() {
-				logDiagOnce("udp:tun_write", 15*time.Second,
-					fmt.Sprintf("UDP TUN write failed: %v", err))
+				logWarn(fmt.Sprintf("udp tun write: %v", err))
 			}
 		} else {
 			statInc(statUDPRxWrite)
-			NoteTunnelInjected(1)
 		}
 	}
 }
@@ -399,7 +414,7 @@ func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 	rawFd, err := udpConnFD(conn)
 	if err != nil {
-		logDiagOnce("udp:tx_batch", 30*time.Second, "UDP sendmmsg unavailable: "+err.Error()+" (fallback path)")
+		logWarn("udp tx batch: " + err.Error())
 		t.txPollLoopUnbatched(conn)
 		return
 	}

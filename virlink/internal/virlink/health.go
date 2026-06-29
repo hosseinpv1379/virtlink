@@ -87,33 +87,6 @@ func (h *HealthMgr) markRx() {
 	h.rxCount.Add(1)
 }
 
-// NoteTunnelAlive marks the tunnel alive after packets are injected into the TUN.
-// Call only after a successful tun write — wire recv alone must not set hs=connected
-// when injection is broken (otherwise ping fails while logs show "connected").
-func NoteTunnelAlive() {
-	if h := activeTunnelHealth.Load(); h != nil {
-		h.markRx()
-	}
-}
-
-// NoteTunnelInjected updates handshake keepalive after n packets reach the kernel stack.
-func NoteTunnelInjected(n int) {
-	if n <= 0 {
-		return
-	}
-	NoteTunnelAlive()
-	logInfoOnce("tunnel:tun:inject", 24*time.Hour,
-		"first packet injected into TUN from wire (RX path OK)")
-}
-
-var activeTunnelHealth atomic.Pointer[HealthMgr]
-
-// BindTunnelHealth registers the process health manager for wire-level keepalive.
-func BindTunnelHealth(h *HealthMgr) { activeTunnelHealth.Store(h) }
-
-// UnbindTunnelHealth clears the wire-level health binding on shutdown.
-func UnbindTunnelHealth() { activeTunnelHealth.Store(nil) }
-
 // LastSeenAge returns how long ago the last probe was received.
 // Returns -1 if no probe has ever been received.
 func (h *HealthMgr) LastSeenAge() time.Duration {

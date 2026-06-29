@@ -8,7 +8,7 @@ package virlink
 import (
 	"fmt"
 	"net"
-	"time"
+	"sync/atomic"
 )
 
 const ipHdrLen = 20
@@ -113,10 +113,15 @@ func wireTCPDoneExtra(cfg *Config) string {
 		cfg.Mangle.SrcIP, cfg.RemoteIP, cfg.Mangle.DstIP, cfg.RemoteIP)
 }
 
+var wireTxErrWarned atomic.Bool
+
 func noteWireTxErr(n int) {
 	if n <= 0 {
 		return
 	}
-	logDiagOnce("wire:tx", 30*time.Second,
-		fmt.Sprintf("wire TX failed %d pkt — run as root, set rp_filter=0, check outbound firewall and routing", n))
+	if wireTxErrWarned.CompareAndSwap(false, true) {
+		logWarn(fmt.Sprintf("[wire] TX failed %d packet(s) — run as root, rp_filter=0, check firewall / routing", n))
+	} else if n > 0 {
+		logDebug(fmt.Sprintf("[wire] TX failed %d packet(s)", n))
+	}
 }

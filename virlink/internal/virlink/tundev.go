@@ -1,9 +1,9 @@
 // tundev.go — TUN device helpers (single + multi-queue).
 //
-// IFF_MULTI_QUEUE opens N fds for the same interface. The kernel spreads
-// stack→userspace packets across all N queues — every fd must be polled.
-// Wire→TUN inject writes to fds[0]; tunWrite() retries EAGAIN with POLLOUT
-// so O_NONBLOCK on the read poller does not break injection.
+// IFF_MULTI_QUEUE gives N file descriptors for the same interface.
+// The kernel load-balances outbound packets (stack → userspace) across
+// queues, so N parallel txLoop goroutines can read at N× the rate of one.
+// Falls back to a single queue when the kernel rejects multi-queue.
 package virlink
 
 import (
@@ -20,7 +20,7 @@ const (
 	tunSetIff = uintptr(0x400454ca)
 )
 
-// TunDev holds N queue fds for one TUN interface.
+// TunDev holds one or more TUN queue file descriptors.
 type TunDev struct {
 	fds    []*os.File
 	queues int
@@ -32,13 +32,9 @@ func (t *TunDev) Close() {
 			f.Close()
 		}
 	}
-	t.fds = nil
 }
 
 func (t *TunDev) Fd0() *os.File { return t.fds[0] }
-
-// WriteFd returns fds[0] for wire→TUN injection.
-func (t *TunDev) WriteFd() *os.File { return t.fds[0] }
 
 func (t *TunDev) QueueCount() int {
 	if t == nil {
@@ -68,14 +64,7 @@ func openTunMulti(name string, n int) (*TunDev, error) {
 }
 
 func openTunMultiTry(name string, n int) (*TunDev, error) {
-	if n < 1 {
-		n = 1
-	}
-	td := &TunDev{
-		fds:    make([]*os.File, 0, n),
-		queues: n,
-	}
-	useMQ := n > 1
+	td := &TunDev{fds: make([]*os.File, 0, n), queues: n}
 	for i := 0; i < n; i++ {
 		fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
 		if err != nil {
@@ -85,7 +74,7 @@ func openTunMultiTry(name string, n int) (*TunDev, error) {
 		var ifr [40]byte
 		copy(ifr[:16], name)
 		flags := unix.IFF_TUN | unix.IFF_NO_PI
-		if useMQ {
+		if n > 1 {
 			flags |= unix.IFF_MULTI_QUEUE
 		}
 		*(*uint16)(unsafe.Pointer(&ifr[16])) = uint16(flags)
@@ -104,12 +93,9 @@ func openTunMultiTry(name string, n int) (*TunDev, error) {
 }
 
 func tunWrite(fd *os.File, pkt []byte) error {
-	if len(pkt) == 0 {
-		return nil
-	}
 	rawFd := int(fd.Fd())
-	pfd := []unix.PollFd{{Fd: int32(rawFd), Events: unix.POLLOUT}}
-	for attempt := 0; attempt < 256; attempt++ {
+	const maxRetries = 32
+	for i := 0; ; i++ {
 		_, err := unix.Write(rawFd, pkt)
 		if err == nil {
 			return nil
@@ -117,15 +103,16 @@ func tunWrite(fd *os.File, pkt []byte) error {
 		if err == unix.EINTR {
 			continue
 		}
-		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-			_, _ = unix.Poll(pfd, 50)
+		if (err == unix.EAGAIN || err == unix.EWOULDBLOCK) && i < maxRetries {
+			unix.Nanosleep(&unix.Timespec{Nsec: 1_000_000}, nil)
 			continue
 		}
 		return err
 	}
-	return unix.EAGAIN
 }
 
+// tunReadNB reads one packet from a non-blocking TUN fd.
+// Returns (0, EAGAIN) when no data is available.
 func tunReadNB(fd *os.File, buf []byte) (int, error) {
 	n, err := fd.Read(buf)
 	if err != nil {
@@ -136,6 +123,7 @@ func tunReadNB(fd *os.File, buf []byte) (int, error) {
 	return n, err
 }
 
+// pollFD waits until fd is readable/writable or timeoutMs elapses.
 func pollFD(fd int, events int16, timeoutMs int) error {
 	fds := []unix.PollFd{{Fd: int32(fd), Events: events}}
 	for {
