@@ -27,6 +27,7 @@ const (
 var (
 	tuningMu     sync.Mutex
 	activeTuning *tunnelTuning
+	tuningRefs   int // active tunnel count — restore sysctl only when last tunnel stops
 )
 
 type sysctlParam struct{ k, v string }
@@ -243,9 +244,13 @@ func ApplyTunnelTuning(cfg *config.Config, devs ...string) {
 	tuningMu.Lock()
 	defer tuningMu.Unlock()
 
+	tuningRefs++
 	if activeTuning != nil {
-		activeTuning.restoreLocked()
-		activeTuning = nil
+		activeTuning.mergeDevs(cfg, devs...)
+		if tuningEnabled(cfg) {
+			logOK(fmt.Sprintf("tuning merged: +devs=%v (refs=%d)", devs, tuningRefs))
+		}
+		return
 	}
 
 	tt := &tunnelTuning{cfg: cfg, devs: append([]string(nil), devs...)}
@@ -262,6 +267,12 @@ func ApplyTunnelTuning(cfg *config.Config, devs ...string) {
 func RestoreTunnelTuning() {
 	tuningMu.Lock()
 	defer tuningMu.Unlock()
+	if tuningRefs > 0 {
+		tuningRefs--
+	}
+	if tuningRefs > 0 {
+		return // other tunnels still up — keep sysctl
+	}
 	if activeTuning != nil {
 		activeTuning.restoreLocked()
 		activeTuning = nil
@@ -311,39 +322,61 @@ func (tt *tunnelTuning) applyLocked() {
 		}
 	}
 
-	// ICMP tunnel only: stop the kernel from auto-replying to echo requests.
-	// The tunnel encapsulates data as ICMP echo requests; if the kernel also
-	// answers each one with an echo reply it doubles wire traffic, floods the
-	// raw socket RX buffer (RAM climbs to SO_RCVBUFFORCE) and burns CPU parsing
-	// and discarding those replies — exactly the "CPU/RAM fill up" symptom.
-	// Restored to its previous value on teardown (tt.set saves the old value).
-	if cfg.Tunnel.Type == "icmp" {
-		params = append(params, sysctlParam{"net.ipv4.icmp_echo_ignore_all", "1"})
-	}
+	// Do NOT set net.ipv4.icmp_echo_ignore_all here. It is global and breaks overlay
+	// ping (ICMP echo/reply through TUN) for udp/tcp and all other tunnels on this
+	// host. Wire-side duplicate ICMP replies for the icmp tunnel are filtered in
+	// userspace (protocol/icmp rxLoop).
 
 	for _, p := range params {
 		tt.set(p.k, p.v)
 	}
 }
 
-func (tt *tunnelTuning) applyLinkProfile(p tuningProfile) {
-	for _, dev := range tt.devs {
-		link, err := netlink.LinkByName(dev)
-		if err != nil {
-			warn("tuning link " + dev + ": " + err.Error())
+func (tt *tunnelTuning) mergeDevs(cfg *config.Config, devs ...string) {
+	for _, dev := range devs {
+		if dev == "" || tuningHasDev(tt.devs, dev) {
 			continue
 		}
-		sl := savedLink{dev: dev, ok: true, txQLen: link.Attrs().TxQLen}
-		tt.savedLinks = append(tt.savedLinks, sl)
-
-		if qlen := perfTxQLen(); qlen > 0 {
-			_ = netlink.LinkSetTxQLen(link, qlen)
+		tt.devs = append(tt.devs, dev)
+		for _, p := range perDevParams(dev) {
+			tt.set(p.k, p.v)
 		}
-		// TUN devices don't benefit from fq/fq_codel and it can break delivery.
-		if p.qdisc != "" && link.Type() != "tun" {
-			if err := replaceDevQdisc(link, p.qdisc); err != nil {
-				warn(fmt.Sprintf("tuning qdisc %s on %s: %v", p.qdisc, dev, err))
-			}
+		if tuningEnabled(cfg) {
+			tt.applyLinkProfileDev(dev, profileForMode(tuningMode(cfg)))
+		}
+	}
+}
+
+func tuningHasDev(devs []string, dev string) bool {
+	for _, d := range devs {
+		if d == dev {
+			return true
+		}
+	}
+	return false
+}
+
+func (tt *tunnelTuning) applyLinkProfile(p tuningProfile) {
+	for _, dev := range tt.devs {
+		tt.applyLinkProfileDev(dev, p)
+	}
+}
+
+func (tt *tunnelTuning) applyLinkProfileDev(dev string, p tuningProfile) {
+	link, err := netlink.LinkByName(dev)
+	if err != nil {
+		warn("tuning link " + dev + ": " + err.Error())
+		return
+	}
+	sl := savedLink{dev: dev, ok: true, txQLen: link.Attrs().TxQLen}
+	tt.savedLinks = append(tt.savedLinks, sl)
+
+	if qlen := perfTxQLen(); qlen > 0 {
+		_ = netlink.LinkSetTxQLen(link, qlen)
+	}
+	if p.qdisc != "" && link.Type() != "tun" {
+		if err := replaceDevQdisc(link, p.qdisc); err != nil {
+			warn(fmt.Sprintf("tuning qdisc %s on %s: %v", p.qdisc, dev, err))
 		}
 	}
 }
