@@ -135,18 +135,20 @@ func balancedGlobalParams() []sysctlParam {
 	return append(requiredGlobalParams(), []sysctlParam{
 		{"net.core.default_qdisc", "fq"},
 		{"net.ipv4.tcp_congestion_control", "bbr"},
-		{"net.core.rmem_max", "33554432"},
-		{"net.core.wmem_max", "33554432"},
+		// 64 MB matches perfSockBuf() for tcp/tcpmux so SO_RCVBUF requests succeed
+		// without needing SO_RCVBUFFORCE (though tuneTCPConnForce tries that too).
+		{"net.core.rmem_max", "67108864"},
+		{"net.core.wmem_max", "67108864"},
 		{"net.core.rmem_default", "1048576"},
 		{"net.core.wmem_default", "1048576"},
-		{"net.ipv4.tcp_rmem", "16384 1048576 33554432"},
-		{"net.ipv4.tcp_wmem", "16384 1048576 33554432"},
+		{"net.ipv4.tcp_rmem", "16384 1048576 67108864"},
+		{"net.ipv4.tcp_wmem", "16384 1048576 67108864"},
 		{"net.ipv4.tcp_mtu_probing", "1"},
 		{"net.core.netdev_max_backlog", "32768"},
 		{"net.core.optmem_max", "262144"},
 		{"net.ipv4.udp_rmem_min", "65536"},
 		{"net.ipv4.udp_wmem_min", "65536"},
-		{"net.ipv4.udp_mem", "65536 1048576 33554432"},
+		{"net.ipv4.udp_mem", "65536 1048576 67108864"},
 		{"net.ipv4.tcp_slow_start_after_idle", "0"},
 		{"net.ipv4.tcp_sack", "1"},
 		{"net.ipv4.tcp_window_scaling", "1"},
@@ -159,12 +161,12 @@ func fastGlobalParams() []sysctlParam {
 		{"net.core.netdev_max_backlog", "32768"},
 		{"net.core.optmem_max", "262144"},
 		{"net.core.somaxconn", "65536"},
-		{"net.core.rmem_max", "33554432"},
+		{"net.core.rmem_max", "67108864"},
 		{"net.core.rmem_default", "1048576"},
-		{"net.core.wmem_max", "33554432"},
+		{"net.core.wmem_max", "67108864"},
 		{"net.core.wmem_default", "1048576"},
-		{"net.ipv4.tcp_rmem", "16384 1048576 33554432"},
-		{"net.ipv4.tcp_wmem", "16384 1048576 33554432"},
+		{"net.ipv4.tcp_rmem", "16384 1048576 67108864"},
+		{"net.ipv4.tcp_wmem", "16384 1048576 67108864"},
 		{"net.ipv4.tcp_congestion_control", "bbr"},
 		{"net.ipv4.tcp_fin_timeout", "25"},
 		{"net.ipv4.tcp_keepalive_time", "1200"},
@@ -294,9 +296,9 @@ func (tt *tunnelTuning) applyLocked() {
 		tt.applyProcessLimits(p.nofile)
 	} else {
 		params = append(requiredGlobalParams(), []sysctlParam{
-			// Minimum headroom so tuneUDPConn / tuneRawSock can use 16 MB buffers.
-			{"net.core.rmem_max", "33554432"},
-			{"net.core.wmem_max", "33554432"},
+			// Minimum headroom so tuneTCPConnForce / tuneUDPConn can use large buffers.
+			{"net.core.rmem_max", "67108864"},
+			{"net.core.wmem_max", "67108864"},
 			{"net.ipv4.udp_rmem_min", "65536"},
 			{"net.ipv4.udp_wmem_min", "65536"},
 		}...)

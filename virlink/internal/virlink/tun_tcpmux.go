@@ -165,43 +165,29 @@ func (t *TcpMuxTunnel) pickConn(data []byte) net.Conn {
 	return nil
 }
 
-// txPollLoop drains the TUN poller and batches consecutive same-stream frames
-// into one net.Buffers.WriteTo (single writev syscall).
-//
-// Uses RunOwned with hdrRoom=6: the poller reads each TUN packet into buf[6:],
-// leaving buf[0:6] for the 6-byte wire header (2 len + 4 flow_hash).
-// This eliminates the per-packet copy that was needed with a shared read buffer.
+// txPollLoop reads TUN packets, writes the 6-byte wire header in-place, and
+// dispatches each owned buffer to a per-stream channel. A txMuxStreamWriter
+// goroutine per stream accumulates frames into a net.Buffers batch and flushes
+// with one writev syscall — no stream-switch penalty, full parallel TX.
 func (t *TcpMuxTunnel) txPollLoop() {
-	// hdrRoom=6: 2-byte payload length + 4-byte flow hash.
-	poller := newTunPollerH(t.tun, &t.stop, 6)
-	defer poller.close()
-
-	bsz := perfBatchSize()
-	bufs := make(net.Buffers, 0, bsz)
-	pooled := make([][]byte, 0, bsz)
-	var curConn net.Conn
-
-	flush := func() {
-		if len(pooled) == 0 {
-			return
-		}
-		if _, err := bufs.WriteTo(curConn); err != nil {
-			logDebug("tcpmux tx: " + err.Error())
-			t.clearConn(curConn)
-		} else {
-			statAdd(statTCPTxSend, uint64(len(pooled)))
-		}
-		for _, b := range pooled {
-			putBuf(b)
-		}
-		bufs = bufs[:0]
-		pooled = pooled[:0]
-		curConn = nil
+	streams := perfTcpStreams()
+	chs := make([]chan []byte, streams)
+	for i := range chs {
+		chs[i] = make(chan []byte, tcpTxChanCap)
+		go t.txMuxStreamWriter(i, chs[i])
 	}
 
-	// buf is owned; payload is at buf[6:6+n]; buf[0:6] is the header slot.
+	// hdrRoom=6: 2-byte len + 4-byte flow_hash; payload at buf[6:].
+	poller := newTunPollerH(t.tun, &t.stop, 6)
+	defer func() {
+		poller.close()
+		for _, ch := range chs {
+			close(ch)
+		}
+	}()
+
 	poller.RunOwned(
-		func() { flush() },
+		nil,
 		func(buf []byte, n int) bool {
 			statInc(statTCPTxRead)
 			if n > 0xffff {
@@ -210,28 +196,91 @@ func (t *TcpMuxTunnel) txPollLoop() {
 				return !t.stop.stopped()
 			}
 			payload := buf[6 : 6+n]
-			c := t.pickConn(payload)
-			if c == nil {
-				statInc(statTCPTxNoConn)
-				putBuf(buf)
-				return !t.stop.stopped()
-			}
-			if curConn != nil && c != curConn {
-				flush()
-			}
-			curConn = c
-			// Write 6-byte header into the reserved slot — no copy of payload.
+			// Write 6-byte header in-place; no payload copy.
 			binary.BigEndian.PutUint16(buf[0:2], uint16(n))
 			binary.BigEndian.PutUint32(buf[2:6], tcpMuxFlowHash(payload, t.hashSeed))
+			slot := tcpMuxSlot(payload, streams, t.hashSeed)
+
+			for i := 0; i < streams; i++ {
+				idx := (slot + i) % streams
+				select {
+				case chs[idx] <- buf:
+					return !t.stop.stopped()
+				default:
+				}
+			}
+			statInc(statTCPTxNoConn)
+			putBuf(buf)
+			return !t.stop.stopped()
+		},
+	)
+}
+
+// txMuxStreamWriter is the per-stream flusher for TCPMUX.
+func (t *TcpMuxTunnel) txMuxStreamWriter(slot int, ch <-chan []byte) {
+	bsz := perfBatchSize()
+	bufs := make(net.Buffers, 0, bsz)
+	pooled := make([][]byte, 0, bsz)
+	pollMs := time.Duration(perfPollMs()) * time.Millisecond
+
+	flush := func() {
+		if len(pooled) == 0 {
+			return
+		}
+		var c net.Conn
+		if p := t.conns[slot].Load(); p != nil {
+			c = *p
+		} else {
+			for i := range t.conns {
+				if p := t.conns[i].Load(); p != nil {
+					c = *p
+					break
+				}
+			}
+		}
+		if c == nil {
+			statInc(statTCPTxNoConn)
+		} else if _, err := bufs.WriteTo(c); err != nil {
+			logDebug(fmt.Sprintf("tcpmux tx stream %d: %v", slot, err))
+			t.clearConn(c)
+		} else {
+			statAdd(statTCPTxSend, uint64(len(pooled)))
+		}
+		for _, b := range pooled {
+			putBuf(b)
+		}
+		bufs = bufs[:0]
+		pooled = pooled[:0]
+	}
+
+	timer := time.NewTimer(pollMs)
+	defer timer.Stop()
+
+	for {
+		select {
+		case buf, ok := <-ch:
+			if !ok {
+				flush()
+				return
+			}
+			n := int(binary.BigEndian.Uint16(buf[0:2]))
 			bufs = append(bufs, buf[:tcpMuxHashHdrLen+2+n])
 			pooled = append(pooled, buf)
 			if len(pooled) >= bsz {
 				flush()
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(pollMs)
 			}
-			return !t.stop.stopped()
-		},
-	)
-	flush()
+		case <-timer.C:
+			flush()
+			timer.Reset(pollMs)
+		}
+	}
 }
 
 func (t *TcpMuxTunnel) clearConn(c net.Conn) {

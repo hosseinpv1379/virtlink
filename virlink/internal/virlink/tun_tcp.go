@@ -126,29 +126,90 @@ func (t *TcpTunnel) pickConn(data []byte) net.Conn {
 	return nil
 }
 
-// txPollLoop drains the TUN poller and batches consecutive same-stream frames
-// into one net.Buffers.WriteTo (single writev syscall).
-//
-// Uses RunOwned with hdrRoom=2: the poller reads each TUN packet into buf[2:],
-// leaving buf[0:2] for the 2-byte length prefix. This eliminates the per-packet
-// copy that was needed when the poller reused a single shared read buffer.
-func (t *TcpTunnel) txPollLoop() {
-	// hdrRoom=2 reserves the 2-byte TCP length header at the start of each buffer.
-	poller := newTunPollerH(t.tun, &t.stop, 2)
-	defer poller.close()
+// tcpTxChanCap is the per-stream TX channel capacity.
+// 512 slots × 1502 bytes ≈ 750 KB per stream — absorbs ~9 ms of bursts at 1 Gbps.
+const tcpTxChanCap = 512
 
+// txPollLoop reads TUN packets and dispatches them into per-stream buffered
+// channels. Each stream runs its own txStreamWriter goroutine that accumulates
+// frames into a net.Buffers batch and flushes with a single writev syscall.
+//
+// This replaces the old "flush on stream-switch" design: each stream writer
+// can fill a full batch independently, and writers for different streams
+// run concurrently on separate goroutines.
+func (t *TcpTunnel) txPollLoop() {
+	streams := perfTcpStreams()
+	chs := make([]chan []byte, streams)
+	for i := range chs {
+		chs[i] = make(chan []byte, tcpTxChanCap)
+		go t.txStreamWriter(i, chs[i])
+	}
+
+	// hdrRoom=2: poller reads TUN packet into buf[2:], leaving buf[0:2] for
+	// the length header — no payload copy on dispatch.
+	poller := newTunPollerH(t.tun, &t.stop, 2)
+	defer func() {
+		poller.close()
+		for _, ch := range chs {
+			close(ch)
+		}
+	}()
+
+	poller.RunOwned(
+		nil, // stream writers handle their own flush timers
+		func(buf []byte, n int) bool {
+			statInc(statTCPTxRead)
+			payload := buf[2 : 2+n]
+			binary.BigEndian.PutUint16(buf[:2], uint16(n))
+			slot := tcpStreamSlot(payload, streams)
+
+			// Try the preferred slot first, then any other — non-blocking.
+			for i := 0; i < streams; i++ {
+				idx := (slot + i) % streams
+				select {
+				case chs[idx] <- buf:
+					return !t.stop.stopped()
+				default:
+				}
+			}
+			// All stream channels full — drop (back-pressure relief).
+			statInc(statTCPTxNoConn)
+			putBuf(buf)
+			return !t.stop.stopped()
+		},
+	)
+}
+
+// txStreamWriter flushes one TCP stream. It reads from ch, accumulates frames
+// into a net.Buffers batch, and writes via a single writev syscall when the
+// batch is full or the flush timer fires.
+func (t *TcpTunnel) txStreamWriter(slot int, ch <-chan []byte) {
 	bsz := perfBatchSize()
 	bufs := make(net.Buffers, 0, bsz)
 	pooled := make([][]byte, 0, bsz)
-	var curConn net.Conn
+	pollMs := time.Duration(perfPollMs()) * time.Millisecond
 
 	flush := func() {
 		if len(pooled) == 0 {
 			return
 		}
-		if _, err := bufs.WriteTo(curConn); err != nil {
-			logDebug("tcp tx: " + err.Error())
-			t.clearConn(curConn)
+		var c net.Conn
+		if p := t.conns[slot].Load(); p != nil {
+			c = *p
+		} else {
+			// Fallback: use any available stream.
+			for i := range t.conns {
+				if p := t.conns[i].Load(); p != nil {
+					c = *p
+					break
+				}
+			}
+		}
+		if c == nil {
+			statInc(statTCPTxNoConn)
+		} else if _, err := bufs.WriteTo(c); err != nil {
+			logDebug(fmt.Sprintf("tcp tx stream %d: %v", slot, err))
+			t.clearConn(c)
 		} else {
 			statAdd(statTCPTxSend, uint64(len(pooled)))
 		}
@@ -157,36 +218,36 @@ func (t *TcpTunnel) txPollLoop() {
 		}
 		bufs = bufs[:0]
 		pooled = pooled[:0]
-		curConn = nil
 	}
 
-	// buf is owned; payload is at buf[2:2+n]; buf[0:2] is the header slot.
-	poller.RunOwned(
-		func() { flush() },
-		func(buf []byte, n int) bool {
-			statInc(statTCPTxRead)
-			payload := buf[2 : 2+n]
-			c := t.pickConn(payload)
-			if c == nil {
-				statInc(statTCPTxNoConn)
-				putBuf(buf)
-				return !t.stop.stopped()
-			}
-			if curConn != nil && c != curConn {
+	timer := time.NewTimer(pollMs)
+	defer timer.Stop()
+
+	for {
+		select {
+		case buf, ok := <-ch:
+			if !ok {
 				flush()
+				return
 			}
-			curConn = c
-			// Write length prefix into the reserved header slot — no copy of payload.
-			binary.BigEndian.PutUint16(buf[:2], uint16(n))
+			n := int(binary.BigEndian.Uint16(buf[:2]))
 			bufs = append(bufs, buf[:2+n])
 			pooled = append(pooled, buf)
 			if len(pooled) >= bsz {
 				flush()
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(pollMs)
 			}
-			return !t.stop.stopped()
-		},
-	)
-	flush()
+		case <-timer.C:
+			flush()
+			timer.Reset(pollMs)
+		}
+	}
 }
 
 func (t *TcpTunnel) clearConn(c net.Conn) {

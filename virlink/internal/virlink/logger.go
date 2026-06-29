@@ -1,19 +1,27 @@
-// logger.go — structured logging with optional CPU activity profiling.
+// logger.go — structured logging with rate limiting and optional profiling.
 //
-// Levels (least → most verbose): error < warn < info < debug
+// Levels: error < warn < info < debug
 // Profile reports ([prof]) are independent — enable with [logging] profile = true
 //
 // Output formats:
 //   tty  : colored symbols + aligned columns
-//   file : "2026-06-25 10:00:00  INF  message"  (grep-friendly)
+//   pipe : "2026-01-02 15:04:05  WRN  message"  (grep-friendly)
+//
+// isatty() result is cached at first call — no Stat syscall per log line.
+// logWarnOnce / logInfoOnce suppress repeated messages within a time window
+// so retry loops do not spam the console.
 package virlink
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
+
+// ── level ────────────────────────────────────────────────────────────────────
 
 type logLevel int
 
@@ -41,6 +49,70 @@ func initLogger(cfg *LoggingCfg) {
 }
 
 func levelAllows(min logLevel) bool { return globalLevel >= min }
+
+// ── buffered stdout ───────────────────────────────────────────────────────────
+
+var (
+	logOut     = bufio.NewWriterSize(os.Stdout, 4096)
+	logOutMu   sync.Mutex
+)
+
+func writeLog(s string) {
+	logOutMu.Lock()
+	_, _ = logOut.WriteString(s)
+	_ = logOut.Flush()
+	logOutMu.Unlock()
+}
+
+// ── isatty (cached) ───────────────────────────────────────────────────────────
+
+var (
+	ttyOnce sync.Once
+	ttyVal  bool
+)
+
+func isatty() bool {
+	ttyOnce.Do(func() {
+		fi, err := os.Stdout.Stat()
+		ttyVal = err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+	})
+	return ttyVal
+}
+
+// ── rate-limited logging ──────────────────────────────────────────────────────
+
+var (
+	rateMu   sync.Mutex
+	rateSeen = make(map[string]time.Time, 64)
+)
+
+// logWarnOnce emits msg at WARN level at most once per window for the given key.
+// Use key as a short stable identifier (e.g. "tcp:stream:0") so the same
+// message from different call sites stays separate.
+func logWarnOnce(key string, window time.Duration, msg string) {
+	rateMu.Lock()
+	now := time.Now()
+	if last, ok := rateSeen[key]; ok && now.Sub(last) < window {
+		rateMu.Unlock()
+		return
+	}
+	rateSeen[key] = now
+	rateMu.Unlock()
+	logWarn(msg)
+}
+
+// logInfoOnce emits msg at INFO level at most once per window for the given key.
+func logInfoOnce(key string, window time.Duration, msg string) {
+	rateMu.Lock()
+	now := time.Now()
+	if last, ok := rateSeen[key]; ok && now.Sub(last) < window {
+		rateMu.Unlock()
+		return
+	}
+	rateSeen[key] = now
+	rateMu.Unlock()
+	logInfo(msg)
+}
 
 // ── public log functions ──────────────────────────────────────────────────────
 
@@ -76,11 +148,13 @@ func logProfile(msg string) {
 // emit is the single output path.
 func emit(level, msg string) {
 	ts := time.Now().Format("2006-01-02 15:04:05")
+	var line string
 	if isatty() {
-		fmt.Printf("%s  %s  %s\n", cGray+ts+cReset, levelSym(level), msg)
+		line = fmt.Sprintf("%s  %s  %s\n", cGray+ts+cReset, levelSym(level), msg)
 	} else {
-		fmt.Printf("%s  %s  %s\n", ts, level, msg)
+		line = fmt.Sprintf("%s  %s  %s\n", ts, level, msg)
 	}
+	writeLog(line)
 }
 
 func levelSym(level string) string {
@@ -146,7 +220,7 @@ func printBanner(tunnelType, mode, localIP, remoteIP, overlay, peer, iface strin
 func step(msg string) {
 	if isatty() {
 		ts := time.Now().Format("2006-01-02 15:04:05")
-		fmt.Printf("%s  %s  %s %s\n", cGray+ts+cReset, cGray+"·"+cReset, cCyan+"→"+cReset, msg)
+		writeLog(fmt.Sprintf("%s  %s  %s %s\n", cGray+ts+cReset, cGray+"·"+cReset, cCyan+"→"+cReset, msg))
 	} else {
 		emit("INF", "[setup] "+msg)
 	}
@@ -155,7 +229,7 @@ func step(msg string) {
 func logOK(msg string) {
 	if isatty() {
 		ts := time.Now().Format("2006-01-02 15:04:05")
-		fmt.Printf("%s  %s  %s %s\n", cGray+ts+cReset, cGray+"·"+cReset, cGreen+"✓"+cReset, msg)
+		writeLog(fmt.Sprintf("%s  %s  %s %s\n", cGray+ts+cReset, cGray+"·"+cReset, cGreen+"✓"+cReset, msg))
 	} else {
 		emit("INF", "[setup] ✓ "+msg)
 	}
@@ -165,7 +239,7 @@ func warn(msg string) { logWarn(msg) }
 
 func header(title string) {
 	if isatty() {
-		fmt.Printf("\n%s  virlink %s\n\n", cBlue+"⬡"+cReset, cBold+title+cReset)
+		writeLog(fmt.Sprintf("\n%s  virlink %s\n\n", cBlue+"⬡"+cReset, cBold+title+cReset))
 	} else {
 		emit("INF", "[start] "+title)
 	}
@@ -174,15 +248,15 @@ func header(title string) {
 func done(iface, overlay, peer string, extras ...string) {
 	if isatty() {
 		ts := time.Now().Format("2006-01-02 15:04:05")
-		fmt.Printf("%s  %s  %s  dev=%s  overlay=%s  peer=%s\n",
+		writeLog(fmt.Sprintf("%s  %s  %s  dev=%s  overlay=%s  peer=%s\n",
 			cGray+ts+cReset,
 			cGray+"·"+cReset,
 			cGreen+cBold+"✓ TUNNEL UP"+cReset,
 			cBold+iface+cReset,
 			cCyan+overlay+cReset,
-			cGreen+peer+cReset)
+			cGreen+peer+cReset))
 		for _, e := range extras {
-			fmt.Printf("                         %s\n", cGray+e+cReset)
+			writeLog(fmt.Sprintf("                         %s\n", cGray+e+cReset))
 		}
 	} else {
 		emit("INF", fmt.Sprintf("[up] dev=%s  overlay=%s  peer=%s", iface, overlay, peer))
@@ -253,14 +327,6 @@ const (
 	cBlue   = "\033[34m"
 	cCyan   = "\033[36m"
 )
-
-func isatty() bool {
-	fi, err := os.Stdout.Stat()
-	if err != nil {
-		return false
-	}
-	return (fi.Mode() & os.ModeCharDevice) != 0
-}
 
 func color(c, s string) string {
 	if !isatty() {

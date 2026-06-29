@@ -4,6 +4,7 @@
 package virlink
 
 import (
+	"net"
 	"os"
 	"unsafe"
 
@@ -244,3 +245,24 @@ func mmsgSendBatch(rawFd int, b *icmpTxBatch) int {
 
 // icmpSendBatch is an alias for mmsgSendBatch (ICMP TX path).
 func icmpSendBatch(rawFd int, b *icmpTxBatch) int { return mmsgSendBatch(rawFd, b) }
+
+// tuneTCPConnForce sets TCP socket buffers using SO_RCVBUFFORCE / SO_SNDBUFFORCE,
+// which bypass net.core.rmem_max / wmem_max (require CAP_NET_ADMIN / root).
+// Falls back to the regular SO_RCVBUF / SO_SNDBUF on EPERM.
+func tuneTCPConnForce(tc *net.TCPConn) {
+	sc, err := tc.SyscallConn()
+	if err != nil {
+		_ = tc.SetReadBuffer(perfSockBuf())
+		_ = tc.SetWriteBuffer(perfSockBuf())
+		return
+	}
+	bufSize := perfSockBuf()
+	_ = sc.Control(func(fd uintptr) {
+		if e := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, bufSize); e != nil {
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, bufSize)
+		}
+		if e := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, bufSize); e != nil {
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, bufSize)
+		}
+	})
+}

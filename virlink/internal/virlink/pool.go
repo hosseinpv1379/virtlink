@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -116,11 +117,18 @@ func tuneRawSock(fd int) {
 }
 
 func tuneTCPConn(conn net.Conn) {
-	if tc, ok := conn.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-		_ = tc.SetReadBuffer(perfSockBuf())
-		_ = tc.SetWriteBuffer(perfSockBuf())
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
 	}
+	_ = tc.SetNoDelay(true)
+	// Keepalive detects half-open connections caused by NAT timeouts or peer crashes.
+	// Without it, a dead stream can block the rxLoop indefinitely in io.ReadFull.
+	_ = tc.SetKeepAlive(true)
+	_ = tc.SetKeepAlivePeriod(10 * time.Second)
+	// tuneTCPConnForce sets SO_RCVBUFFORCE / SO_SNDBUFFORCE on Linux (bypasses
+	// net.core.rmem_max cap) and falls back to SetReadBuffer on other platforms.
+	tuneTCPConnForce(tc)
 }
 
 // udpConnFD returns the underlying socket fd for sendmmsg batching.
