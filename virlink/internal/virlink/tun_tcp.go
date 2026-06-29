@@ -39,7 +39,11 @@ func (t *TcpTunnel) Up() error {
 	port := c.Transport.Port
 	mtu := c.Tunnel.MTU
 	if mtu == 0 {
-		mtu = 1460
+		// 1440: wire frame = 1440 + 2 (len header) = 1442 bytes.
+		// Outer TCP MSS with timestamps = 1448 bytes → one wire frame per TCP segment.
+		// At 1460 the wire frame (1462) exceeds the MSS on many paths (PPPoE, timestamps),
+		// causing each overlay packet to split into two outer TCP segments.
+		mtu = 1440
 	}
 
 	header("tcp / " + c.Mode)
@@ -127,8 +131,13 @@ func (t *TcpTunnel) pickConn(data []byte) net.Conn {
 }
 
 // tcpTxChanCap is the per-stream TX channel capacity.
-// 512 slots × 1502 bytes ≈ 750 KB per stream — absorbs ~9 ms of bursts at 1 Gbps.
-const tcpTxChanCap = 512
+// Intentionally small: 64 slots × ~1442 bytes ≈ 90 KB per stream.
+// Large channels hide backpressure from the inner TCP: frames queue here while
+// the outer TCP is slow, inflating the inner RTT and causing retransmits.
+// Together with TCP_NOTSENT_LOWAT (256 KB), total unsent buffering per stream
+// is ~350 KB — roughly 2-3× BDP on a typical VPN link, enough to keep the
+// wire saturated without causing RTT inflation.
+const tcpTxChanCap = 64
 
 // txPollLoop reads TUN packets and dispatches them into per-stream buffered
 // channels. Each stream runs its own txStreamWriter goroutine that accumulates
@@ -172,9 +181,13 @@ func (t *TcpTunnel) txPollLoop() {
 				default:
 				}
 			}
-			// All stream channels full — drop (back-pressure relief).
-			statInc(statTCPTxNoConn)
-			putBuf(buf)
+			// All channels full: BLOCK on preferred slot instead of dropping.
+			// Blocking stops the TUN poller, which fills the kernel TUN ring,
+			// which causes the inner TCP to reduce its CWND — proper back-pressure.
+			// Dropping would cause inner TCP retransmits with no congestion signal.
+			// TCP_NOTSENT_LOWAT ensures this only triggers when the outer TCP wire
+			// is genuinely saturated, not due to kernel send-buffer bloat.
+			chs[slot] <- buf
 			return !t.stop.stopped()
 		},
 	)

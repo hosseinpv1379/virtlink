@@ -249,6 +249,17 @@ func icmpSendBatch(rawFd int, b *icmpTxBatch) int { return mmsgSendBatch(rawFd, 
 // tuneTCPConnForce sets TCP socket buffers using SO_RCVBUFFORCE / SO_SNDBUFFORCE,
 // which bypass net.core.rmem_max / wmem_max (require CAP_NET_ADMIN / root).
 // Falls back to the regular SO_RCVBUF / SO_SNDBUF on EPERM.
+//
+// TCP_NOTSENT_LOWAT is the critical setting for TCP-over-TCP tunnels.
+// Without it the kernel accepts up to SO_SNDBUF bytes (e.g. 8 MB) into its
+// send buffer regardless of whether the outer TCP has actually transmitted
+// them. The inner TCP then sees a 640 ms+ artificial RTT (8 MB / 10 Mbps)
+// and hammers RTO retransmits. With TCP_NOTSENT_LOWAT = 256 KB the kernel
+// only allows 256 KB of unsent data; writes block once that is reached,
+// which propagates back-pressure up through our channel → TUN poller →
+// kernel TUN ring → inner TCP CWND reduction.
+const tcpNotSentLowat = 256 * 1024
+
 func tuneTCPConnForce(tc *net.TCPConn) {
 	sc, err := tc.SyscallConn()
 	if err != nil {
@@ -264,5 +275,7 @@ func tuneTCPConnForce(tc *net.TCPConn) {
 		if e := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, bufSize); e != nil {
 			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, bufSize)
 		}
+		// Limit unsent-data queue to prevent bufferbloat in TCP-over-TCP tunnels.
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, tcpNotSentLowat)
 	})
 }

@@ -78,7 +78,11 @@ func (t *TcpMuxTunnel) Up() error {
 	port := c.Transport.Port
 	mtu := c.Tunnel.MTU
 	if mtu == 0 {
-		mtu = 1460
+		// 1440: wire frame = 1440 + 6 (len+flow_hash header) = 1446 bytes.
+		// Outer TCP MSS with timestamps = 1448 bytes → one wire frame per TCP segment.
+		// At 1460 the wire frame (1466) exceeds the outer MSS on most paths, causing
+		// each overlay packet to split into two outer TCP segments.
+		mtu = 1440
 	}
 	t.hashSeed = parseTcpMuxHash(c.TcpMux.Hash)
 	hashLabel := c.TcpMux.Hash
@@ -209,8 +213,8 @@ func (t *TcpMuxTunnel) txPollLoop() {
 				default:
 				}
 			}
-			statInc(statTCPTxNoConn)
-			putBuf(buf)
+			// Block on preferred slot — same back-pressure reasoning as tun_tcp.go.
+			chs[slot] <- buf
 			return !t.stop.stopped()
 		},
 	)

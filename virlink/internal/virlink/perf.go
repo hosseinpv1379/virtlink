@@ -98,7 +98,13 @@ func initUserspacePerfDefaults(c *Config) {
 		// Match ICMP batch size — sendmmsg is equally effective here.
 		perf.batchSize = 64
 	case "tcp", "tcpmux":
-		// tun_queues feeds the TUN poller; tcp_streams feeds parallel carrier TCP sockets.
+		// Wire socket buffer deliberately smaller than other protocols:
+		// large buffers cause TCP-over-TCP bufferbloat (inner TCP sees inflated
+		// RTT equal to buffer_size / wire_bandwidth, triggering mass retransmits).
+		// TCP_NOTSENT_LOWAT (256 KB, set in tuneTCPConnForce) enforces the real
+		// limit; this 8 MB value covers in-flight BDP for fast links while keeping
+		// the kernel queue bounded.
+		perf.sockBuf = 8 << 20
 		// 3 ms poll keeps latency low while batching consecutive packets efficiently.
 		perf.pollMs = 3
 	case "udp-obfs":
