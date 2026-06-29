@@ -67,9 +67,9 @@ func userspaceCPU() int {
 	return clampInt(runtime.NumCPU(), 1, 8)
 }
 
-// userspaceQueues — multi-queue TUN lets the kernel spread stack→TUN traffic across fds.
+// userspaceQueues — multi-queue TUN readers; default 1 for correctness (raise in config for throughput).
 func userspaceQueues() int {
-	return clampInt(userspaceCPU(), 2, maxPerfQueues)
+	return 1
 }
 
 // userspaceTcpStreams — parallel TCP conns for tcp/tcpmux (independent of tun_queues).

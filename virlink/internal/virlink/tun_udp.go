@@ -96,9 +96,6 @@ func (t *UdpTunnel) Up() error {
 		if c.Mode == "client" {
 			dst := &net.UDPAddr{IP: net.ParseIP(c.RemoteIP), Port: port}
 			t.lastPeer.Store(dst)
-			if err := connectUDP(t.udpConn, dst); err != nil {
-				logWarn("udp client connect: " + err.Error())
-			}
 		}
 		logOK(fmt.Sprintf("UDP :%d", port))
 	}
@@ -446,7 +443,7 @@ func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 			var port uint16
 			if t.cfg.Mode == "client" {
 				dst = t.peerIP
-				port = 0 // connected UDP socket — sendmmsg must not set msg_name
+				port = uint16(t.cfg.Transport.Port)
 			} else if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
 				copy(dst[:], p.IP.To4())
 				port = uint16(p.Port)

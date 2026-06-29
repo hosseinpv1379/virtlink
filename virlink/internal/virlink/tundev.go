@@ -1,13 +1,9 @@
 // tundev.go — TUN device helpers (single + multi-queue).
 //
-// IFF_MULTI_QUEUE gives N file descriptors for the same interface.
-// The kernel load-balances outbound packets (stack → userspace) across
-// all N queues. fds[0] is used for wire→TUN writes (blocking) AND is
-// included in the TX poller read set. fds[1..] are O_NONBLOCK read-only.
-//
-// Never open a write-only queue fd: the kernel hashes stack→userspace TX
-// across every queue, so an unread queue drops ~1/N of all outbound packets
-// (ping probes, health checks, etc.).
+// IFF_MULTI_QUEUE opens N fds for the same interface. The kernel spreads
+// stack→userspace packets across all N queues — every fd must be polled.
+// Wire→TUN inject writes to fds[0]; tunWrite() retries EAGAIN with POLLOUT
+// so O_NONBLOCK on the read poller does not break injection.
 package virlink
 
 import (
@@ -24,8 +20,7 @@ const (
 	tunSetIff = uintptr(0x400454ca)
 )
 
-// TunDev holds N queue fds. fds[0] is the blocking inject fd (WriteFd) and
-// the first TX-poller read queue; fds[1..] are additional read queues.
+// TunDev holds N queue fds for one TUN interface.
 type TunDev struct {
 	fds    []*os.File
 	queues int
@@ -42,7 +37,7 @@ func (t *TunDev) Close() {
 
 func (t *TunDev) Fd0() *os.File { return t.fds[0] }
 
-// WriteFd returns fds[0] for wire→TUN injection (never O_NONBLOCK).
+// WriteFd returns fds[0] for wire→TUN injection.
 func (t *TunDev) WriteFd() *os.File { return t.fds[0] }
 
 func (t *TunDev) QueueCount() int {
@@ -131,7 +126,6 @@ func tunWrite(fd *os.File, pkt []byte) error {
 	return unix.EAGAIN
 }
 
-// tunReadNB reads one packet from a non-blocking TUN fd.
 func tunReadNB(fd *os.File, buf []byte) (int, error) {
 	n, err := fd.Read(buf)
 	if err != nil {
@@ -142,7 +136,6 @@ func tunReadNB(fd *os.File, buf []byte) (int, error) {
 	return n, err
 }
 
-// pollFD waits until fd is readable/writable or timeoutMs elapses.
 func pollFD(fd int, events int16, timeoutMs int) error {
 	fds := []unix.PollFd{{Fd: int32(fd), Events: events}}
 	for {
