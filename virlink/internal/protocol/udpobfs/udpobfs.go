@@ -188,19 +188,7 @@ func (t *UdpObfsTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File, gcm ciph
 	buf := platform.GetBuf()
 	defer platform.PutBuf(buf)
 
-	bsz := platform.PerfBatchSize()
-	batch := platform.NewTunRxBatch(bsz)
-
-	flush := func() {
-		n, err := batch.Flush(tun)
-		if n == 0 {
-			return
-		}
-		if err != nil && !t.stop.Stopped() {
-			platform.LogWarn("tun write: " + err.Error())
-		}
-	}
-	defer flush()
+	batch := platform.NewTunRxBatch(1)
 
 	for {
 		n, src, err := conn.ReadFromUDP(buf)
@@ -217,8 +205,8 @@ func (t *UdpObfsTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File, gcm ciph
 		}
 		t.lastPeer.Store(src)
 		batch.Add(pkt)
-		if batch.Len() >= bsz {
-			flush()
+		if _, werr := batch.Flush(tun); werr != nil && !t.stop.Stopped() {
+			platform.LogWarn("tun write: " + werr.Error())
 		}
 	}
 }
@@ -227,7 +215,6 @@ func (t *UdpObfsTunnel) txPollLoop(conn *net.UDPConn, gcm cipher.AEAD, mask stri
 	poller := platform.NewTunPoller(t.tun, &t.stop)
 	defer poller.Close()
 
-	bsz := platform.PerfBatchSize()
 	var curDst *net.UDPAddr
 	var frames [][]byte
 	var lens []int
@@ -280,9 +267,7 @@ func (t *UdpObfsTunnel) txPollLoop(conn *net.UDPConn, gcm cipher.AEAD, mask stri
 			}
 			frames = append(frames, frameBuf)
 			lens = append(lens, len(frame))
-			if len(frames) >= bsz {
-				flush()
-			}
+			flush()
 			return !t.stop.Stopped()
 		},
 	)
