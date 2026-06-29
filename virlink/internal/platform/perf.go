@@ -96,7 +96,10 @@ func initUserspacePerfDefaults(c *config.Config) {
 	switch c.Tunnel.Type {
 	case "icmp":
 		perf.batchSize = 64
-	case "udp", "bip":
+	case "udp":
+		perf.batchSize = 64
+		perf.pollMs = 3 // match tcp/tcpmux — low-latency TUN poll for throughput
+	case "bip":
 		// Match ICMP batch size — sendmmsg is equally effective here.
 		perf.batchSize = 64
 	case "tcp", "tcpmux":

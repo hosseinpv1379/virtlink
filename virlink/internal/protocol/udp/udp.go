@@ -48,7 +48,8 @@ func (t *UdpTunnel) Up() error {
 	port := c.Transport.Port
 	mtu := c.Tunnel.MTU
 	if mtu == 0 {
-		mtu = 1472
+		// 1440 like tcp: one outer UDP datagram fits common path MTU (1500).
+		mtu = 1440
 	}
 	t.peerIP = platform.IpTo4(c.RemoteIP)
 	t.localIP = platform.IpTo4(c.LocalIP)
@@ -114,13 +115,14 @@ func (t *UdpTunnel) Up() error {
 		go t.txPollLoopRaw(t.rawFd, port)
 	} else {
 		conn := t.udpConn
-		// Plain UDP: ReadFromUDP/WriteToUDP are more reliable than recvmmsg/sendmmsg
-		// on some kernels and avoid silent batch TX/RX failures (rx_recv=0, hs=waiting).
-		go t.rxLoopBlocking(conn, t.tun.Fd0())
-		go t.txPollLoopUnbatched(conn)
+		go t.rxLoop(conn, t.tun.Fd0())
+		go t.txPollLoop(conn)
 	}
 
-	platform.Done(dev, addr, peer, fmt.Sprintf("transport : UDP :%d  poller×1", port))
+	platform.Done(dev, addr, peer,
+		fmt.Sprintf("transport : UDP :%d  poller×1", port),
+		"test      : ping -c3 "+peer,
+	)
 	return nil
 }
 
@@ -405,7 +407,9 @@ func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 			t.lastPeer.Store(src)
 		}
 		platform.StatInc(platform.StatUDPRxRecv)
-		if err := platform.TunWrite(tun, buf[:n]); err != nil {
+		batch := platform.NewTunRxBatch(1)
+		batch.Add(buf[:n])
+		if _, err := batch.Flush(tun); err != nil {
 			platform.StatInc(platform.StatUDPRxDropWrite)
 			if !t.stop.Stopped() {
 				platform.LogWarn(fmt.Sprintf("udp tun write: %v", err))
@@ -421,13 +425,6 @@ func (t *UdpTunnel) rxLoopBlocking(conn *net.UDPConn, tun *os.File) {
 // Uses RunOwned with hdrRoom=0: the poller's owned buffer IS the UDP payload,
 // so batch.add receives it directly — no intermediate platform.GetBuf+copy per packet.
 func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
-	rawFd, err := platform.UdpConnFD(conn)
-	if err != nil {
-		platform.LogWarn("udp tx batch: " + err.Error())
-		t.txPollLoopUnbatched(conn)
-		return
-	}
-
 	poller := platform.NewTunPollerH(t.tun, &t.stop, 0)
 	defer poller.Close()
 
@@ -441,13 +438,25 @@ func (t *UdpTunnel) txPollLoop(conn *net.UDPConn) {
 		if batch.N() == 0 {
 			return
 		}
-		platform.StatAdd(platform.StatUDPTxSend, uint64(batch.N()))
-		if nerr := platform.MmsgSendBatch(rawFd, &batch); nerr > 0 {
-			wire.NoteWireTxErr(nerr)
+		dst := &net.UDPAddr{
+			IP:   net.IPv4(curDst[0], curDst[1], curDst[2], curDst[3]),
+			Port: int(curPort),
 		}
+		var sent uint64
 		for i := 0; i < batch.N(); i++ {
+			plen := batch.PktLen(i)
+			if _, err := conn.WriteToUDP(batch.Frame(i)[:plen], dst); err != nil {
+				if !t.stop.Stopped() {
+					platform.LogDebug("udp tx: " + err.Error())
+				}
+			} else {
+				sent++
+			}
 			platform.PutBuf(batch.Frame(i))
 			batch.SetFrame(i, nil)
+		}
+		if sent > 0 {
+			platform.StatAdd(platform.StatUDPTxSend, sent)
 		}
 		batch.Reset()
 		haveDst = false

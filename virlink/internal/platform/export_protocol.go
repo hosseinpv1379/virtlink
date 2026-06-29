@@ -81,6 +81,7 @@ func (b *IcmpTxBatch) Add(frame []byte, pktLen int, dst [4]byte, port uint16) {
 
 func (b *IcmpTxBatch) SetFrame(i int, frame []byte) { b.frames[i] = frame }
 func (b *IcmpTxBatch) Frame(i int) []byte { return b.frames[i] }
+func (b *IcmpTxBatch) PktLen(i int) int   { return b.lens[i] }
 
 func (b *IcmpTxBatch) Reset() { b.reset() }
 func ReadSysctl(key string) (string, error) { return readSysctl(key) }
