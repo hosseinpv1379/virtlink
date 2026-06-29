@@ -39,11 +39,14 @@ func healthPortOffset(name string) int {
 }
 
 // applyHealthPort assigns a unique health port when unset or left at default.
+// Port is derived from tunnel type + overlay CIDR so client and server always
+// agree (tunnel.name / dev name may differ per host).
 func applyHealthPort(c *Config) {
 	if c.Health.Port != 0 && c.Health.Port != defaultHealthPort {
 		return
 	}
-	c.Health.Port = defaultHealthPort + healthPortOffset(tunnelInstanceName(c))
+	key := c.Tunnel.Type + "|" + c.Tunnel.CIDR
+	c.Health.Port = defaultHealthPort + healthPortOffset(key)
 }
 
 func listenTCPReuseAddr(addr string) (net.Listener, error) {
@@ -178,7 +181,17 @@ func (h *HealthMgr) runProbeSender(localOverlay, peerOverlay string, port int) {
 	if peerIP = peerIP.To4(); peerIP == nil {
 		return
 	}
-	// build probe packet: 4-byte magic + 8-byte timestamp
+	peerAddr := &net.UDPAddr{IP: peerIP, Port: port}
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: localIP, Port: 0})
+	if err != nil {
+		logWarn(fmt.Sprintf("health probe sender: bind %s: %v", localIP, err))
+		return
+	}
+	defer conn.Close()
+	tuneUDPConn(conn)
+	logInfo(fmt.Sprintf("health probe sender  peer=%s:%d  interval=%s", peerOverlay, port, h.interval))
+
 	pkt := make([]byte, 12)
 	copy(pkt[:4], probeMagic[:])
 
@@ -186,15 +199,11 @@ func (h *HealthMgr) runProbeSender(localOverlay, peerOverlay string, port int) {
 	defer ticker.Stop()
 	for range ticker.C {
 		binary.BigEndian.PutUint64(pkt[4:], uint64(time.Now().UnixNano()))
-		conn, err := net.DialUDP("udp4",
-			&net.UDPAddr{IP: localIP, Port: 0},
-			&net.UDPAddr{IP: peerIP, Port: port})
-		if err != nil {
+		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if _, err := conn.WriteToUDP(pkt, peerAddr); err != nil {
+			logDebug("health probe tx: " + err.Error())
 			continue
 		}
-		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		_, _ = conn.Write(pkt)
-		conn.Close()
 		h.txCount.Add(1)
 	}
 }

@@ -9,6 +9,18 @@ import (
 
 const udpHdrLen = 8
 
+// trimIPv4Packet clips a raw RX buffer to the IPv4 total length field.
+func trimIPv4Packet(pkt []byte) []byte {
+	if len(pkt) < ipHdrLen || pkt[0]>>4 != 4 {
+		return pkt
+	}
+	total := int(binary.BigEndian.Uint16(pkt[2:4]))
+	if total >= ipHdrLen && total <= len(pkt) {
+		return pkt[:total]
+	}
+	return pkt
+}
+
 func putIPv4Header(pkt []byte, src, dst [4]byte, proto byte, totalLen int) {
 	pkt[0] = 0x45
 	pkt[1] = 0

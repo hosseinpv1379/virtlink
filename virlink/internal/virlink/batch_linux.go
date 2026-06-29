@@ -102,8 +102,28 @@ func (b *rxMmsgBatch) data(i int) []byte {
 }
 
 func (b *rxMmsgBatch) from4(i int) *unix.SockaddrInet4 {
-	// RawSockaddrInet4 and SockaddrInet4 have different layouts; read Addr directly.
 	return &unix.SockaddrInet4{Addr: b.addrs[i].Addr}
+}
+
+// installICMPFilter drops all ICMP types except echo request (type 8) at the socket.
+func installICMPFilter(fd int) error {
+	var filter [32]byte // 256 types
+	for t := 0; t < 256; t++ {
+		if t != icmpEchoReq {
+			filter[t/8] |= 1 << (t % 8)
+		}
+	}
+	return unix.SetsockoptString(fd, unix.IPPROTO_ICMP, unix.ICMP_FILTER, string(filter[:]))
+}
+
+// icmpWireCarrierType returns the ICMP type byte for a raw RX buffer, or 255 if unknown.
+func icmpWireCarrierType(pkt []byte, wireOn bool) byte {
+	pkt = trimIPv4Packet(pkt)
+	icmp, ok := parseIcmpWirePacket(pkt, wireOn)
+	if !ok || len(icmp) == 0 {
+		return 255
+	}
+	return icmp[0]
 }
 
 func tunWritev(fd *os.File, bufs [][]byte) error {

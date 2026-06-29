@@ -102,6 +102,10 @@ func (t *IcmpTunnel) Up() error {
 	if err != nil {
 		return fmt.Errorf("SOCK_RAW: %w", err)
 	}
+	tuneRawSock(t.rawFd)
+	if !t.wire.on {
+		_ = installICMPFilter(t.rawFd)
+	}
 	_ = unix.SetNonblock(t.rawFd, true)
 	logOK("raw ICMP socket ready")
 	logWireSpoof(t.cfg, t.wire)
@@ -252,8 +256,12 @@ func (t *IcmpTunnel) rxLoop(rawFd int, tun *os.File) {
 		}
 		idleMs = pollMs
 		for i := 0; i < got; i++ {
-			pkt := rb.data(i)
+			pkt := trimIPv4Packet(rb.data(i))
 			sa := rb.from4(i)
+			// Kernel echo replies (type 0) to our wire pings — not tunnel traffic.
+			if icmpWireCarrierType(pkt, t.wire.on) != icmpEchoReq {
+				continue
+			}
 			if !acceptWirePeer(pkt, sa, local, peer, t.wire.src, t.wire, unix.IPPROTO_ICMP) {
 				statInc(statICMPRxDropPeer)
 				continue

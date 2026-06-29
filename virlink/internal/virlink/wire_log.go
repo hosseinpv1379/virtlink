@@ -150,6 +150,7 @@ func evalWirePeer(pkt []byte, sa *unix.SockaddrInet4, local, expectPeerSrc, ourS
 }
 
 func acceptWirePeer(pkt []byte, sa *unix.SockaddrInet4, local, peer, spoofSrc [4]byte, w wireSpoof, wantProto byte) bool {
+	pkt = trimIPv4Packet(pkt)
 	v, src, dst := evalWirePeer(pkt, sa, local, peer, spoofSrc, w, wantProto)
 	if v == wirePeerOK {
 		if wireMonitorActive() {
