@@ -103,8 +103,9 @@ func initUserspacePerfDefaults(c *config.Config) {
 		perf.pollMs = 3
 		perf.tcpStreams = 1
 	case "bip":
-		// Match ICMP batch size — sendmmsg is equally effective here.
 		perf.batchSize = 64
+		perf.pollMs = 3
+		perf.tcpStreams = 1
 	case "tcp", "tcpmux":
 		// Wire socket buffer deliberately smaller than other protocols:
 		// large buffers cause TCP-over-TCP bufferbloat (inner TCP sees inflated
@@ -182,7 +183,7 @@ func ApplyPerfFromConfig(c *config.Config) {
 	}
 	if t.TcpStreams > 0 {
 		perf.tcpStreams = clampInt(t.TcpStreams, 1, MaxPerfQueues)
-	} else if !isTcpUserspaceTunnel(c.Tunnel.Type) && c.Tunnel.Type != "udp" && c.Tunnel.Type != "icmp" {
+	} else if !isTcpUserspaceTunnel(c.Tunnel.Type) && c.Tunnel.Type != "udp" && c.Tunnel.Type != "icmp" && c.Tunnel.Type != "bip" {
 		// Non-streaming tunnels ignore tcp_streams; do not clobber protocol defaults.
 		perf.tcpStreams = perf.tunQueues
 	}
@@ -229,7 +230,12 @@ func applyWirePerfBoost(c *config.Config) {
 	case "udp", "bip":
 		perf.tunQueues = maxInt(perf.tunQueues, userspaceQueues())
 		perf.batchSize = maxInt(perf.batchSize, 32)
-		perf.pollMs = minInt(perf.pollMs, 5)
+		if c.Tunnel.Type == "bip" {
+			perf.batchSize = maxInt(perf.batchSize, 64)
+			perf.pollMs = minInt(perf.pollMs, 3)
+		} else {
+			perf.pollMs = minInt(perf.pollMs, 5)
+		}
 	}
 }
 

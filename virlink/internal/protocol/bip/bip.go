@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	bipSubnet = "10.20.44.0/24"
-	bipProto  = 58
+	bipSubnet  = "10.20.44.0/24"
+	bipProto   = 58
+	bipWireHdr = 20 // RunOwned hdrRoom for [mangle] wire IPv4 header
 )
 
 type BipTunnel struct {
@@ -26,7 +27,7 @@ type BipTunnel struct {
 	tun     *platform.TunDev
 	rawFd   int
 	lockFd  *os.File
-	done chan struct{}
+	done    chan struct{}
 	stop    platform.StoppedFlag
 	lastSrc atomic.Value
 	wire    wire.WireSpoof
@@ -107,10 +108,19 @@ func (t *BipTunnel) Up() error {
 	return nil
 }
 
+func (t *BipTunnel) resolveDst() ([4]byte, bool) {
+	if t.cfg.Mode == "client" {
+		return t.peerIP, true
+	}
+	if v := t.lastSrc.Load(); v != nil {
+		return v.([4]byte), true
+	}
+	return [4]byte{}, false
+}
+
 func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
-	var rb platform.RxMmsgBatch
-	rb.Init(platform.PerfBatchSize())
-	defer rb.Release()
+	buf := platform.GetBuf()
+	defer platform.PutBuf(buf)
 
 	peer := t.wire.WirePeer(t.peerIP)
 	local := t.localIP
@@ -133,12 +143,12 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 	defer flush()
 
 	for {
-		got, err := rb.Recv(rawFd)
-		if got == 0 {
-			if t.stop.Stopped() {
-				return
-			}
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == nil {
+		if t.stop.Stopped() {
+			return
+		}
+		n, sa, err := unix.Recvfrom(rawFd, buf, unix.MSG_DONTWAIT)
+		if err != nil {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				flush()
 				platform.StatInc(platform.StatBIPRxPoll)
 				_ = platform.PollFD(rawFd, unix.POLLIN, idleMs)
@@ -151,24 +161,29 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 			platform.LogWarn("bip rx: " + err.Error())
 			continue
 		}
-		idleMs = pollMs
-		for i := 0; i < got; i++ {
-			pkt := rb.Data(i)
-			sa := rb.From4(i)
-			if !wire.AcceptWirePeer(pkt, sa, local, peer, t.wire.Src(), t.wire, bipProto) {
-				platform.StatInc(platform.StatBIPRxDrop)
-				continue
-			}
-			inner, ok := wire.ParseWireInner(pkt, t.wire.On)
-			if !ok || len(inner) == 0 {
-				continue
-			}
-			if t.cfg.Mode == "server" {
-				t.lastSrc.Store(wire.RememberPeerRoute(t.wire, sa.Addr, t.peerIP))
-			}
-			platform.StatInc(platform.StatBIPRxRecv)
-			batch.Add(inner)
+		if n == 0 {
+			continue
 		}
+		idleMs = pollMs
+
+		from, ok := sa.(*unix.SockaddrInet4)
+		if !ok {
+			continue
+		}
+		pkt := buf[:n]
+		if !wire.AcceptWirePeer(pkt, from, local, peer, t.wire.Src(), t.wire, bipProto) {
+			platform.StatInc(platform.StatBIPRxDrop)
+			continue
+		}
+		inner, ok := wire.ParseWireInner(pkt, t.wire.On)
+		if !ok || len(inner) == 0 {
+			continue
+		}
+		if t.cfg.Mode == "server" {
+			t.lastSrc.Store(wire.RememberPeerRoute(t.wire, from.Addr, t.peerIP))
+		}
+		platform.StatInc(platform.StatBIPRxRecv)
+		batch.Add(inner)
 		if batch.Len() >= bsz {
 			flush()
 		}
@@ -176,27 +191,26 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 }
 
 func (t *BipTunnel) txPollLoop(rawFd int) {
-	poller := platform.NewTunPoller(t.tun, &t.stop)
+	if t.wire.On {
+		t.txPollLoopWire(rawFd)
+		return
+	}
+	t.txPollLoopPlain(rawFd)
+}
+
+func (t *BipTunnel) txPollLoopPlain(rawFd int) {
+	poller := platform.NewTunPollerH(t.tun, &t.stop, 0)
 	defer poller.Close()
 
 	var batch platform.IcmpTxBatch
 	bsz := platform.PerfBatchSize()
-	var lastDst [4]byte
-	var lastPLen int
 
 	flush := func() {
 		if batch.N() == 0 {
 			return
 		}
 		platform.StatAdd(platform.StatBIPTxSend, uint64(batch.N()))
-		nerr := platform.MmsgSendBatch(rawFd, &batch)
-		if t.wire.On {
-			sent := batch.N() - nerr
-			if sent < 0 {
-				sent = 0
-			}
-			// WireMon.noteTxBatch(sent, nerr, t.wire.Src(), lastDst, bipProto, lastPLen)
-		} else if nerr > 0 {
+		if nerr := platform.MmsgSendBatch(rawFd, &batch); nerr > 0 {
 			wire.NoteWireTxErr(nerr)
 		}
 		for i := 0; i < batch.N(); i++ {
@@ -206,39 +220,71 @@ func (t *BipTunnel) txPollLoop(rawFd int) {
 		batch.Reset()
 	}
 
-	poller.Run(
+	poller.RunOwned(
 		func() {
 			platform.StatInc(platform.StatBIPTxPoll)
 			if batch.N() > 0 {
 				flush()
 			}
 		},
-		func(pkt []byte, n int) bool {
+		func(buf []byte, n int) bool {
 			platform.StatInc(platform.StatBIPTxRead)
-			var routeDst [4]byte
-			if t.cfg.Mode == "client" {
-				routeDst = t.peerIP
-			} else if v := t.lastSrc.Load(); v != nil {
-				routeDst = v.([4]byte)
-			} else {
+			routeDst, ok := t.resolveDst()
+			if !ok {
 				platform.StatInc(platform.StatBIPTxNoDst)
-				if t.wire.On {
-					// WireMon.noteTxNoDst()
-				}
-				return true
+				platform.PutBuf(buf)
+				return !t.stop.Stopped()
 			}
-			frame := platform.GetBuf()
-			var out []byte
-			if t.wire.On {
-				out = wire.BuildWireProto(frame, t.wire.Src(), routeDst, bipProto, pkt[:n])
-			} else {
-				out = frame[:n]
-				copy(out, pkt[:n])
+			batch.Add(buf, n, routeDst, 0)
+			if batch.N() >= bsz {
+				flush()
 			}
-			batch.Add(frame, len(out), routeDst, 0)
-			lastDst = routeDst
-			lastPLen = n
-			_, _ = lastDst, lastPLen
+			return !t.stop.Stopped()
+		},
+	)
+	flush()
+}
+
+func (t *BipTunnel) txPollLoopWire(rawFd int) {
+	poller := platform.NewTunPollerH(t.tun, &t.stop, bipWireHdr)
+	defer poller.Close()
+
+	var batch platform.IcmpTxBatch
+	bsz := platform.PerfBatchSize()
+
+	flush := func() {
+		if batch.N() == 0 {
+			return
+		}
+		platform.StatAdd(platform.StatBIPTxSend, uint64(batch.N()))
+		if nerr := platform.MmsgSendBatch(rawFd, &batch); nerr > 0 {
+			wire.NoteWireTxErr(nerr)
+		}
+		for i := 0; i < batch.N(); i++ {
+			platform.PutBuf(batch.Frame(i))
+			batch.SetFrame(i, nil)
+		}
+		batch.Reset()
+	}
+
+	poller.RunOwned(
+		func() {
+			platform.StatInc(platform.StatBIPTxPoll)
+			if batch.N() > 0 {
+				flush()
+			}
+		},
+		func(buf []byte, n int) bool {
+			platform.StatInc(platform.StatBIPTxRead)
+			routeDst, ok := t.resolveDst()
+			if !ok {
+				platform.StatInc(platform.StatBIPTxNoDst)
+				platform.PutBuf(buf)
+				return !t.stop.Stopped()
+			}
+			payload := buf[bipWireHdr : bipWireHdr+n]
+			out := wire.BuildWireProto(buf, t.wire.Src(), routeDst, bipProto, payload)
+			batch.Add(buf, len(out), routeDst, 0)
 			if batch.N() >= bsz {
 				flush()
 			}
