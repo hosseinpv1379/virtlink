@@ -124,6 +124,22 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 	local := t.localIP
 	pollMs := perfPollMs()
 	idleMs := pollMs
+	bsz := perfBatchSize()
+	var batch tunRxBatch
+
+	flush := func() {
+		n, err := batch.flush(tun)
+		if n == 0 {
+			return
+		}
+		if err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
+		} else if err == nil {
+			statAdd(statUDPRxWrite, uint64(n))
+		}
+	}
+	defer flush()
+
 	for {
 		n, from, err := unix.Recvfrom(rawFd, buf, 0)
 		if err != nil {
@@ -131,6 +147,7 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 				return
 			}
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				flush()
 				_ = pollFD(rawFd, unix.POLLIN, idleMs)
 				if idleMs < 50 {
 					idleMs += pollMs
@@ -172,10 +189,9 @@ func (t *UdpTunnel) rxLoopRaw(rawFd int, tun *os.File, port int) {
 			t.lastRoute.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
 		}
 		statInc(statUDPRxRecv)
-		if err := tunWrite(tun, payload); err != nil && !t.stop.stopped() {
-			logWarn("tun write: " + err.Error())
-		} else {
-			statInc(statUDPRxWrite)
+		batch.add(payload)
+		if batch.len() >= bsz {
+			flush()
 		}
 	}
 }

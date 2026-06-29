@@ -15,6 +15,11 @@ import (
 const (
 	maxPktBuf  = 65535 + 512
 	icmpHdrLen = 8
+
+	// tcpRxBufSize sizes the bufio.Reader used by TCP/TCPMUX rx loops.
+	// Coalesces many frame-header + frame-payload reads into one socket
+	// read syscall instead of (at least) two syscalls per frame.
+	tcpRxBufSize = 64 << 10
 )
 
 var pktPool = sync.Pool{

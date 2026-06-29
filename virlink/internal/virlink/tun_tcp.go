@@ -4,6 +4,7 @@
 package virlink
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -125,25 +126,62 @@ func (t *TcpTunnel) pickConn(data []byte) net.Conn {
 	return nil
 }
 
+// txPollLoop drains the TUN poller and batches consecutive same-stream frames
+// into one net.Buffers.WriteTo (single writev syscall) instead of one syscall
+// per packet. Frames are copied into pooled buffers since the poller reuses
+// its read buffer across packets within a drain burst.
 func (t *TcpTunnel) txPollLoop() {
 	poller := newTunPoller(t.tun, &t.stop)
 	defer poller.close()
 
-	poller.Run(nil, func(pkt []byte, n int) bool {
-		statInc(statTCPTxRead)
-		c := t.pickConn(pkt[:n])
-		if c == nil {
-			statInc(statTCPTxNoConn)
-			return true
+	bsz := perfBatchSize()
+	var bufs net.Buffers
+	var pooled [][]byte
+	var curConn net.Conn
+
+	flush := func() {
+		if len(pooled) == 0 {
+			return
 		}
-		if err := tcpWriteFrame(c, pkt[:n]); err != nil {
+		if _, err := bufs.WriteTo(curConn); err != nil {
 			logDebug("tcp tx: " + err.Error())
-			t.clearConn(c)
+			t.clearConn(curConn)
 		} else {
-			statInc(statTCPTxSend)
+			statAdd(statTCPTxSend, uint64(len(pooled)))
 		}
-		return !t.stop.stopped()
-	})
+		for _, b := range pooled {
+			putBuf(b)
+		}
+		bufs = bufs[:0]
+		pooled = pooled[:0]
+		curConn = nil
+	}
+
+	poller.Run(
+		func() { flush() },
+		func(pkt []byte, n int) bool {
+			statInc(statTCPTxRead)
+			c := t.pickConn(pkt[:n])
+			if c == nil {
+				statInc(statTCPTxNoConn)
+				return true
+			}
+			if curConn != nil && c != curConn {
+				flush()
+			}
+			curConn = c
+			frame := getBuf()
+			binary.BigEndian.PutUint16(frame[:2], uint16(n))
+			copy(frame[2:2+n], pkt[:n])
+			bufs = append(bufs, frame[:2+n])
+			pooled = append(pooled, frame)
+			if len(pooled) >= bsz {
+				flush()
+			}
+			return !t.stop.stopped()
+		},
+	)
+	flush()
 }
 
 func (t *TcpTunnel) clearConn(c net.Conn) {
@@ -227,9 +265,10 @@ func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 	defer conn.Close()
 	buf := getBuf()
 	defer putBuf(buf)
+	br := bufio.NewReaderSize(conn, tcpRxBufSize)
 	var hdr [2]byte
 	for {
-		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
 			if !t.stop.stopped() {
 				logDebug(fmt.Sprintf("tcp rx stream %d: %v", slot, err))
 			}
@@ -241,7 +280,7 @@ func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 			logWarn(fmt.Sprintf("tcp rx: invalid frame len %d", n))
 			return
 		}
-		if _, err := io.ReadFull(conn, buf[:n]); err != nil {
+		if _, err := io.ReadFull(br, buf[:n]); err != nil {
 			if !t.stop.stopped() {
 				logDebug(fmt.Sprintf("tcp rx read stream %d: %v", slot, err))
 			}
@@ -257,13 +296,6 @@ func (t *TcpTunnel) rxLoop(conn net.Conn, tun *os.File, slot int) {
 			statInc(statTCPRxWrite)
 		}
 	}
-}
-
-func tcpWriteFrame(conn net.Conn, data []byte) error {
-	var hdr [2]byte
-	binary.BigEndian.PutUint16(hdr[:], uint16(len(data)))
-	_, err := (&net.Buffers{hdr[:], data}).WriteTo(conn)
-	return err
 }
 
 func (t *TcpTunnel) Down() error {

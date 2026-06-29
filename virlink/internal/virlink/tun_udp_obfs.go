@@ -212,8 +212,10 @@ func (t *UdpObfsTunnel) txPollLoop(conn *net.UDPConn, gcm cipher.AEAD, mask stri
 	defer poller.close()
 
 	poller.Run(nil, func(pkt []byte, n int) bool {
-		frame, err := obfsEncrypt(pkt[:n], gcm, mask, t.cfg.Obfs.Padding)
+		frameBuf := getBuf()
+		frame, err := obfsEncrypt(frameBuf, pkt[:n], gcm, mask, t.cfg.Obfs.Padding)
 		if err != nil {
+			putBuf(frameBuf)
 			return true
 		}
 		dst := fixed
@@ -221,12 +223,14 @@ func (t *UdpObfsTunnel) txPollLoop(conn *net.UDPConn, gcm cipher.AEAD, mask stri
 			if p, ok := t.lastPeer.Load().(*net.UDPAddr); ok && p != nil {
 				dst = p
 			} else {
+				putBuf(frameBuf)
 				return true
 			}
 		}
 		if _, err := conn.WriteToUDP(frame, dst); err != nil && !t.stop.stopped() {
 			logDebug("obfs tx: " + err.Error())
 		}
+		putBuf(frameBuf)
 		return !t.stop.stopped()
 	})
 }
@@ -268,64 +272,73 @@ func deriveObfsKey(passphrase string) [32]byte {
 	return sha256.Sum256([]byte(passphrase))
 }
 
-// obfsEncrypt encrypts plaintext IP packet and prepends the chosen mask header.
+// obfsEncrypt encrypts pkt and prepends the chosen mask header, writing
+// everything into frame (a pktPool buffer) in place — zero heap allocation.
 // gcm is the cached cipher — created once in Up(), safe for concurrent use.
 //
 // Plaintext inside GCM:
 //
 //	[flags(1B)] [original packet] [random pad (optional)] [padLen(1B)]
 //	flags: 0x01 = padding present
-func obfsEncrypt(pkt []byte, gcm cipher.AEAD, mask string, padding bool) ([]byte, error) {
-	// build inner plaintext
-	inner := make([]byte, 1+len(pkt))
-	if padding {
-		padLen := int(mustRandByte()%48) + 4
-		pad := make([]byte, padLen)
-		if _, err := rand.Read(pad); err != nil {
-			return nil, err
-		}
-		pad[padLen-1] = byte(padLen)
-		inner = make([]byte, 1+len(pkt)+padLen)
-		inner[0] = 0x01
-		copy(inner[1:], pkt)
-		copy(inner[1+len(pkt):], pad)
-	} else {
-		inner[0] = 0x00
-		copy(inner[1:], pkt)
-	}
-
-	// nonce: 12-byte random (GCM standard)
-	var nonceBuf [12]byte
-	if _, err := rand.Read(nonceBuf[:]); err != nil {
-		return nil, err
-	}
-	nonce := nonceBuf[:]
-
-	// encrypt — gcm.Seal appends to nil → allocates result once
-	ciphertext := gcm.Seal(nil, nonce, inner, nil)
-
-	// build wire frame: [mask header] [nonce] [ciphertext]
-	var hdr []byte
+func obfsEncrypt(frame, pkt []byte, gcm cipher.AEAD, mask string, padding bool) ([]byte, error) {
+	var hdrLen int
 	switch mask {
 	case "quic":
-		h := quicPrefix
-		_, _ = rand.Read(h[6:14]) // randomise DCID per packet
-		hdr = h[:]
+		hdrLen = len(quicPrefix)
 	case "dtls":
-		h := dtlsPrefix
-		payLen := len(nonce) + len(ciphertext)
-		binary.BigEndian.PutUint16(h[11:], uint16(payLen))
-		hdr = h[:]
+		hdrLen = len(dtlsPrefix)
 	}
 
-	frame := make([]byte, 0, len(hdr)+len(nonce)+len(ciphertext))
-	frame = append(frame, hdr...)
-	frame = append(frame, nonce...)
-	frame = append(frame, ciphertext...)
-	return frame, nil
+	nonceOff := hdrLen
+	plainOff := nonceOff + 12
+	innerLen := 1 + len(pkt)
+	padLen := 0
+	if padding {
+		padLen = int(mustRandByte()%48) + 4
+		innerLen += padLen
+	}
+
+	// plaintext, written directly into frame: flags(1B) | packet | [pad...] [padLen(1B)]
+	plain := frame[plainOff : plainOff+innerLen]
+	if padding {
+		plain[0] = 0x01
+		copy(plain[1:], pkt)
+		padStart := 1 + len(pkt)
+		if _, err := rand.Read(plain[padStart : padStart+padLen-1]); err != nil {
+			return nil, err
+		}
+		plain[innerLen-1] = byte(padLen)
+	} else {
+		plain[0] = 0x00
+		copy(plain[1:], pkt)
+	}
+
+	// nonce: 12-byte random (GCM standard), written into frame right before the plaintext.
+	nonce := frame[nonceOff:plainOff]
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+
+	// encrypt in place — dst aliases plain exactly (documented crypto/cipher idiom).
+	ciphertext := gcm.Seal(plain[:0], nonce, plain, nil)
+
+	// mask header, written last since dtls needs the final payload length.
+	switch mask {
+	case "quic":
+		copy(frame[:hdrLen], quicPrefix[:])
+		_, _ = rand.Read(frame[6:14]) // randomise DCID per packet
+	case "dtls":
+		copy(frame[:hdrLen], dtlsPrefix[:])
+		payLen := len(nonce) + len(ciphertext)
+		binary.BigEndian.PutUint16(frame[11:13], uint16(payLen))
+	}
+
+	return frame[:plainOff+len(ciphertext)], nil
 }
 
-// obfsDecrypt reverses obfsEncrypt.
+// obfsDecrypt reverses obfsEncrypt, decrypting in place into frame's backing
+// array (zero heap allocation). The returned slice aliases frame, so callers
+// must consume it before frame is reused (rxLoop does so immediately).
 func obfsDecrypt(frame []byte, gcm cipher.AEAD, mask string, _ bool) ([]byte, error) {
 	switch mask {
 	case "quic":
@@ -345,7 +358,8 @@ func obfsDecrypt(frame []byte, gcm cipher.AEAD, mask string, _ bool) ([]byte, er
 		return nil, fmt.Errorf("frame too short (%d bytes)", len(frame))
 	}
 
-	inner, err := gcm.Open(nil, frame[:ns], frame[ns:], nil)
+	ciphertext := frame[ns:]
+	inner, err := gcm.Open(ciphertext[:0], frame[:ns], ciphertext, nil)
 	if err != nil {
 		return nil, fmt.Errorf("AES-GCM: %w", err)
 	}

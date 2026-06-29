@@ -110,6 +110,22 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 	local := t.localIP
 	pollMs := perfPollMs()
 	idleMs := pollMs
+	bsz := perfBatchSize()
+	var batch tunRxBatch
+
+	flush := func() {
+		n, err := batch.flush(tun)
+		if n == 0 {
+			return
+		}
+		if err != nil && !t.stop.stopped() {
+			logWarn("tun write: " + err.Error())
+		} else if err == nil {
+			statAdd(statBIPRxWrite, uint64(n))
+		}
+	}
+	defer flush()
+
 	for {
 		n, from, err := unix.Recvfrom(rawFd, buf, 0)
 		if err != nil {
@@ -117,6 +133,7 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 				return
 			}
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				flush()
 				statInc(statBIPRxPoll)
 				_ = pollFD(rawFd, unix.POLLIN, idleMs)
 				if idleMs < 50 {
@@ -147,10 +164,9 @@ func (t *BipTunnel) rxLoop(rawFd int, tun *os.File) {
 			t.lastSrc.Store(rememberPeerRoute(t.wire, sa.Addr, t.peerIP))
 		}
 		statInc(statBIPRxRecv)
-		if err := tunWrite(tun, buf[ihl:n]); err != nil && !t.stop.stopped() {
-			logWarn("tun write: " + err.Error())
-		} else {
-			statInc(statBIPRxWrite)
+		batch.add(buf[ihl:n])
+		if batch.len() >= bsz {
+			flush()
 		}
 	}
 }

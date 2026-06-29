@@ -44,6 +44,40 @@ func tunWritev(fd *os.File, bufs [][]byte) error {
 	return err
 }
 
+// tunRxBatch accumulates inbound (wire → TUN) packets so a burst of datagrams
+// drained from one rx loop iteration costs one tunWritev instead of one
+// Write per packet. Payloads are copied into pooled buffers since the rx
+// loop's read buffer is reused for the next recvfrom before the batch flushes.
+type tunRxBatch struct {
+	bufs   [][]byte
+	pooled [][]byte
+}
+
+func (b *tunRxBatch) add(payload []byte) {
+	frame := getBuf()
+	n := copy(frame, payload)
+	b.bufs = append(b.bufs, frame[:n])
+	b.pooled = append(b.pooled, frame)
+}
+
+func (b *tunRxBatch) len() int { return len(b.bufs) }
+
+// flush writes the batch in one tunWritev call and returns the packet count
+// that was flushed (0 if the batch was already empty).
+func (b *tunRxBatch) flush(tun *os.File) (int, error) {
+	n := len(b.bufs)
+	if n == 0 {
+		return 0, nil
+	}
+	err := tunWritev(tun, b.bufs)
+	for _, p := range b.pooled {
+		putBuf(p)
+	}
+	b.bufs = b.bufs[:0]
+	b.pooled = b.pooled[:0]
+	return n, err
+}
+
 // icmpTxBatch holds up to icmpBatchMax frames ready for sendmmsg.
 type icmpTxBatch struct {
 	n      int
