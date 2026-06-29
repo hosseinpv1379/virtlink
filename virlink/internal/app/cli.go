@@ -12,7 +12,7 @@ import (
 	"virlink/internal/platform"
 )
 
-const version = "3.3.8"
+const version = "3.3.9"
 
 func Main() {
 	cfgFile := flag.String("c", "", "path to config.toml")

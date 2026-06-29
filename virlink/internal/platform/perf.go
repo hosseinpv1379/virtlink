@@ -134,12 +134,11 @@ func initUserspacePerfDefaults(c *config.Config) {
 			perf.pollMs = 50
 		}
 	case "hysteria2":
-		// Wrap path is loopback UDP — low latency, use smaller poll interval.
-		// More queues let the kernel spread TUN→wire traffic.
 		perf.tunQueues = clampInt(userspaceCPU(), 2, 4)
 		perf.sockBuf = 64 << 20
 		perf.batchSize = 64
-		perf.pollMs = 10
+		perf.pollMs = 3
+		perf.tcpStreams = 1
 	case "wireguard", "amneziawg":
 		perf.tunQueues = 1
 		perf.sockBuf = defSockBufMB << 20
@@ -183,7 +182,7 @@ func ApplyPerfFromConfig(c *config.Config) {
 	}
 	if t.TcpStreams > 0 {
 		perf.tcpStreams = clampInt(t.TcpStreams, 1, MaxPerfQueues)
-	} else if !isTcpUserspaceTunnel(c.Tunnel.Type) && c.Tunnel.Type != "udp" && c.Tunnel.Type != "icmp" && c.Tunnel.Type != "bip" {
+	} else if !isTcpUserspaceTunnel(c.Tunnel.Type) && c.Tunnel.Type != "udp" && c.Tunnel.Type != "icmp" && c.Tunnel.Type != "bip" && c.Tunnel.Type != "hysteria2" {
 		// Non-streaming tunnels ignore tcp_streams; do not clobber protocol defaults.
 		perf.tcpStreams = perf.tunQueues
 	}

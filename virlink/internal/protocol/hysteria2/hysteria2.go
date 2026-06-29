@@ -6,7 +6,6 @@
 package hysteria2
 
 import (
-	"virlink/internal/wire"
 	"virlink/internal/platform"
 	"virlink/internal/core"
 	"virlink/internal/config"
@@ -22,7 +21,6 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
 
 const hysteria2Subnet = "10.20.52.0/30"
@@ -170,9 +168,12 @@ func (t *Hysteria2Tunnel) Up() error {
 		}
 		platform.TuneUDPConn(t.udpConn)
 		t.wrapAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wrapPort}
+		if err := platform.ConnectUDP(t.udpConn, t.wrapAddr); err != nil {
+			platform.LogWarn("wrap connect: " + err.Error())
+		}
 		platform.LogOK(fmt.Sprintf("UDP wrap → 127.0.0.1:%d", wrapPort))
 		platform.Step("keepalive...")
-		if _, err := t.udpConn.WriteToUDP([]byte{0}, t.wrapAddr); err != nil {
+		if _, err := t.udpConn.Write([]byte{0}); err != nil {
 			platform.LogWarn("wrap keepalive: " + err.Error())
 		}
 	}
@@ -209,22 +210,13 @@ func (t *Hysteria2Tunnel) Up() error {
 }
 
 // rxLoopServer receives IP packets from hysteria's UDP forwarding port and writes
-// them to the TUN device in batches (recvmmsg → tunWritev).
+// them to the TUN device. ReadFromUDP (not recvmmsg) — reliable on loopback wrap.
 func (t *Hysteria2Tunnel) rxLoopServer(conn *net.UDPConn, tun *os.File) {
-	rawFd, err := platform.UdpConnFD(conn)
-	if err != nil {
-		t.rxLoopServerBlocking(conn, tun)
-		return
-	}
-	_ = unix.SetNonblock(rawFd, true)
-
-	var rb platform.RxMmsgBatch
-	rb.Init(platform.PerfBatchSize())
-	defer rb.Release()
+	buf := platform.GetBuf()
+	defer platform.PutBuf(buf)
 
 	bsz := platform.PerfBatchSize()
 	batch := platform.NewTunRxBatch(bsz)
-	pollMs := platform.PerfPollMs()
 
 	flush := func() {
 		n, ferr := batch.Flush(tun)
@@ -235,41 +227,6 @@ func (t *Hysteria2Tunnel) rxLoopServer(conn *net.UDPConn, tun *os.File) {
 	defer flush()
 
 	for !t.stop.Stopped() {
-		got, rerr := rb.Recv(rawFd)
-		if got == 0 {
-			if t.stop.Stopped() {
-				return
-			}
-			if rerr == unix.EAGAIN || rerr == unix.EWOULDBLOCK || rerr == nil {
-				flush()
-				_ = platform.PollFD(rawFd, unix.POLLIN, pollMs)
-				continue
-			}
-			continue
-		}
-		for i := 0; i < got; i++ {
-			pkt := rb.Data(i)
-			// Update last peer from the recvmmsg source address.
-			sa := rb.From4(i)
-			portBE := sa.Port
-			t.lastPeer.Store(&net.UDPAddr{
-				IP:   net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]),
-				Port: int(portBE>>8 | (portBE&0xff)<<8),
-			})
-			platform.StatInc(platform.StatUDPRxRecv)
-			batch.Add(pkt)
-		}
-		if batch.Len() >= bsz {
-			flush()
-		}
-	}
-}
-
-// rxLoopServerBlocking is the single-packet fallback when recvmmsg is unavailable.
-func (t *Hysteria2Tunnel) rxLoopServerBlocking(conn *net.UDPConn, tun *os.File) {
-	buf := platform.GetBuf()
-	defer platform.PutBuf(buf)
-	for {
 		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if t.stop.Stopped() {
@@ -277,44 +234,57 @@ func (t *Hysteria2Tunnel) rxLoopServerBlocking(conn *net.UDPConn, tun *os.File) 
 			}
 			continue
 		}
+		if n == 0 {
+			continue
+		}
 		t.lastPeer.Store(src)
 		platform.StatInc(platform.StatUDPRxRecv)
-		if err := platform.TunWrite(tun, buf[:n]); err != nil && !t.stop.Stopped() {
-			platform.LogWarn("tun write: " + err.Error())
-		} else {
-			platform.StatInc(platform.StatUDPRxWrite)
+		batch.Add(buf[:n])
+		if batch.Len() >= bsz {
+			flush()
 		}
 	}
 }
 
 // txPollLoopServer drains the TUN device and sends IP packets to the hysteria
-// wrap client via sendmmsg.
+// wrap peer via batched WriteToUDP (single socket, no sendmmsg on loopback).
 func (t *Hysteria2Tunnel) txPollLoopServer(conn *net.UDPConn) {
-	rawFd, err := platform.UdpConnFD(conn)
-	if err != nil {
-		t.txPollLoopServerUnbatched(conn)
-		return
-	}
-
 	poller := platform.NewTunPollerH(t.tun, &t.stop, 0)
 	defer poller.Close()
 
 	var batch platform.IcmpTxBatch
 	bsz := platform.PerfBatchSize()
+	var curDst *net.UDPAddr
+	var haveDst bool
 
 	flush := func() {
-		if batch.N() == 0 {
+		if batch.N() == 0 || curDst == nil {
+			for i := 0; i < batch.N(); i++ {
+				platform.PutBuf(batch.Frame(i))
+				batch.SetFrame(i, nil)
+			}
+			batch.Reset()
+			haveDst = false
 			return
 		}
-		platform.StatAdd(platform.StatUDPTxSend, uint64(batch.N()))
-		if nerr := platform.MmsgSendBatch(rawFd, &batch); nerr > 0 {
-			wire.NoteWireTxErr(nerr)
-		}
+		var sent uint64
 		for i := 0; i < batch.N(); i++ {
+			plen := batch.PktLen(i)
+			if _, err := conn.WriteToUDP(batch.Frame(i)[:plen], curDst); err != nil {
+				if !t.stop.Stopped() {
+					platform.LogDebug("udp wrap tx: " + err.Error())
+				}
+			} else {
+				sent++
+			}
 			platform.PutBuf(batch.Frame(i))
 			batch.SetFrame(i, nil)
 		}
+		if sent > 0 {
+			platform.StatAdd(platform.StatUDPTxSend, sent)
+		}
 		batch.Reset()
+		haveDst = false
 	}
 
 	poller.RunOwned(
@@ -330,12 +300,16 @@ func (t *Hysteria2Tunnel) txPollLoopServer(conn *net.UDPConn) {
 			if !ok || p == nil {
 				platform.StatInc(platform.StatUDPTxNoDst)
 				platform.PutBuf(buf)
-				return true
+				return !t.stop.Stopped()
 			}
+			if haveDst && !udpAddrEqual(p, curDst) {
+				flush()
+			}
+			curDst = p
+			haveDst = true
 			var dst [4]byte
 			copy(dst[:], p.IP.To4())
-			port := uint16(p.Port)
-			batch.Add(buf, n, dst, port)
+			batch.Add(buf, n, dst, uint16(p.Port))
 			if batch.N() >= bsz {
 				flush()
 			}
@@ -345,47 +319,20 @@ func (t *Hysteria2Tunnel) txPollLoopServer(conn *net.UDPConn) {
 	flush()
 }
 
-// txPollLoopServerUnbatched is the single-packet fallback for txPollLoopServer.
-func (t *Hysteria2Tunnel) txPollLoopServerUnbatched(conn *net.UDPConn) {
-	poller := platform.NewTunPoller(t.tun, &t.stop)
-	defer poller.Close()
-
-	poller.Run(
-		func() { platform.StatInc(platform.StatUDPTxPoll) },
-		func(pkt []byte, n int) bool {
-			platform.StatInc(platform.StatUDPTxRead)
-			p, ok := t.lastPeer.Load().(*net.UDPAddr)
-			if !ok || p == nil {
-				platform.StatInc(platform.StatUDPTxNoDst)
-				return true
-			}
-			if _, err := conn.WriteToUDP(pkt[:n], p); err != nil && !t.stop.Stopped() {
-				platform.LogDebug("udp wrap tx: " + err.Error())
-			} else if err == nil {
-				platform.StatInc(platform.StatUDPTxSend)
-			}
-			return !t.stop.Stopped()
-		},
-	)
+func udpAddrEqual(a, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.IP.Equal(b.IP) && a.Port == b.Port
 }
 
-// rxLoopClient receives IP packets forwarded back by hysteria (client side) and
-// writes them to TUN in batches.
+// rxLoopClient receives IP packets forwarded back by hysteria (client side).
 func (t *Hysteria2Tunnel) rxLoopClient(conn *net.UDPConn, tun *os.File) {
-	rawFd, err := platform.UdpConnFD(conn)
-	if err != nil {
-		t.rxLoopClientBlocking(conn, tun)
-		return
-	}
-	_ = unix.SetNonblock(rawFd, true)
-
-	var rb platform.RxMmsgBatch
-	rb.Init(platform.PerfBatchSize())
-	defer rb.Release()
+	buf := platform.GetBuf()
+	defer platform.PutBuf(buf)
 
 	bsz := platform.PerfBatchSize()
 	batch := platform.NewTunRxBatch(bsz)
-	pollMs := platform.PerfPollMs()
 
 	flush := func() {
 		n, ferr := batch.Flush(tun)
@@ -396,33 +343,6 @@ func (t *Hysteria2Tunnel) rxLoopClient(conn *net.UDPConn, tun *os.File) {
 	defer flush()
 
 	for !t.stop.Stopped() {
-		got, rerr := rb.Recv(rawFd)
-		if got == 0 {
-			if t.stop.Stopped() {
-				return
-			}
-			if rerr == unix.EAGAIN || rerr == unix.EWOULDBLOCK || rerr == nil {
-				flush()
-				_ = platform.PollFD(rawFd, unix.POLLIN, pollMs)
-				continue
-			}
-			continue
-		}
-		platform.StatAdd(platform.StatUDPRxRecv, uint64(got))
-		for i := 0; i < got; i++ {
-			batch.Add(rb.Data(i))
-		}
-		if batch.Len() >= bsz {
-			flush()
-		}
-	}
-}
-
-// rxLoopClientBlocking is the single-packet fallback for rxLoopClient.
-func (t *Hysteria2Tunnel) rxLoopClientBlocking(conn *net.UDPConn, tun *os.File) {
-	buf := platform.GetBuf()
-	defer platform.PutBuf(buf)
-	for {
 		n, err := conn.Read(buf)
 		if err != nil {
 			if t.stop.Stopped() {
@@ -430,94 +350,68 @@ func (t *Hysteria2Tunnel) rxLoopClientBlocking(conn *net.UDPConn, tun *os.File) 
 			}
 			continue
 		}
+		if n == 0 {
+			continue
+		}
 		platform.StatInc(platform.StatUDPRxRecv)
-		if err := platform.TunWrite(tun, buf[:n]); err != nil && !t.stop.Stopped() {
-			platform.LogWarn("tun write: " + err.Error())
-		} else {
-			platform.StatInc(platform.StatUDPRxWrite)
+		batch.Add(buf[:n])
+		if batch.Len() >= bsz {
+			flush()
 		}
 	}
 }
 
-// txPollLoopClient drains the TUN device and sends IP packets toward the hysteria
-// udpForwarding port via sendmmsg.
+// txPollLoopClient drains the TUN device and sends IP packets to hysteria udpForwarding.
 func (t *Hysteria2Tunnel) txPollLoopClient(conn *net.UDPConn) {
-	rawFd, err := platform.UdpConnFD(conn)
-	if err != nil {
-		t.txPollLoopClientUnbatched(conn)
+	if t.wrapAddr == nil {
 		return
 	}
-
-	dst := t.wrapAddr
-	if dst == nil {
-		return
-	}
-	var dstArr [4]byte
-	copy(dstArr[:], dst.IP.To4())
-	dstPort := uint16(dst.Port)
 
 	poller := platform.NewTunPollerH(t.tun, &t.stop, 0)
 	defer poller.Close()
 
-	var batch platform.IcmpTxBatch
 	bsz := platform.PerfBatchSize()
+	batch := make([][]byte, 0, bsz)
+	lens := make([]int, 0, bsz)
 
 	flush := func() {
-		if batch.N() == 0 {
+		if len(batch) == 0 {
 			return
 		}
-		platform.StatAdd(platform.StatUDPTxSend, uint64(batch.N()))
-		if nerr := platform.MmsgSendBatch(rawFd, &batch); nerr > 0 {
-			wire.NoteWireTxErr(nerr)
+		var sent uint64
+		for i := range batch {
+			if _, err := conn.Write(batch[i][:lens[i]]); err != nil {
+				if !t.stop.Stopped() {
+					platform.LogDebug("udp wrap tx: " + err.Error())
+				}
+			} else {
+				sent++
+			}
+			platform.PutBuf(batch[i])
 		}
-		for i := 0; i < batch.N(); i++ {
-			platform.PutBuf(batch.Frame(i))
-			batch.SetFrame(i, nil)
+		if sent > 0 {
+			platform.StatAdd(platform.StatUDPTxSend, sent)
 		}
-		batch.Reset()
+		batch = batch[:0]
+		lens = lens[:0]
 	}
 
 	poller.RunOwned(
 		func() {
 			platform.StatInc(platform.StatUDPTxPoll)
-			if batch.N() > 0 {
-				flush()
-			}
+			flush()
 		},
 		func(buf []byte, n int) bool {
 			platform.StatInc(platform.StatUDPTxRead)
-			batch.Add(buf, n, dstArr, dstPort)
-			if batch.N() >= bsz {
+			batch = append(batch, buf)
+			lens = append(lens, n)
+			if len(batch) >= bsz {
 				flush()
 			}
 			return !t.stop.Stopped()
 		},
 	)
 	flush()
-}
-
-// txPollLoopClientUnbatched is the single-packet fallback for txPollLoopClient.
-func (t *Hysteria2Tunnel) txPollLoopClientUnbatched(conn *net.UDPConn) {
-	poller := platform.NewTunPoller(t.tun, &t.stop)
-	defer poller.Close()
-	dst := t.wrapAddr
-
-	poller.Run(
-		func() { platform.StatInc(platform.StatUDPTxPoll) },
-		func(pkt []byte, n int) bool {
-			platform.StatInc(platform.StatUDPTxRead)
-			if dst == nil {
-				platform.StatInc(platform.StatUDPTxNoDst)
-				return true
-			}
-			if _, err := conn.WriteToUDP(pkt[:n], dst); err != nil && !t.stop.Stopped() {
-				platform.LogDebug("udp wrap tx: " + err.Error())
-			} else if err == nil {
-				platform.StatInc(platform.StatUDPTxSend)
-			}
-			return !t.stop.Stopped()
-		},
-	)
 }
 
 func (t *Hysteria2Tunnel) Down() error {
