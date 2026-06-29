@@ -127,16 +127,23 @@ func icmpWireCarrierType(pkt []byte, wireOn bool) byte {
 	return icmp[0]
 }
 
+// tunWritev writes each buffer as a separate packet to the TUN device.
+//
+// CRITICAL: TUN requires one write() syscall per IP packet. writev() concatenates
+// all iovecs into a single data stream that TUN treats as ONE packet. Sending
+// N packets via a single writev() produces one oversized, invalid "packet" that
+// the kernel's IP stack silently discards — causing catastrophic packet loss
+// whenever two or more packets arrive together (i.e. any time bandwidth > ~1 pps).
+//
+// Each packet must be written with its own write() call. The syscall overhead is
+// negligible: at 100 Mbps / 1320-byte MTU = ~9500 pkt/s × 200 ns ≈ 0.2% CPU.
 func tunWritev(fd *os.File, bufs [][]byte) error {
-	if len(bufs) == 0 {
-		return nil
+	for _, buf := range bufs {
+		if _, err := fd.Write(buf); err != nil {
+			return err
+		}
 	}
-	if len(bufs) == 1 {
-		_, err := fd.Write(bufs[0])
-		return err
-	}
-	_, err := unix.Writev(int(fd.Fd()), bufs)
-	return err
+	return nil
 }
 
 // tunRxBatch accumulates inbound (wire → TUN) packets so a burst of datagrams
