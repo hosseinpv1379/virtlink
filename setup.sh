@@ -12,7 +12,7 @@ set -Eeuo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # Constants & paths
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_VERSION="1.8.0"
+SCRIPT_VERSION="1.8.1"
 GITHUB_REPO="hosseinpv1379/virtlink"
 TELEGRAM_CHANNEL="@mioopython"
 AUTHOR="Hossein"
@@ -33,6 +33,8 @@ MANUAL_CLIENT_CONF_DIR="/root/manual-client-conf"
 
 UPDATE_AVAILABLE=0
 LATEST_TAG=""
+BETA_TAG=""
+BETA_UPDATE_AVAILABLE=0
 LAST_CFG_PATH=""   # set by gen_* instead of echoing (avoids $() capture)
 PICKED_TUNNEL=""   # set by pick_tunnel (avoids printf -v scope bug with set -u)
 PICKED_TUNNEL_TYPE=""  # set by pick_tunnel_type (never capture pick UI via $())
@@ -493,6 +495,86 @@ check_update() {
   else
     UPDATE_AVAILABLE=0
   fi
+}
+
+# Latest GitHub prerelease (beta) — does not affect stable /releases/latest.
+fetch_beta_tag() {
+  local raw
+  set +e
+  raw=$(curl -fsSL --connect-timeout 5 --max-time 8 \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=30" 2>/dev/null)
+  set -e
+  BETA_TAG=""
+  [[ -n "$raw" ]] || return 1
+  BETA_TAG=$(printf '%s\n' "$raw" | awk '
+    /"tag_name"/ {
+      line=$0
+      sub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/, "", line)
+      sub(/".*/, "", line)
+      tag=line
+    }
+    /"prerelease"[[:space:]]*:[[:space:]]*true/ {
+      if (tag != "") { print tag; exit }
+    }
+  ')
+  [[ -n "$BETA_TAG" ]]
+}
+
+check_beta_update() {
+  local current
+  set +e
+  current=$("$VIRLINK_BIN" --version 2>/dev/null \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?' | head -1 || echo "")
+  set -e
+  BETA_UPDATE_AVAILABLE=0
+  if ! fetch_beta_tag; then
+    return 0
+  fi
+  if [[ -n "$current" && "${BETA_TAG#v}" == "$current" ]]; then
+    return 0
+  fi
+  if [[ -n "$current" && "${BETA_TAG#v}" == "${current#v}" ]]; then
+    return 0
+  fi
+  BETA_UPDATE_AVAILABLE=1
+}
+
+do_update_beta() {
+  require_root
+  if ! fetch_beta_tag; then
+    err "No beta release found on GitHub."
+    return 1
+  fi
+  info "Downloading beta ${BETA_TAG}..."
+  safe_download \
+    "https://github.com/${GITHUB_REPO}/releases/download/${BETA_TAG}/virlink" \
+    "${VIRLINK_BIN}.new"
+  chmod +x "${VIRLINK_BIN}.new"
+  mv "${VIRLINK_BIN}.new" "$VIRLINK_BIN"
+  ok "Core updated to beta ${BETA_TAG}."
+  info "Stable latest remains v3.3.18 — use menu 4 to return to stable when promoted."
+  blank
+  press_enter
+}
+
+do_install_beta() {
+  require_root
+  ensure_deps
+  if ! fetch_beta_tag; then
+    die "No beta release on GitHub."
+  fi
+  mkdir -p "${INSTALL_DIR}/configs" || die "Cannot create ${INSTALL_DIR}"
+  info "Downloading beta ${BETA_TAG}..."
+  safe_download \
+    "https://github.com/${GITHUB_REPO}/releases/download/${BETA_TAG}/virlink" \
+    "${INSTALL_DIR}/virlink"
+  chmod +x "${INSTALL_DIR}/virlink"
+  ln -sf "${INSTALL_DIR}/virlink" /usr/local/bin/virlink 2>/dev/null || true
+  install_setup_script
+  ok "Beta ${BETA_TAG} installed. Stable: releases/latest (currently v3.3.18)."
+  blank
+  press_enter
 }
 
 _install_latest_setup_script() {
@@ -4960,6 +5042,40 @@ menu_update_core() {
   press_enter
 }
 
+menu_update_beta() {
+  show_banner
+  echo -e "  ${BOLD}Install / Update Beta${NC}"
+  sep_thin
+  info "Beta builds are for testing. Stable installs use menu 4 (releases/latest)."
+  check_beta_update
+  local cur_ver
+  cur_ver=$(core_version)
+  blank
+  echo -e "  Installed : ${W}${cur_ver}${NC}"
+  if [[ -z "$BETA_TAG" ]]; then
+    echo -e "  Beta      : ${R}none published${NC}"
+    blank
+    press_enter
+    return
+  fi
+  echo -e "  Beta      : ${W}${BETA_TAG}${NC}  ${DIM}(prerelease)${NC}"
+  blank
+  if (( BETA_UPDATE_AVAILABLE )) || [[ "$cur_ver" != *beta* ]]; then
+    if confirm "Install or update to beta ${BETA_TAG}"; then
+      if [[ -x "$VIRLINK_BIN" ]]; then
+        do_update_beta
+      else
+        do_install_beta
+      fi
+      return
+    fi
+  else
+    ok "Already on latest beta (${BETA_TAG})."
+  fi
+  blank
+  press_enter
+}
+
 menu_update_script() {
   show_banner
   echo -e "  ${BOLD}Update Setup Script${NC}"
@@ -5143,9 +5259,10 @@ main() {
     echo -e "    ${C} 5${NC}  Update script"
     echo -e "    ${C} 6${NC}  Remove Virtlink Core"
     echo -e "    ${C} 7${NC}  Install Web Panel"
+    echo -e "    ${Y} 8${NC}  ${Y}Install / Update Beta${NC}  ${DIM}(testing; stable = menu 4)${NC}"
     echo -e "    ${C} 0${NC}  Exit"
     blank
-    tty_out "  ${W}?${NC} Choose [0-7]: "
+    tty_out "  ${W}?${NC} Choose [0-8]: "
     read -r choice < /dev/tty || { blank; ok "Goodbye."; blank; exit 0; }
     case "$choice" in
       1) menu_create_tunnel ;;
@@ -5155,6 +5272,7 @@ main() {
       5) menu_update_script ;;
       6) menu_remove_core ;;
       7) menu_webpanel ;;
+      8) menu_update_beta ;;
       0) blank; ok "Goodbye."; blank; exit 0 ;;
       *) warn "Invalid choice." ;;
     esac
