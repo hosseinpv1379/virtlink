@@ -11,7 +11,7 @@
 
 ```bash
 # Install (as root)
-sudo bash <(curl -fsSL https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh)
+bash <(curl -fsSL https://github.com/hosseinpv1379/virtlink/releases/latest/download/setup.sh)
 ```
 
 This downloads the binary and setup script to `/opt/virlink`, creates symlinks in `/usr/local/bin`, and launches the interactive menu.
